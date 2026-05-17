@@ -1,0 +1,13 @@
+# Windows schannel cert revocation check is unreliable on this host
+# (CRYPT_E_NO_REVOCATION_CHECK). Disable the check for cargo's HTTP client.
+# This affects crate fetches only; build artifacts are still verified via
+# the registry's checksums.
+[http]
+check-revoke = false
+
+# aws-lc-sys (transitive dep of russh) needs NASM to assemble x86_64 crypto
+# primitives. We don't want to require a system NASM install. Setting this
+# env var tells aws-lc-sys to use the prebuilt NASM-compiled object files
+# bundled with the crate. Verified against aws-lc-sys >= 0.20.
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"

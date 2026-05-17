@@ -1,0 +1,43 @@
+[Unit]
+Description=middleWHERE secure SQL gateway daemon (mwsqld)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mwsqld run --state-dir /var/lib/middlewhere --file-keystore
+Restart=on-failure
+RestartSec=5
+
+# --- dedicated unprivileged identity (the core of the trust model) ---
+DynamicUser=yes
+StateDirectory=mwsqld
+StateDirectoryMode=0700
+UMask=0077
+
+# --- sandbox ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

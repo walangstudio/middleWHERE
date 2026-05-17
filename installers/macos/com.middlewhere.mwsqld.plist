@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.middlewhere.mwsqld</string>
+    <key>UserName</key>
+    <string>_middlewhere</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mwsqld</string>
+        <string>run</string>
+        <string>--state-dir</string>
+        <string>/Library/Application Support/middlewhere</string>
+        <string>--file-keystore</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Application Support/middlewhere/stderr.log</string>
+    <key>StandardOutPath</key>
+    <string>/Library/Application Support/middlewhere/stdout.log</string>
+</dict>
+</plist>

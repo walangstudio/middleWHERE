@@ -1,0 +1,38 @@
+[package]
+name = "mwsqld"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mwsqld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mwsqld"
+path = "src/main.rs"
+
+[dependencies]
+mw-core.workspace = true
+mw-net.workspace  = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+tracing-appender.workspace = true
+rand.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+mysql_async.workspace = true
+tokio-postgres.workspace = true
+russh.workspace = true
+base64.workspace = true
+sha2.workspace = true
