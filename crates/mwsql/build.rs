@@ -33,9 +33,11 @@ fn main() {
     res.set("LegalCopyright", "(c) 2026 scr1p7k177y. MIT License.");
     res.set("OriginalFilename", "mwsql.exe");
     res.set_manifest(MANIFEST);
-    if let Err(e) = res.compile() {
-        println!("cargo:warning=winresource: failed to embed metadata: {e}");
-    }
+    // Hard-fail: the version-info + manifest is load-bearing for AV reputation,
+    // and any host that can link a Windows binary has the resource compiler.
+    // Silently shipping a bare PE would defeat the purpose.
+    res.compile()
+        .expect("winresource: failed to embed Windows version-info/manifest");
 }
 
 #[cfg(not(windows))]

@@ -43,21 +43,29 @@ function Get-TargetVersion {
     return $r.tag_name
   }
   if ($PreRelease) {
-    $r = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases") | Where-Object { $_.prerelease } | Select-Object -First 1
+    try { $list = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=100" -ErrorAction Stop }
+    catch { Write-Fatal "Could not query GitHub releases (rate limit or network?): $_" }
+    $r = $list | Where-Object { $_.prerelease } | Select-Object -First 1
     if (-not $r) { Write-Fatal "No pre-release found" }
     return $r.tag_name
   }
-  return (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+  try { return (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -ErrorAction Stop).tag_name }
+  catch { Write-Fatal "Could not query the latest GitHub release (rate limit or network?): $_" }
 }
 
 function Get-InstalledVersion {
-  $cmd = Get-Command mwsql -ErrorAction SilentlyContinue
-  if (-not $cmd) {
-    $known = Join-Path (Get-InstallDir) $Probe
-    if (Test-Path $known) { $cmd = $known } else { return $null }
+  # Prefer our own install dir; fall back to the .exe on PATH (never a bare
+  # `mwsql` alias/function/script).
+  $known = Join-Path (Get-InstallDir) $Probe
+  if (Test-Path $known) {
+    $bin = $known
+  } else {
+    $cmd = Get-Command $Probe -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    $bin = $cmd.Source
   }
+  if ([string]::IsNullOrEmpty($bin)) { return $null }
   try {
-    $bin = if ($cmd -is [string]) { $cmd } else { $cmd.Source }
     $out = & $bin --version 2>&1
     if ($out -match '(\d+\.\d+\.\d+)') { return "v$($Matches[1])" }
   } catch {}

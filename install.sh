@@ -67,11 +67,15 @@ fetch_target_version() {
     [ -n "$result" ] || fatal "Version ${tag} not found"
     echo "$result"
   elif [ "$use_prerelease" = "1" ]; then
-    http_get "https://api.github.com/repos/${REPO}/releases" \
-      | awk '
-          /"tag_name"/ { t=$0; sub(/.*"tag_name": *"/, "", t); sub(/".*/, "", t); c=t }
-          /"prerelease": *true/ && c != "" { print c; exit }
-          /"prerelease": *false/ { c="" }'
+    # Split the response into one record per release at each "tag_name" key, so
+    # each record holds that release's tag (at its start) and its own
+    # "prerelease" flag — independent of how many releases the page lists.
+    http_get "https://api.github.com/repos/${REPO}/releases?per_page=100" \
+      | awk 'BEGIN { RS="\"tag_name\":" }
+             NR > 1 {
+               tag=$0; sub(/^[[:space:]]*"/, "", tag); sub(/".*/, "", tag);
+               if ($0 ~ /"prerelease":[[:space:]]*true/) { print tag; exit }
+             }'
   else
     http_get "https://api.github.com/repos/${REPO}/releases/latest" \
       | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
@@ -196,7 +200,12 @@ main() {
   done
 
   INSTALL_DIR="$(select_install_dir)"
-  mkdir -p "$INSTALL_DIR"
+  if [ ! -d "$INSTALL_DIR" ]; then
+    if mkdir -p "$INSTALL_DIR" 2>/dev/null; then :
+    elif command -v sudo >/dev/null 2>&1; then
+      info "Requesting sudo to create ${INSTALL_DIR}"; sudo mkdir -p "$INSTALL_DIR"
+    else fatal "Cannot create ${INSTALL_DIR}"; fi
+  fi
   info "Installing to ${INSTALL_DIR}..."
   for bin in $BINARIES; do
     install_binary "${TMP_DIR}/${bin}" "$INSTALL_DIR"
