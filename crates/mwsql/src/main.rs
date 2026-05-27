@@ -35,18 +35,23 @@ enum Cmd {
 #[derive(Args)]
 struct LoginArgs {
     env: String,
-    #[arg(long)] port: u16,
-    #[arg(long, default_value = "127.0.0.1")] host: String,
+    #[arg(long)]
+    port: u16,
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
     /// Read the token from stdin instead of an interactive prompt.
-    #[arg(long)] token_stdin: bool,
+    #[arg(long)]
+    token_stdin: bool,
 }
 
 #[derive(Args)]
 struct RunArgs {
     env: String,
-    #[arg(long)] db: Option<String>,
+    #[arg(long)]
+    db: Option<String>,
     /// SQL to execute. If omitted, read one statement from stdin.
-    #[arg(short = 'e', long)] execute: Option<String>,
+    #[arg(short = 'e', long)]
+    execute: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -64,8 +69,17 @@ fn main() -> Result<()> {
             } else {
                 bail!("stdin is not a terminal; pass --token-stdin");
             };
-            if token.is_empty() { bail!("empty token"); }
-            store.save(&a.env, &StoredCred { token, host: a.host, port: a.port })?;
+            if token.is_empty() {
+                bail!("empty token");
+            }
+            store.save(
+                &a.env,
+                &StoredCred {
+                    token,
+                    host: a.host,
+                    port: a.port,
+                },
+            )?;
             eprintln!("stored credentials for env {:?}", a.env);
         }
         Cmd::Logout { env } => {
@@ -82,7 +96,9 @@ fn main() -> Result<()> {
                     s.trim().to_string()
                 }
             };
-            if sql.is_empty() { bail!("no SQL given (use -e \"...\" or pipe via stdin)"); }
+            if sql.is_empty() {
+                bail!("no SQL given (use -e \"...\" or pipe via stdin)");
+            }
             let rt = tokio::runtime::Runtime::new()?;
             let out = rt.block_on(mwsql::run_sql_as(&a.env, &cred, a.db.as_deref(), &sql))?;
             println!("{out}");

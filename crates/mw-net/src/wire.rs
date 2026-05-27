@@ -59,12 +59,15 @@ pub fn row_text_packet(row: &Row) -> Vec<u8> {
                 } else if *us == 0 {
                     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
                 } else {
-                    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", y, mo, d, h, mi, s, us)
+                    format!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                        y, mo, d, h, mi, s, us
+                    )
                 };
                 push_lenenc_bytes(&mut p, s.as_bytes());
             }
             Value::Time(neg, days, h, mi, s, us) => {
-                let total_h = (*days as u32) * 24 + (*h as u32);
+                let total_h = *days * 24 + (*h as u32);
                 let sign = if *neg { "-" } else { "" };
                 let s = if *us == 0 {
                     format!("{sign}{:02}:{:02}:{:02}", total_h, mi, s)
@@ -97,10 +100,19 @@ fn push_lenenc_bytes(out: &mut Vec<u8>, b: &[u8]) {
 }
 
 fn format_float(d: f64) -> String {
-    if d.is_nan() { "NaN".into() }
-    else if d.is_infinite() { if d.is_sign_negative() { "-inf".into() } else { "inf".into() } }
-    else if d.fract() == 0.0 && d.abs() < 1e15 { format!("{:.0}", d) }
-    else { format!("{}", d) }
+    if d.is_nan() {
+        "NaN".into()
+    } else if d.is_infinite() {
+        if d.is_sign_negative() {
+            "-inf".into()
+        } else {
+            "inf".into()
+        }
+    } else if d.fract() == 0.0 && d.abs() < 1e15 {
+        format!("{:.0}", d)
+    } else {
+        format!("{}", d)
+    }
 }
 
 fn column_type_to_byte(t: ColumnType) -> u8 {

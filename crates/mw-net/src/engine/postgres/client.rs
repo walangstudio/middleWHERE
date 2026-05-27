@@ -21,7 +21,9 @@ pub struct PgManager {
 }
 
 impl PgManager {
-    pub fn new(opts: BackendOpts) -> Self { Self { opts } }
+    pub fn new(opts: BackendOpts) -> Self {
+        Self { opts }
+    }
 
     fn config(&self) -> tokio_postgres::Config {
         let mut c = tokio_postgres::Config::new();

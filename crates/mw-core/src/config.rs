@@ -16,14 +16,12 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 /// schema-v1 sealed configs (which predate this field) deserialize unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EngineKind {
+    #[default]
     MySql,
     Postgres,
     MsSql,
-}
-
-impl Default for EngineKind {
-    fn default() -> Self { EngineKind::MySql }
 }
 
 impl EngineKind {
@@ -40,18 +38,18 @@ impl EngineKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub schema_version: u32,
-    pub bastions:    BTreeMap<String, Bastion>,
+    pub bastions: BTreeMap<String, Bastion>,
     pub credentials: BTreeMap<String, Credential>,
-    pub envs:        BTreeMap<String, Env>,
+    pub envs: BTreeMap<String, Env>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
-            bastions:    BTreeMap::new(),
+            bastions: BTreeMap::new(),
             credentials: BTreeMap::new(),
-            envs:        BTreeMap::new(),
+            envs: BTreeMap::new(),
         }
     }
 }
@@ -68,7 +66,9 @@ pub struct Bastion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BastionAuth {
-    Password { password: SecretStr },
+    Password {
+        password: SecretStr,
+    },
     Key {
         private_key_pem: SecretBytes,
         passphrase: Option<SecretStr>,
@@ -141,10 +141,15 @@ mod serde_arr20 {
             fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; 20], E> {
                 self.visit_bytes(&v)
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 20], A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<[u8; 20], A::Error> {
                 let mut out = [0u8; 20];
                 for slot in out.iter_mut() {
-                    *slot = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(20, &self))?;
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(20, &self))?;
                 }
                 Ok(out)
             }
@@ -172,10 +177,15 @@ mod serde_arr32 {
             fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; 32], E> {
                 self.visit_bytes(&v)
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 32], A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<[u8; 32], A::Error> {
                 let mut out = [0u8; 32];
                 for slot in out.iter_mut() {
-                    *slot = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
                 }
                 Ok(out)
             }
@@ -186,7 +196,9 @@ mod serde_arr32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Policy {
+    #[default]
     ReadOnly,
     ReadWrite,
     Custom {
@@ -194,10 +206,6 @@ pub enum Policy {
         allow_ddl: bool,
         allow_admin: bool,
     },
-}
-
-impl Default for Policy {
-    fn default() -> Self { Policy::ReadOnly }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,7 +217,11 @@ pub struct PoolSettings {
 
 impl Default for PoolSettings {
     fn default() -> Self {
-        Self { min_idle: 0, max_size: 16, idle_timeout_secs: 300 }
+        Self {
+            min_idle: 0,
+            max_size: 16,
+            idle_timeout_secs: 300,
+        }
     }
 }
 
@@ -258,7 +270,8 @@ impl Config {
             };
             if !auth_ok {
                 return Err(ConfigError::EngineAuthMismatch(
-                    env_name.clone(), env.engine,
+                    env_name.clone(),
+                    env.engine,
                 ));
             }
             if let Some(prev) = seen_ports.insert(env.listen_port, env_name.as_str()) {
@@ -322,22 +335,30 @@ mod migrate_tests {
 
     fn one_env_config() -> Config {
         let mut cfg = Config::default();
-        cfg.credentials.insert("c".into(), Credential {
-            backend_user: "u".into(),
-            backend_password: SecretStr::new("pw"),
-        });
-        cfg.envs.insert("e".into(), Env {
-            backend_host: "h".into(),
-            backend_port: 3306,
-            default_database: None,
-            bastion: None,
-            credential: "c".into(),
-            policy: Policy::ReadOnly,
-            client_auth: ClientAuth::NativePassword { double_sha1: [0; 20] },
-            listen_port: 6033,
-            pool: PoolSettings::default(),
-            engine: EngineKind::MySql,
-        });
+        cfg.credentials.insert(
+            "c".into(),
+            Credential {
+                backend_user: "u".into(),
+                backend_password: SecretStr::new("pw"),
+            },
+        );
+        cfg.envs.insert(
+            "e".into(),
+            Env {
+                backend_host: "h".into(),
+                backend_port: 3306,
+                default_database: None,
+                bastion: None,
+                credential: "c".into(),
+                policy: Policy::ReadOnly,
+                client_auth: ClientAuth::NativePassword {
+                    double_sha1: [0; 20],
+                },
+                listen_port: 6033,
+                pool: PoolSettings::default(),
+                engine: EngineKind::MySql,
+            },
+        );
         cfg
     }
 
@@ -387,6 +408,9 @@ mod migrate_tests {
         let cfg = one_env_config();
         let mut v = ciborium::Value::serialized(&cfg).unwrap();
         set_schema_version(&mut v, 999);
-        assert!(matches!(migrate(v), Err(ConfigError::UnsupportedSchema(999))));
+        assert!(matches!(
+            migrate(v),
+            Err(ConfigError::UnsupportedSchema(999))
+        ));
     }
 }

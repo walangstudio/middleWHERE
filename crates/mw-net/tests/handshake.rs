@@ -16,10 +16,16 @@ use tokio::net::{TcpListener, TcpStream};
 /// only exercise COM_PING / COM_QUIT, which `serve_session` answers without
 /// ever borrowing from the pool, so it is never connected.
 fn dead_pool() -> mw_net::mysql_client::BackendPool {
-    build_pool(BackendOpts {
-        host: "127.0.0.1".into(), port: 1,
-        user: "x".into(), password: SecretStr::new("x"), database: None,
-    }, 1)
+    build_pool(
+        BackendOpts {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: SecretStr::new("x"),
+            database: None,
+        },
+        1,
+    )
 }
 
 /// Pull the 20-byte scramble out of an Initial Handshake Packet v10.
@@ -28,7 +34,10 @@ fn dead_pool() -> mw_net::mysql_client::BackendPool {
 /// auth_data_len(1) + reserved(10) + scramble_p2(12) + NUL + plugin_name(NUL)
 fn parse_scramble_from_greeting(g: &[u8]) -> [u8; 20] {
     assert_eq!(g[0], 10, "expected protocol version 10");
-    let nul = g[1..].iter().position(|&b| b == 0).expect("server_version NUL");
+    let nul = g[1..]
+        .iter()
+        .position(|&b| b == 0)
+        .expect("server_version NUL");
     let mut cur = 1 + nul + 1 + 4;
     let mut out = [0u8; 20];
     out[..8].copy_from_slice(&g[cur..cur + 8]);
@@ -72,7 +81,9 @@ where
 
 #[tokio::test]
 async fn happy_path_auth_ok() {
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(b"correct-token") };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"correct-token"),
+    };
     let (mut server, mut client) = pair().await;
     let server_task = tokio::spawn(async move {
         let session = handshake(&mut server, "stage_w9", &auth, 42).await.unwrap();
@@ -80,14 +91,30 @@ async fn happy_path_auth_ok() {
         assert_eq!(session.client_username_seen, "stage_w9");
         assert_eq!(session.database.as_deref(), Some("reports"));
         let pool = dead_pool();
-        serve_session(&mut server, "stage_w9", &session.client_username_seen,
-                       &pool, &Policy::ReadOnly).await.unwrap();
+        serve_session(
+            &mut server,
+            "stage_w9",
+            &session.client_username_seen,
+            &pool,
+            &Policy::ReadOnly,
+        )
+        .await
+        .unwrap();
     });
 
     let (reply, _) = client_handshake_send(
-        &mut client, b"stage_w9", b"correct-token", b"mysql_native_password", Some(b"reports"),
-    ).await;
-    assert!(testing::is_ok_packet(&reply), "expected OK packet, got {:02x?}", reply);
+        &mut client,
+        b"stage_w9",
+        b"correct-token",
+        b"mysql_native_password",
+        Some(b"reports"),
+    )
+    .await;
+    assert!(
+        testing::is_ok_packet(&reply),
+        "expected OK packet, got {:02x?}",
+        reply
+    );
 
     // COM_PING -> OK
     let mut seq = SequenceCounter::default();
@@ -104,29 +131,54 @@ async fn happy_path_auth_ok() {
 
 #[tokio::test]
 async fn wrong_token_denied() {
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(b"real-token") };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"real-token"),
+    };
     let (mut server, mut client) = pair().await;
     let server_task = tokio::spawn(async move {
-        let err = handshake(&mut server, "stage_w9", &auth, 1).await.unwrap_err();
-        assert!(matches!(err, mw_net::mysql_server::HandshakeError::AuthFailed));
+        let err = handshake(&mut server, "stage_w9", &auth, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            mw_net::mysql_server::HandshakeError::AuthFailed
+        ));
     });
     let (reply, _) = client_handshake_send(
-        &mut client, b"stage_w9", b"wrong-token", b"mysql_native_password", None,
-    ).await;
-    assert_eq!(testing::err_code_of(&reply), Some(1045), "expected ER_ACCESS_DENIED");
+        &mut client,
+        b"stage_w9",
+        b"wrong-token",
+        b"mysql_native_password",
+        None,
+    )
+    .await;
+    assert_eq!(
+        testing::err_code_of(&reply),
+        Some(1045),
+        "expected ER_ACCESS_DENIED"
+    );
     server_task.await.unwrap();
 }
 
 #[tokio::test]
 async fn wrong_env_name_denied() {
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(b"tk") };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"tk"),
+    };
     let (mut server, mut client) = pair().await;
     let server_task = tokio::spawn(async move {
-        let _ = handshake(&mut server, "stage_w9", &auth, 1).await.unwrap_err();
+        let _ = handshake(&mut server, "stage_w9", &auth, 1)
+            .await
+            .unwrap_err();
     });
     let (reply, _) = client_handshake_send(
-        &mut client, b"prod_w9", b"tk", b"mysql_native_password", None,
-    ).await;
+        &mut client,
+        b"prod_w9",
+        b"tk",
+        b"mysql_native_password",
+        None,
+    )
+    .await;
     assert_eq!(testing::err_code_of(&reply), Some(1045));
     server_task.await.unwrap();
 }
@@ -134,7 +186,12 @@ async fn wrong_env_name_denied() {
 /// Pull the switch scramble out of an AuthSwitchRequest packet:
 /// `0xFE | "mysql_native_password\0" | scramble(20) | 0x00`.
 fn parse_auth_switch(asr: &[u8]) -> [u8; 20] {
-    assert_eq!(asr[0], 0xFE, "expected AuthSwitchRequest, got {:02x?}", &asr[..asr.len().min(8)]);
+    assert_eq!(
+        asr[0],
+        0xFE,
+        "expected AuthSwitchRequest, got {:02x?}",
+        &asr[..asr.len().min(8)]
+    );
     let nul = asr[1..].iter().position(|&b| b == 0).expect("plugin NUL");
     assert_eq!(&asr[1..1 + nul], b"mysql_native_password");
     let start = 1 + nul + 1;
@@ -148,7 +205,9 @@ fn parse_auth_switch(asr: &[u8]) -> [u8; 20] {
 /// after replying with a native response over the switch scramble.
 #[tokio::test]
 async fn non_native_plugin_auth_switch_ok() {
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(b"tk") };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"tk"),
+    };
     let (mut server, mut client) = pair().await;
     let server_task = tokio::spawn(async move {
         let session = handshake(&mut server, "stage_w9", &auth, 1).await.unwrap();
@@ -156,30 +215,41 @@ async fn non_native_plugin_auth_switch_ok() {
     });
     let mut seq = SequenceCounter::default();
     let _greeting = read_packet(&mut client, &mut seq).await.unwrap();
-    let payload = testing::build_handshake_response(
-        b"stage_w9", &[0u8; 20], None, b"caching_sha2_password");
+    let payload =
+        testing::build_handshake_response(b"stage_w9", &[0u8; 20], None, b"caching_sha2_password");
     write_packet(&mut client, &mut seq, &payload).await.unwrap();
     let asr = read_packet(&mut client, &mut seq).await.unwrap();
     let switch_scr = parse_auth_switch(&asr);
     let resp = native_response(b"tk", &switch_scr);
     write_packet(&mut client, &mut seq, &resp).await.unwrap();
     let reply = read_packet(&mut client, &mut seq).await.unwrap();
-    assert!(testing::is_ok_packet(&reply), "expected OK after auth switch, got {:02x?}", reply);
+    assert!(
+        testing::is_ok_packet(&reply),
+        "expected OK after auth switch, got {:02x?}",
+        reply
+    );
     server_task.await.unwrap();
 }
 
 #[tokio::test]
 async fn auth_switch_wrong_token_denied() {
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(b"correct") };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"correct"),
+    };
     let (mut server, mut client) = pair().await;
     let server_task = tokio::spawn(async move {
-        let err = handshake(&mut server, "stage_w9", &auth, 1).await.unwrap_err();
-        assert!(matches!(err, mw_net::mysql_server::HandshakeError::AuthFailed));
+        let err = handshake(&mut server, "stage_w9", &auth, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            mw_net::mysql_server::HandshakeError::AuthFailed
+        ));
     });
     let mut seq = SequenceCounter::default();
     let _greeting = read_packet(&mut client, &mut seq).await.unwrap();
-    let payload = testing::build_handshake_response(
-        b"stage_w9", &[0u8; 20], None, b"caching_sha2_password");
+    let payload =
+        testing::build_handshake_response(b"stage_w9", &[0u8; 20], None, b"caching_sha2_password");
     write_packet(&mut client, &mut seq, &payload).await.unwrap();
     let asr = read_packet(&mut client, &mut seq).await.unwrap();
     let switch_scr = parse_auth_switch(&asr);

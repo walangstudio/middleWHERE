@@ -17,15 +17,23 @@ pub enum PolicyTarget {
     ReadWrite,
 }
 
-pub fn set(state_dir: &Path, ks: &KeystoreChoice, env_name: &str, target: PolicyTarget, confirm_unsafe: bool) -> Result<()> {
+pub fn set(
+    state_dir: &Path,
+    ks: &KeystoreChoice,
+    env_name: &str,
+    target: PolicyTarget,
+    confirm_unsafe: bool,
+) -> Result<()> {
     if target == PolicyTarget::ReadWrite && !confirm_unsafe {
         bail!("ReadWrite requires --i-know-what-im-doing");
     }
     with_config(state_dir, ks, |cfg| {
-        let env = cfg.envs.get_mut(env_name)
+        let env = cfg
+            .envs
+            .get_mut(env_name)
             .ok_or_else(|| anyhow!("env {:?} not found", env_name))?;
         env.policy = match target {
-            PolicyTarget::ReadOnly  => Policy::ReadOnly,
+            PolicyTarget::ReadOnly => Policy::ReadOnly,
             PolicyTarget::ReadWrite => Policy::ReadWrite,
         };
         Ok(())

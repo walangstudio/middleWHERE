@@ -1,8 +1,10 @@
 //! Round-trip a realistic multi-env config through the seal layer.
 //! Covers three capabilities that a flat env-file deployment can't do cleanly:
-//!  - same backend username with different passwords across envs
-//!  - shared bastion across envs
-//!  - shared credential across envs
+//!
+//! - same backend username with different passwords across envs
+//! - shared bastion across envs
+//! - shared credential across envs
+//!
 //! Also asserts no plaintext password material survives on disk.
 
 use mw_core::config::*;
@@ -19,90 +21,131 @@ fn sample_config() -> Config {
     use std::collections::BTreeMap;
 
     let mut bastions = BTreeMap::new();
-    bastions.insert("corp-jump".to_string(), Bastion {
-        host: "jump.corp.example".into(),
-        port: 22,
-        ssh_user: "tunnel".into(),
-        auth: BastionAuth::Password { password: SecretStr::new(BASTION_PW) },
-        pinned_host_keys: vec![HostKeyFingerprint {
-            algo: "ssh-ed25519".into(),
-            sha256_b64: "AAAAC3NzaC1lZDI1NTE5AAAAIExampleFingerprint".into(),
-        }],
-    });
+    bastions.insert(
+        "corp-jump".to_string(),
+        Bastion {
+            host: "jump.corp.example".into(),
+            port: 22,
+            ssh_user: "tunnel".into(),
+            auth: BastionAuth::Password {
+                password: SecretStr::new(BASTION_PW),
+            },
+            pinned_host_keys: vec![HostKeyFingerprint {
+                algo: "ssh-ed25519".into(),
+                sha256_b64: "AAAAC3NzaC1lZDI1NTE5AAAAIExampleFingerprint".into(),
+            }],
+        },
+    );
 
     let mut credentials = BTreeMap::new();
     // Two distinct credentials sharing the same backend username with different
     // passwords. v1 ProxySQL refuses this; v2 must accept it.
-    credentials.insert("app_read_stage".to_string(), Credential {
-        backend_user: "app_read".into(),
-        backend_password: SecretStr::new(STAGE_PW),
-    });
-    credentials.insert("app_read_prod".to_string(), Credential {
-        backend_user: "app_read".into(),
-        backend_password: SecretStr::new(PROD_PW),
-    });
+    credentials.insert(
+        "app_read_stage".to_string(),
+        Credential {
+            backend_user: "app_read".into(),
+            backend_password: SecretStr::new(STAGE_PW),
+        },
+    );
+    credentials.insert(
+        "app_read_prod".to_string(),
+        Credential {
+            backend_user: "app_read".into(),
+            backend_password: SecretStr::new(PROD_PW),
+        },
+    );
     // A shared credential referenced by two envs.
-    credentials.insert("reporting".to_string(), Credential {
-        backend_user: "reporter".into(),
-        backend_password: SecretStr::new(SHARED_PW),
-    });
+    credentials.insert(
+        "reporting".to_string(),
+        Credential {
+            backend_user: "reporter".into(),
+            backend_password: SecretStr::new(SHARED_PW),
+        },
+    );
 
     let mut envs = BTreeMap::new();
-    envs.insert("stage_w9".to_string(), Env {
-        backend_host: "db-stage.corp.example".into(),
-        backend_port: 3306,
-        default_database: None,
-        bastion: Some("corp-jump".into()),
-        credential: "app_read_stage".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: mw_core::token::double_sha1(b"stage-token") },
-        listen_port: 6033,
-        pool: PoolSettings::default(),
-        engine: EngineKind::MySql,
-    });
-    envs.insert("prod_w9".to_string(), Env {
-        backend_host: "db-prod.corp.example".into(),
-        backend_port: 3306,
-        default_database: None,
-        bastion: Some("corp-jump".into()),
-        credential: "app_read_prod".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: mw_core::token::double_sha1(b"prod-token") },
-        listen_port: 6034,
-        pool: PoolSettings::default(),
-        engine: EngineKind::MySql,
-    });
-    envs.insert("stage_reports".to_string(), Env {
-        backend_host: "db-stage.corp.example".into(),
-        backend_port: 3306,
-        default_database: Some("reports".into()),
-        bastion: Some("corp-jump".into()),
-        credential: "reporting".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: mw_core::token::double_sha1(b"rpt1-token") },
-        listen_port: 6035,
-        pool: PoolSettings::default(),
-        engine: EngineKind::MySql,
-    });
-    envs.insert("prod_reports".to_string(), Env {
-        backend_host: "db-prod.corp.example".into(),
-        backend_port: 3306,
-        default_database: Some("reports".into()),
-        bastion: Some("corp-jump".into()),
-        credential: "reporting".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: mw_core::token::double_sha1(b"rpt2-token") },
-        listen_port: 6036,
-        pool: PoolSettings::default(),
-        engine: EngineKind::MySql,
-    });
+    envs.insert(
+        "stage_w9".to_string(),
+        Env {
+            backend_host: "db-stage.corp.example".into(),
+            backend_port: 3306,
+            default_database: None,
+            bastion: Some("corp-jump".into()),
+            credential: "app_read_stage".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: mw_core::token::double_sha1(b"stage-token"),
+            },
+            listen_port: 6033,
+            pool: PoolSettings::default(),
+            engine: EngineKind::MySql,
+        },
+    );
+    envs.insert(
+        "prod_w9".to_string(),
+        Env {
+            backend_host: "db-prod.corp.example".into(),
+            backend_port: 3306,
+            default_database: None,
+            bastion: Some("corp-jump".into()),
+            credential: "app_read_prod".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: mw_core::token::double_sha1(b"prod-token"),
+            },
+            listen_port: 6034,
+            pool: PoolSettings::default(),
+            engine: EngineKind::MySql,
+        },
+    );
+    envs.insert(
+        "stage_reports".to_string(),
+        Env {
+            backend_host: "db-stage.corp.example".into(),
+            backend_port: 3306,
+            default_database: Some("reports".into()),
+            bastion: Some("corp-jump".into()),
+            credential: "reporting".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: mw_core::token::double_sha1(b"rpt1-token"),
+            },
+            listen_port: 6035,
+            pool: PoolSettings::default(),
+            engine: EngineKind::MySql,
+        },
+    );
+    envs.insert(
+        "prod_reports".to_string(),
+        Env {
+            backend_host: "db-prod.corp.example".into(),
+            backend_port: 3306,
+            default_database: Some("reports".into()),
+            bastion: Some("corp-jump".into()),
+            credential: "reporting".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: mw_core::token::double_sha1(b"rpt2-token"),
+            },
+            listen_port: 6036,
+            pool: PoolSettings::default(),
+            engine: EngineKind::MySql,
+        },
+    );
 
-    Config { schema_version: CURRENT_SCHEMA_VERSION, bastions, credentials, envs }
+    Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        bastions,
+        credentials,
+        envs,
+    }
 }
 
 #[test]
 fn validates_clean() {
-    sample_config().validate().expect("sample config should validate");
+    sample_config()
+        .validate()
+        .expect("sample config should validate");
 }
 
 #[test]
@@ -140,14 +183,20 @@ fn roundtrip_preserves_shape_and_secrets() {
 
     // No plaintext password material in the sealed blob.
     for needle in [PROD_PW, STAGE_PW, SHARED_PW, BASTION_PW] {
-        assert!(!contains(&blob, needle.as_bytes()),
-            "sealed blob leaked {:?}", needle);
+        assert!(
+            !contains(&blob, needle.as_bytes()),
+            "sealed blob leaked {:?}",
+            needle
+        );
     }
     // No plaintext identifiers either (defense-in-depth — ciborium would
     // serialize map keys verbatim if the blob were unencrypted).
     for needle in ["app_read_prod", "corp-jump", "db-prod.corp.example"] {
-        assert!(!contains(&blob, needle.as_bytes()),
-            "sealed blob leaked identifier {:?}", needle);
+        assert!(
+            !contains(&blob, needle.as_bytes()),
+            "sealed blob leaked identifier {:?}",
+            needle
+        );
     }
 
     let back = unseal(&blob, &mk, &pp).expect("unseal");
@@ -167,10 +216,22 @@ fn roundtrip_preserves_shape_and_secrets() {
     );
 
     // Shared bastion + shared credential references survive.
-    assert_eq!(back.envs.get("stage_w9").unwrap().bastion.as_deref(), Some("corp-jump"));
-    assert_eq!(back.envs.get("prod_w9").unwrap().bastion.as_deref(), Some("corp-jump"));
-    assert_eq!(back.envs.get("stage_reports").unwrap().credential, "reporting");
-    assert_eq!(back.envs.get("prod_reports").unwrap().credential, "reporting");
+    assert_eq!(
+        back.envs.get("stage_w9").unwrap().bastion.as_deref(),
+        Some("corp-jump")
+    );
+    assert_eq!(
+        back.envs.get("prod_w9").unwrap().bastion.as_deref(),
+        Some("corp-jump")
+    );
+    assert_eq!(
+        back.envs.get("stage_reports").unwrap().credential,
+        "reporting"
+    );
+    assert_eq!(
+        back.envs.get("prod_reports").unwrap().credential,
+        "reporting"
+    );
 
     let bastion_pw = match &back.bastions.get("corp-jump").unwrap().auth {
         BastionAuth::Password { password } => password.expose().to_string(),

@@ -18,8 +18,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub struct SecretStr(String);
 
 impl SecretStr {
-    pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
-    pub fn expose(&self) -> &str { &self.0 }
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SecretStr {
@@ -29,7 +33,9 @@ impl std::fmt::Debug for SecretStr {
 }
 
 impl Drop for SecretStr {
-    fn drop(&mut self) { self.0.zeroize(); }
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl Serialize for SecretStr {
@@ -44,16 +50,28 @@ impl<'de> Deserialize<'de> for SecretStr {
     }
 }
 
-impl From<String> for SecretStr { fn from(s: String) -> Self { Self(s) } }
-impl From<&str> for SecretStr { fn from(s: &str) -> Self { Self(s.to_string()) } }
+impl From<String> for SecretStr {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<&str> for SecretStr {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
 
 /// Owned secret byte sequence (e.g. SSH key PEM). Serializes as bytes.
 #[derive(Clone, Default, ZeroizeOnDrop)]
 pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
-    pub fn new(b: impl Into<Vec<u8>>) -> Self { Self(b.into()) }
-    pub fn expose(&self) -> &[u8] { &self.0 }
+    pub fn new(b: impl Into<Vec<u8>>) -> Self {
+        Self(b.into())
+    }
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SecretBytes {
@@ -83,9 +101,14 @@ impl<'de> Deserialize<'de> for SecretBytes {
             fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
                 Ok(v)
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(b) = seq.next_element::<u8>()? { out.push(b); }
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
                 Ok(out)
             }
         }

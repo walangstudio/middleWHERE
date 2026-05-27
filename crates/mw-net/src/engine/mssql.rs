@@ -10,16 +10,22 @@ use crate::engine::{Backend, BackendOpts, Engine, EngineError, Session};
 pub struct MsSqlEngine;
 
 impl MsSqlEngine {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for MsSqlEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl Engine for MsSqlEngine {
-    fn kind(&self) -> EngineKind { EngineKind::MsSql }
+    fn kind(&self) -> EngineKind {
+        EngineKind::MsSql
+    }
 
     async fn accept(
         &self,

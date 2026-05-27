@@ -6,7 +6,11 @@ use clap::{Parser, Subcommand};
 use mwsqld::{default_state_dir, init as init_state, load_config, Daemon, KeystoreChoice};
 
 #[derive(Parser)]
-#[command(name = "mwsqld", version, about = "middleWHERE secure SQL gateway daemon")]
+#[command(
+    name = "mwsqld",
+    version,
+    about = "middleWHERE secure SQL gateway daemon"
+)]
 struct Cli {
     /// State directory (config.sealed + audit/).
     #[arg(long, global = true)]
@@ -67,7 +71,10 @@ fn main() -> Result<()> {
                 eprintln!("initialized at {}", state_dir.display());
                 Ok(())
             }
-            Cmd::Run { listen_host, allow_tofu } => {
+            Cmd::Run {
+                listen_host,
+                allow_tofu,
+            } => {
                 // Process owns the global subscriber + audit writer guard for
                 // its whole lifetime. Not done inside Daemon::bind on purpose.
                 let _audit = mwsqld::install_audit(&state_dir)?;

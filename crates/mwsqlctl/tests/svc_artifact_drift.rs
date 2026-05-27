@@ -9,8 +9,10 @@ use mwsqlctl::installer::{launchd_plist, systemd_unit, windows_install_ps1, Inst
 fn workspace_root() -> PathBuf {
     // crates/mwsqlctl -> ../../
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf()
 }
 

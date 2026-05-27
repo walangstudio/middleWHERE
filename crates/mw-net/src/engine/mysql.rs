@@ -17,22 +17,30 @@ use crate::router::serve_session;
 pub struct MySqlEngine;
 
 impl MySqlEngine {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for MySqlEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct MySqlBackend(pub BackendPool);
 
 impl Backend for MySqlBackend {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
 impl Engine for MySqlEngine {
-    fn kind(&self) -> EngineKind { EngineKind::MySql }
+    fn kind(&self) -> EngineKind {
+        EngineKind::MySql
+    }
 
     async fn accept(
         &self,

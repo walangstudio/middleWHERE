@@ -51,7 +51,9 @@ pub struct BackendManager {
 }
 
 impl BackendManager {
-    pub fn new(opts: BackendOpts) -> Self { Self { opts } }
+    pub fn new(opts: BackendOpts) -> Self {
+        Self { opts }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

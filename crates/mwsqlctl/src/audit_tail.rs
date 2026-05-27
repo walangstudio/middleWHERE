@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 
 pub fn tail(state_dir: &Path, n: usize) -> Result<Vec<String>> {
     let dir = state_dir.join("audit");
-    if !dir.exists() { return Ok(Vec::new()); }
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
 
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .with_context(|| format!("read_dir {}", dir.display()))?
@@ -16,7 +18,9 @@ pub fn tail(state_dir: &Path, n: usize) -> Result<Vec<String>> {
         .filter(|e| e.file_name().to_string_lossy().starts_with("audit.jsonl"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
-    let Some(latest) = entries.last() else { return Ok(Vec::new()); };
+    let Some(latest) = entries.last() else {
+        return Ok(Vec::new());
+    };
 
     let body = std::fs::read_to_string(latest.path())
         .with_context(|| format!("read {}", latest.path().display()))?;

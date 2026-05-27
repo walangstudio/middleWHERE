@@ -32,29 +32,37 @@ pub struct OsClientStore {
 }
 
 impl OsClientStore {
-    pub fn new() -> Self { Self { service: "middlewhere-client".into() } }
+    pub fn new() -> Self {
+        Self {
+            service: "middlewhere-client".into(),
+        }
+    }
     fn entry(&self, env: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(&self.service, env)
-            .map_err(|e| anyhow!("keyring entry: {e}"))
+        keyring::Entry::new(&self.service, env).map_err(|e| anyhow!("keyring entry: {e}"))
     }
 }
 
 impl Default for OsClientStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClientTokenStore for OsClientStore {
     fn save(&self, env: &str, cred: &StoredCred) -> Result<()> {
         let json = serde_json::to_string(cred)?;
-        self.entry(env)?.set_password(&json).map_err(|e| anyhow!("keyring set: {e}"))
+        self.entry(env)?
+            .set_password(&json)
+            .map_err(|e| anyhow!("keyring set: {e}"))
     }
     fn load(&self, env: &str) -> Result<StoredCred> {
         let json = self.entry(env)?.get_password().map_err(|e| match e {
-            keyring::Error::NoEntry =>
-                anyhow!("no credentials for env {env:?}; run: mwsql login {env} --port <p>"),
+            keyring::Error::NoEntry => {
+                anyhow!("no credentials for env {env:?}; run: mwsql login {env} --port <p>")
+            }
             other => anyhow!("keyring get: {other}"),
         })?;
-        Ok(serde_json::from_str(&json).context("decode stored credential")?)
+        serde_json::from_str(&json).context("decode stored credential")
     }
     fn delete(&self, env: &str) -> Result<()> {
         match self.entry(env)?.delete_credential() {
@@ -72,8 +80,12 @@ pub struct FileClientStore {
 }
 
 impl FileClientStore {
-    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self { Self { dir: dir.into() } }
-    fn path(&self, env: &str) -> std::path::PathBuf { self.dir.join(format!("{env}.json")) }
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+    fn path(&self, env: &str) -> std::path::PathBuf {
+        self.dir.join(format!("{env}.json"))
+    }
 }
 
 impl ClientTokenStore for FileClientStore {
@@ -92,7 +104,7 @@ impl ClientTokenStore for FileClientStore {
                 anyhow!("read {}: {e}", p.display())
             }
         })?;
-        Ok(serde_json::from_str(&body).context("decode stored credential")?)
+        serde_json::from_str(&body).context("decode stored credential")
     }
     fn delete(&self, env: &str) -> Result<()> {
         match std::fs::remove_file(self.path(env)) {
@@ -108,7 +120,10 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true).mode(0o600)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
         .open(path)?;
     f.write_all(bytes)?;
     Ok(())
@@ -141,7 +156,9 @@ pub async fn run_sql_as(
         b = b.db_name(Some(db.to_string()));
     }
     let mut conn = Conn::new(b).await.with_context(|| "connect to proxy")?;
-    let mut qr = conn.query_iter(sql.to_string()).await
+    let mut qr = conn
+        .query_iter(sql.to_string())
+        .await
         .with_context(|| "query rejected")?;
 
     let cols = qr.columns().map(|a| a.to_vec());
@@ -176,10 +193,15 @@ fn render_value(v: &mysql_async::Value) -> String {
         UInt(n) => n.to_string(),
         Float(f) => f.to_string(),
         Double(d) => d.to_string(),
-        Date(y, mo, d, h, mi, s, _) =>
-            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"),
-        Time(neg, d, h, mi, s, _) =>
-            format!("{}{}:{:02}:{:02}:{:02}", if *neg {"-"} else {""}, d, h, mi, s),
+        Date(y, mo, d, h, mi, s, _) => format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"),
+        Time(neg, d, h, mi, s, _) => format!(
+            "{}{}:{:02}:{:02}:{:02}",
+            if *neg { "-" } else { "" },
+            d,
+            h,
+            mi,
+            s
+        ),
     }
 }
 
@@ -187,13 +209,18 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for r in rows {
         for (i, c) in r.iter().enumerate() {
-            if i < widths.len() { widths[i] = widths[i].max(c.len()); }
+            if i < widths.len() {
+                widths[i] = widths[i].max(c.len());
+            }
         }
     }
     let line = |cells: &[String]| -> String {
-        cells.iter().enumerate()
+        cells
+            .iter()
+            .enumerate()
             .map(|(i, c)| format!("{:<w$}", c, w = widths.get(i).copied().unwrap_or(0)))
-            .collect::<Vec<_>>().join("  ")
+            .collect::<Vec<_>>()
+            .join("  ")
     };
     let mut s = String::new();
     s.push_str(&line(headers));
@@ -203,7 +230,11 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
         s.push('\n');
         s.push_str(&line(r));
     }
-    s.push_str(&format!("\n({} row{})", rows.len(), if rows.len() == 1 {""} else {"s"}));
+    s.push_str(&format!(
+        "\n({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    ));
     s
 }
 
@@ -215,7 +246,11 @@ mod tests {
     fn file_store_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let store = FileClientStore::new(tmp.path());
-        let cred = StoredCred { token: "tk-123".into(), host: "127.0.0.1".into(), port: 6033 };
+        let cred = StoredCred {
+            token: "tk-123".into(),
+            host: "127.0.0.1".into(),
+            port: 6033,
+        };
         store.save("stage_w9", &cred).unwrap();
         assert_eq!(store.load("stage_w9").unwrap(), cred);
         store.delete("stage_w9").unwrap();
@@ -234,7 +269,11 @@ mod tests {
 
     #[test]
     fn stored_cred_json_is_stable() {
-        let c = StoredCred { token: "t".into(), host: "127.0.0.1".into(), port: 1 };
+        let c = StoredCred {
+            token: "t".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
         let j = serde_json::to_string(&c).unwrap();
         assert_eq!(j, r#"{"token":"t","host":"127.0.0.1","port":1}"#);
     }
@@ -243,7 +282,10 @@ mod tests {
     fn table_render_basic() {
         let t = render_table(
             &["id".into(), "name".into()],
-            &[vec!["1".into(), "alice".into()], vec!["2".into(), "bob".into()]],
+            &[
+                vec!["1".into(), "alice".into()],
+                vec!["2".into(), "bob".into()],
+            ],
         );
         assert!(t.contains("id"));
         assert!(t.contains("alice"));

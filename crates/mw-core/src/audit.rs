@@ -75,14 +75,18 @@ fn hash_stmt(sql: &str) -> String {
     let d = h.finalize();
     let mut s = String::with_capacity(7 + 64);
     s.push_str("sha256:");
-    for b in d { s.push_str(&format!("{:02x}", b)); }
+    for b in d {
+        s.push_str(&format!("{:02x}", b));
+    }
     s
 }
 
 fn first_64(sql: &str) -> String {
     let mut s = String::with_capacity(64);
     for (i, c) in sql.chars().enumerate() {
-        if i >= 64 { break; }
+        if i >= 64 {
+            break;
+        }
         s.push(c);
     }
     s
@@ -103,7 +107,9 @@ fn now_iso8601() -> String {
 /// Returns a guard that must outlive the daemon — dropping it stops the
 /// background writer thread and may lose buffered audit lines.
 pub fn install_subscriber(state_dir: &Path) -> std::io::Result<WorkerGuard> {
-    use tracing_subscriber::{filter::Targets, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+    use tracing_subscriber::{
+        filter::Targets, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer,
+    };
 
     let audit_dir = state_dir.join("audit");
     std::fs::create_dir_all(&audit_dir)?;
@@ -121,9 +127,14 @@ pub fn install_subscriber(state_dir: &Path) -> std::io::Result<WorkerGuard> {
     let console_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(true)
-        .with_filter(Targets::new()
-            .with_default(tracing::Level::INFO)
-            .with_target("middlewhere::audit", tracing::level_filters::LevelFilter::OFF));
+        .with_filter(
+            Targets::new()
+                .with_default(tracing::Level::INFO)
+                .with_target(
+                    "middlewhere::audit",
+                    tracing::level_filters::LevelFilter::OFF,
+                ),
+        );
 
     // `try_init` instead of `init`: a global subscriber may already exist
     // (another daemon instance in-process, an embedding host, or a test
@@ -164,8 +175,13 @@ mod tests {
     #[test]
     fn event_serializes_with_expected_shape() {
         let ev = AuditEvent::new(
-            "stage_w9", "alice", "SELECT 1",
-            Decision::Allow, None, Some(1), Duration::from_millis(5),
+            "stage_w9",
+            "alice",
+            "SELECT 1",
+            Decision::Allow,
+            None,
+            Some(1),
+            Duration::from_millis(5),
         );
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains(r#""decision":"allow""#), "{s}");

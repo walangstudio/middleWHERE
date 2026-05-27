@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 
-use mw_core::config::{ClientAuth, EngineKind, Env, PoolSettings, Policy};
+use mw_core::config::{ClientAuth, EngineKind, Env, Policy, PoolSettings};
 use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
 use mw_core::token::{double_sha1, generate_token, sha256};
@@ -19,11 +19,14 @@ use mw_core::token::{double_sha1, generate_token, sha256};
 /// according to the engine's front-side auth scheme.
 fn client_auth_for(engine: EngineKind, token: &str) -> ClientAuth {
     match engine {
-        EngineKind::Postgres => ClientAuth::PgCleartext { sha256: sha256(token.as_bytes()) },
+        EngineKind::Postgres => ClientAuth::PgCleartext {
+            sha256: sha256(token.as_bytes()),
+        },
         // MsSql is a daemon-side stub; store native_password as a placeholder
         // so config round-trips. It is never used (bind refuses MsSql).
-        EngineKind::MySql | EngineKind::MsSql =>
-            ClientAuth::NativePassword { double_sha1: double_sha1(token.as_bytes()) },
+        EngineKind::MySql | EngineKind::MsSql => ClientAuth::NativePassword {
+            double_sha1: double_sha1(token.as_bytes()),
+        },
     }
 }
 
@@ -50,8 +53,10 @@ pub struct NewEnvOutput {
 
 pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: EnvAddArgs<'_>) -> Result<NewEnvOutput> {
     if args.engine == EngineKind::MsSql {
-        bail!("engine 'mssql' is not implemented yet (TDS protocol stub); \
-               supported engines: mysql, postgres");
+        bail!(
+            "engine 'mssql' is not implemented yet (TDS protocol stub); \
+               supported engines: mysql, postgres"
+        );
     }
     let token = generate_token();
     let token_for_return = SecretStr::new(token.expose());
@@ -74,24 +79,34 @@ pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: EnvAddArgs<'_>) -> Resul
                 }
                 p
             }
-            None => pick_free_port(cfg).ok_or_else(|| anyhow!("no free listen port in 6033..=6064"))?,
+            None => {
+                pick_free_port(cfg).ok_or_else(|| anyhow!("no free listen port in 6033..=6064"))?
+            }
         };
         let mut pool = PoolSettings::default();
-        if let Some(n) = args.max_pool { pool.max_size = n; }
+        if let Some(n) = args.max_pool {
+            pool.max_size = n;
+        }
 
-        cfg.envs.insert(args.name.to_string(), Env {
-            backend_host: args.backend_host.to_string(),
-            backend_port: args.backend_port,
-            default_database: args.default_database.map(|s| s.to_string()),
-            bastion: args.bastion.map(|s| s.to_string()),
-            credential: args.credential.to_string(),
-            policy: args.policy,
-            client_auth: client_auth_for(args.engine, token.expose()),
+        cfg.envs.insert(
+            args.name.to_string(),
+            Env {
+                backend_host: args.backend_host.to_string(),
+                backend_port: args.backend_port,
+                default_database: args.default_database.map(|s| s.to_string()),
+                bastion: args.bastion.map(|s| s.to_string()),
+                credential: args.credential.to_string(),
+                policy: args.policy,
+                client_auth: client_auth_for(args.engine, token.expose()),
+                listen_port,
+                pool,
+                engine: args.engine,
+            },
+        );
+        Ok(NewEnvOutput {
+            token: token_for_return,
             listen_port,
-            pool,
-            engine: args.engine,
-        });
-        Ok(NewEnvOutput { token: token_for_return, listen_port })
+        })
     })
 }
 
@@ -116,10 +131,15 @@ pub fn grant(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<NewEnv
     let token = generate_token();
     let token_for_return = SecretStr::new(token.expose());
     with_config(state_dir, ks, |cfg| {
-        let env = cfg.envs.get_mut(name)
+        let env = cfg
+            .envs
+            .get_mut(name)
             .ok_or_else(|| anyhow!("env {:?} not found", name))?;
         env.client_auth = client_auth_for(env.engine, token.expose());
-        Ok(NewEnvOutput { token: token_for_return, listen_port: env.listen_port })
+        Ok(NewEnvOutput {
+            token: token_for_return,
+            listen_port: env.listen_port,
+        })
     })
 }
 
@@ -136,15 +156,19 @@ pub struct EnvRow {
 
 pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<EnvRow>> {
     let cfg = mw_core::state::load_config(state_dir, ks)?;
-    Ok(cfg.envs.iter().map(|(name, e)| EnvRow {
-        name: name.clone(),
-        backend: format!("{}:{}", e.backend_host, e.backend_port),
-        bastion: e.bastion.clone(),
-        credential: e.credential.clone(),
-        policy: policy_label(&e.policy),
-        listen_port: e.listen_port,
-        engine: engine_label(e.engine),
-    }).collect())
+    Ok(cfg
+        .envs
+        .iter()
+        .map(|(name, e)| EnvRow {
+            name: name.clone(),
+            backend: format!("{}:{}", e.backend_host, e.backend_port),
+            bastion: e.bastion.clone(),
+            credential: e.credential.clone(),
+            policy: policy_label(&e.policy),
+            listen_port: e.listen_port,
+            engine: engine_label(e.engine),
+        })
+        .collect())
 }
 
 pub fn engine_label(e: EngineKind) -> &'static str {
@@ -165,7 +189,7 @@ fn pick_free_port(cfg: &mw_core::config::Config) -> Option<u16> {
 
 pub fn policy_label(p: &Policy) -> &'static str {
     match p {
-        Policy::ReadOnly  => "read-only",
+        Policy::ReadOnly => "read-only",
         Policy::ReadWrite => "read-write",
         Policy::Custom { .. } => "custom",
     }

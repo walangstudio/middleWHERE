@@ -13,22 +13,38 @@ use mw_core::state::KeystoreChoice;
 
 use crate::store::with_config;
 
-pub fn add(state_dir: &Path, ks: &KeystoreChoice, name: &str, backend_user: &str, password: SecretStr) -> Result<()> {
+pub fn add(
+    state_dir: &Path,
+    ks: &KeystoreChoice,
+    name: &str,
+    backend_user: &str,
+    password: SecretStr,
+) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
         if cfg.credentials.contains_key(name) {
             bail!("credential {:?} already exists", name);
         }
-        cfg.credentials.insert(name.to_string(), Credential {
-            backend_user: backend_user.to_string(),
-            backend_password: password,
-        });
+        cfg.credentials.insert(
+            name.to_string(),
+            Credential {
+                backend_user: backend_user.to_string(),
+                backend_password: password,
+            },
+        );
         Ok(())
     })
 }
 
-pub fn rotate(state_dir: &Path, ks: &KeystoreChoice, name: &str, new_password: SecretStr) -> Result<()> {
+pub fn rotate(
+    state_dir: &Path,
+    ks: &KeystoreChoice,
+    name: &str,
+    new_password: SecretStr,
+) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
-        let cred = cfg.credentials.get_mut(name)
+        let cred = cfg
+            .credentials
+            .get_mut(name)
             .ok_or_else(|| anyhow!("credential {:?} not found", name))?;
         cred.backend_password = new_password;
         Ok(())
@@ -37,13 +53,18 @@ pub fn rotate(state_dir: &Path, ks: &KeystoreChoice, name: &str, new_password: S
 
 pub fn rm(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
-        let users: Vec<&str> = cfg.envs.iter()
+        let users: Vec<&str> = cfg
+            .envs
+            .iter()
             .filter(|(_, e)| e.credential == name)
             .map(|(n, _)| n.as_str())
             .collect();
         if !users.is_empty() {
-            return Err(anyhow!("credential {:?} is still referenced by env(s): {}",
-                name, users.join(", ")));
+            return Err(anyhow!(
+                "credential {:?} is still referenced by env(s): {}",
+                name,
+                users.join(", ")
+            ));
         }
         if cfg.credentials.remove(name).is_none() {
             bail!("credential {:?} not found", name);
@@ -60,8 +81,12 @@ pub struct CredRow {
 
 pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<CredRow>> {
     let cfg = mw_core::state::load_config(state_dir, ks)?;
-    Ok(cfg.credentials.iter().map(|(name, c)| CredRow {
-        name: name.clone(),
-        backend_user: c.backend_user.clone(),
-    }).collect())
+    Ok(cfg
+        .credentials
+        .iter()
+        .map(|(name, c)| CredRow {
+            name: name.clone(),
+            backend_user: c.backend_user.clone(),
+        })
+        .collect())
 }

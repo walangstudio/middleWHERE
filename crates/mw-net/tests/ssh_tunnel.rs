@@ -51,7 +51,9 @@ async fn spawn_echo_server() -> u16 {
                     match sock.read(&mut buf).await {
                         Ok(0) | Err(_) => return,
                         Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() { return; }
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -107,9 +109,13 @@ impl server::Handler for TestSshHandler {
         Ok(true)
     }
 
-    async fn channel_eof(&mut self, _channel: ChannelId, _session: &mut Session)
-        -> Result<(), Self::Error>
-    { Ok(()) }
+    async fn channel_eof(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Spawn the russh server. Returns (port, host_key_fingerprint).
@@ -123,7 +129,10 @@ async fn spawn_sshd() -> (u16, HostKeyFingerprint) {
     let blob = public.to_bytes().unwrap();
     let digest = Sha256::digest(&blob);
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
-    let fp = HostKeyFingerprint { algo: public.algorithm().to_string(), sha256_b64: b64 };
+    let fp = HostKeyFingerprint {
+        algo: public.algorithm().to_string(),
+        sha256_b64: b64,
+    };
 
     let config = Arc::new(server::Config {
         inactivity_timeout: Some(std::time::Duration::from_secs(30)),
@@ -158,7 +167,9 @@ async fn build_bastion(host_port: u16, pinned: Vec<HostKeyFingerprint>) -> Basti
         host: "127.0.0.1".into(),
         port: host_port,
         ssh_user: SSH_USER.into(),
-        auth: BastionAuth::Password { password: SecretStr::new(SSH_PASSWORD) },
+        auth: BastionAuth::Password {
+            password: SecretStr::new(SSH_PASSWORD),
+        },
         pinned_host_keys: pinned,
     }
 }
@@ -172,9 +183,13 @@ async fn round_trip_through_tunnel() {
     let registry = BastionRegistry::new();
     let slot = registry.get_or_open("test", &bastion, false).await.unwrap();
 
-    let fwd = start_local_forward(slot, "127.0.0.1".to_string(), echo_port).await.unwrap();
+    let fwd = start_local_forward(slot, "127.0.0.1".to_string(), echo_port)
+        .await
+        .unwrap();
 
-    let mut client = TcpStream::connect(("127.0.0.1", fwd.local_port)).await.unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", fwd.local_port))
+        .await
+        .unwrap();
     client.write_all(b"hello-through-bastion").await.unwrap();
     let mut buf = [0u8; 32];
     let n = client.read(&mut buf).await.unwrap();
@@ -191,12 +206,16 @@ async fn fingerprint_mismatch_refuses_connection() {
     let bastion = build_bastion(sshd_port, vec![bogus]).await;
     let registry = BastionRegistry::new();
     let res = registry.get_or_open("test", &bastion, false).await;
-    let Err(err) = res else { panic!("expected refusal on fingerprint mismatch"); };
+    let Err(err) = res else {
+        panic!("expected refusal on fingerprint mismatch");
+    };
     let msg = format!("{err:#}");
     // russh surfaces this as either an auth/disconnect error.
     assert!(
-        msg.to_lowercase().contains("key") || msg.to_lowercase().contains("disconnect")
-            || msg.to_lowercase().contains("refuse") || msg.to_lowercase().contains("auth"),
+        msg.to_lowercase().contains("key")
+            || msg.to_lowercase().contains("disconnect")
+            || msg.to_lowercase().contains("refuse")
+            || msg.to_lowercase().contains("auth"),
         "unexpected error: {msg}",
     );
 }
@@ -205,12 +224,19 @@ async fn fingerprint_mismatch_refuses_connection() {
 async fn wrong_password_refuses_auth() {
     let (sshd_port, real_fp) = spawn_sshd().await;
     let mut b = build_bastion(sshd_port, vec![real_fp]).await;
-    b.auth = BastionAuth::Password { password: SecretStr::new("wrong") };
+    b.auth = BastionAuth::Password {
+        password: SecretStr::new("wrong"),
+    };
     let registry = BastionRegistry::new();
     let res = registry.get_or_open("test", &b, false).await;
-    let Err(err) = res else { panic!("expected refusal on wrong password"); };
+    let Err(err) = res else {
+        panic!("expected refusal on wrong password");
+    };
     let msg = format!("{err:#}");
-    assert!(msg.to_lowercase().contains("auth"), "unexpected error: {msg}");
+    assert!(
+        msg.to_lowercase().contains("auth"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -219,7 +245,10 @@ async fn empty_pin_list_refused_by_default() {
     let bastion = build_bastion(sshd_port, vec![]).await; // no pinned keys
     let registry = BastionRegistry::new();
     let res = registry.get_or_open("test", &bastion, false).await;
-    assert!(res.is_err(), "unpinned bastion must be refused without --allow-tofu");
+    assert!(
+        res.is_err(),
+        "unpinned bastion must be refused without --allow-tofu"
+    );
 }
 
 #[tokio::test]
@@ -228,10 +257,16 @@ async fn empty_pin_list_accepted_with_allow_tofu() {
     let (sshd_port, _fp) = spawn_sshd().await;
     let bastion = build_bastion(sshd_port, vec![]).await; // no pinned keys
     let registry = BastionRegistry::new();
-    let slot = registry.get_or_open("test", &bastion, true).await
+    let slot = registry
+        .get_or_open("test", &bastion, true)
+        .await
         .expect("allow_tofu must accept first-use");
-    let fwd = start_local_forward(slot, "127.0.0.1".to_string(), echo_port).await.unwrap();
-    let mut client = TcpStream::connect(("127.0.0.1", fwd.local_port)).await.unwrap();
+    let fwd = start_local_forward(slot, "127.0.0.1".to_string(), echo_port)
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", fwd.local_port))
+        .await
+        .unwrap();
     client.write_all(b"tofu-ok").await.unwrap();
     let mut buf = [0u8; 16];
     let n = client.read(&mut buf).await.unwrap();

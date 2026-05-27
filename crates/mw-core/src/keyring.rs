@@ -44,7 +44,10 @@ pub struct OsStore {
 
 impl OsStore {
     pub fn new(service: impl Into<String>, account: impl Into<String>) -> Self {
-        Self { service: service.into(), account: account.into() }
+        Self {
+            service: service.into(),
+            account: account.into(),
+        }
     }
 
     fn entry(&self) -> Result<keyring::Entry, KeyringError> {
@@ -93,7 +96,11 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    pub fn new(path: impl AsRef<Path>) -> Self { Self { path: path.as_ref().to_owned() } }
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+        }
+    }
 }
 
 impl MasterKeyStore for FileStore {
@@ -133,7 +140,10 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true).mode(0o400)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o400)
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()

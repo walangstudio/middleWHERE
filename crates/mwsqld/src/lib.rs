@@ -20,8 +20,8 @@ use mw_net::engine::{engine_for, Backend, BackendOpts, Engine};
 use mw_net::ssh::{start_local_forward, BastionRegistry, LocalForward};
 
 pub use mw_core::state::{
-    default_state_dir, init, load_config, save_config, KeystoreChoice,
-    CONFIG_FILE_NAME, FILE_MASTER_KEY_NAME,
+    default_state_dir, init, load_config, save_config, KeystoreChoice, CONFIG_FILE_NAME,
+    FILE_MASTER_KEY_NAME,
 };
 
 #[cfg(windows)]
@@ -68,7 +68,10 @@ impl Daemon {
             // Stub engines: skip rather than fail the whole daemon so the
             // working envs still come up.
             if env.engine == EngineKind::MsSql {
-                warn!(env = env_name, "engine 'mssql' not implemented; skipping env");
+                warn!(
+                    env = env_name,
+                    "engine 'mssql' not implemented; skipping env"
+                );
                 continue;
             }
             // Postgres uses cleartext-password auth; the token would cross the
@@ -85,9 +88,17 @@ impl Daemon {
                 ));
             }
             let runtime = build_env_runtime(
-                env_name, env, cfg, listen_host, &bastions, &mut forwards, allow_tofu,
-            ).await?;
-            let listener = TcpListener::bind(runtime.listen_addr).await
+                env_name,
+                env,
+                cfg,
+                listen_host,
+                &bastions,
+                &mut forwards,
+                allow_tofu,
+            )
+            .await?;
+            let listener = TcpListener::bind(runtime.listen_addr)
+                .await
                 .with_context(|| format!("bind {} for env {}", runtime.listen_addr, env_name))?;
             info!(env = env_name, addr = %listener.local_addr()?, "listening");
             bound.push((env_name.clone(), listener));
@@ -122,7 +133,10 @@ impl Daemon {
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
-        || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 async fn build_env_runtime(
@@ -134,8 +148,12 @@ async fn build_env_runtime(
     forwards: &mut Vec<LocalForward>,
     allow_tofu: bool,
 ) -> Result<EnvRuntime> {
-    let cred = cfg.credentials.get(&env.credential)
-        .ok_or_else(|| anyhow!("env {name} references unknown credential {}", env.credential))?;
+    let cred = cfg.credentials.get(&env.credential).ok_or_else(|| {
+        anyhow!(
+            "env {name} references unknown credential {}",
+            env.credential
+        )
+    })?;
     let mut opts = BackendOpts::from_env_credential(env, cred);
 
     // If this env tunnels through a bastion, open the SSH session (sharing
@@ -143,11 +161,16 @@ async fn build_env_runtime(
     // forward to the real backend, and rewrite opts to point at it. The
     // engine's backend pool then connects to 127.0.0.1:<local_port>.
     if let Some(bastion_name) = &env.bastion {
-        let bastion = cfg.bastions.get(bastion_name)
+        let bastion = cfg
+            .bastions
+            .get(bastion_name)
             .ok_or_else(|| anyhow!("env {name} references unknown bastion {bastion_name}"))?;
-        let session = bastions.get_or_open(bastion_name, bastion, allow_tofu).await
+        let session = bastions
+            .get_or_open(bastion_name, bastion, allow_tofu)
+            .await
             .with_context(|| format!("opening bastion session {bastion_name} for env {name}"))?;
-        let fwd = start_local_forward(session, opts.host.clone(), opts.port).await
+        let fwd = start_local_forward(session, opts.host.clone(), opts.port)
+            .await
             .with_context(|| format!("start local forward for env {name}"))?;
         info!(env = name, bastion = bastion_name,
               backend = %format!("{}:{}", opts.host, opts.port),
@@ -163,7 +186,8 @@ async fn build_env_runtime(
         .build_backend(opts, env.pool.max_size.max(1))
         .await
         .map_err(|e| anyhow!("env {name}: build backend ({:?}): {e}", env.engine))?;
-    let listen_addr: SocketAddr = format!("{listen_host}:{}", env.listen_port).parse()
+    let listen_addr: SocketAddr = format!("{listen_host}:{}", env.listen_port)
+        .parse()
         .map_err(|e| anyhow!("bad listen addr for env {name}: {e}"))?;
     Ok(EnvRuntime {
         name: name.to_string(),
@@ -214,9 +238,15 @@ async fn handle_one(
     _peer: SocketAddr,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let env = envs.get(&env_name).ok_or_else(|| anyhow!("env vanished mid-flight"))?;
+    let env = envs
+        .get(&env_name)
+        .ok_or_else(|| anyhow!("env vanished mid-flight"))?;
     let conn_id = std::process::id().wrapping_add(rand::random::<u32>());
-    match env.engine.accept(&mut sock, &env.name, &env.client_auth, conn_id).await {
+    match env
+        .engine
+        .accept(&mut sock, &env.name, &env.client_auth, conn_id)
+        .await
+    {
         Ok(session) => {
             env.engine
                 .serve(&mut sock, &session, env.backend.as_ref(), &env.policy)

@@ -12,7 +12,7 @@
 
 use std::io;
 
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, AsyncRead};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_PAYLOAD: usize = (1 << 24) - 1;
 
@@ -32,7 +32,10 @@ pub enum FramingError {
 pub struct SequenceCounter(pub u8);
 
 impl SequenceCounter {
-    pub fn reset(&mut self) { self.0 = 0; }
+    pub fn reset(&mut self) {
+        self.0 = 0;
+    }
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u8 {
         let v = self.0;
         self.0 = self.0.wrapping_add(1);
@@ -58,7 +61,9 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
     match r.read_exact(&mut hdr).await {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(FramingError::UnexpectedEof { what: "packet header" });
+            return Err(FramingError::UnexpectedEof {
+                what: "packet header",
+            });
         }
         Err(e) => return Err(e.into()),
     }
@@ -70,7 +75,9 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
-            FramingError::UnexpectedEof { what: "packet payload" }
+            FramingError::UnexpectedEof {
+                what: "packet payload",
+            }
         } else {
             FramingError::Io(e)
         }
@@ -112,7 +119,10 @@ pub fn read_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
         }
         0xFD => {
             let b = buf.get(1..4)?;
-            Some(((b[0] as u64) | ((b[1] as u64) << 8) | ((b[2] as u64) << 16), 4))
+            Some((
+                (b[0] as u64) | ((b[1] as u64) << 8) | ((b[2] as u64) << 16),
+                4,
+            ))
         }
         0xFE => {
             let b = buf.get(1..9)?;
@@ -184,7 +194,19 @@ mod tests {
 
     #[test]
     fn lenenc_roundtrip() {
-        for v in [0u64, 1, 250, 251, 0xFA, 0xFB, 0xFFFF, 0x10000, (1u64 << 24) - 1, 1u64 << 24, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            250,
+            251,
+            0xFA,
+            0xFB,
+            0xFFFF,
+            0x10000,
+            (1u64 << 24) - 1,
+            1u64 << 24,
+            u64::MAX,
+        ] {
             let mut out = Vec::new();
             write_lenenc_int(&mut out, v);
             let (back, n) = read_lenenc_int(&out).unwrap();
