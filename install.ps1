@@ -67,8 +67,9 @@ function Get-InstalledVersion {
 function Add-ToUserPath {
   param([string]$Dir)
   $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if ($current -split ';' -contains $Dir) { return }
-  [Environment]::SetEnvironmentVariable('Path', "$current;$Dir", 'User')
+  if (-not [string]::IsNullOrEmpty($current) -and (($current -split ';') -contains $Dir)) { return }
+  $newPath = if ([string]::IsNullOrEmpty($current)) { $Dir } else { "$current;$Dir" }
+  [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
   $env:PATH = "$env:PATH;$Dir"
   Write-Warn "$Dir added to your user PATH (restart the terminal to take effect)"
 }
@@ -87,9 +88,10 @@ function Confirm-Checksum {
 function Invoke-Uninstall {
   $dir = Get-InstallDir
   $removed = $false
+  # Only remove from our own install dir; a same-named binary elsewhere on PATH
+  # is not ours to delete.
   foreach ($bin in $Binaries) {
-    $cmd = Get-Command ([System.IO.Path]::GetFileNameWithoutExtension($bin)) -ErrorAction SilentlyContinue
-    $path = if ($cmd) { $cmd.Source } else { Join-Path $dir $bin }
+    $path = Join-Path $dir $bin
     if (Test-Path $path) { Write-Info "Removing $path..."; Remove-Item $path -Force; $removed = $true }
   }
   if (Test-Path $dir) {
@@ -139,12 +141,17 @@ function Main {
     Write-Info "Extracting..."
     Expand-Archive $archive -DestinationPath $tmpDir -Force
 
+    # Validate the whole set before touching the install dir, so a malformed
+    # archive can't leave a half-installed, version-skewed toolset.
+    foreach ($bin in $Binaries) {
+      if (-not (Test-Path (Join-Path $tmpDir $bin))) { Write-Fatal "Binary '$bin' not found in archive" }
+    }
+
     $installDir = Get-InstallDir
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
     foreach ($bin in $Binaries) {
       $extracted = Join-Path $tmpDir $bin
-      if (-not (Test-Path $extracted)) { Write-Fatal "Binary '$bin' not found in archive" }
       $dest = Join-Path $installDir $bin
       $backup = "$dest.old"; $hasBackup = $false
       if (Test-Path $dest) {

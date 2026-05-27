@@ -83,6 +83,9 @@ get_installed_version() {
     ver=$("$VERSION_PROBE" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     [ -n "$ver" ] && echo "v${ver}"
   fi
+  # Never let a non-semver probe poison the function's exit status: under
+  # `set -e`, a nonzero return here would abort the whole installer.
+  return 0
 }
 
 verify_checksum() {
@@ -186,14 +189,17 @@ main() {
   info "Extracting..."
   tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 
+  # Validate the whole set before touching the install dir, so a malformed
+  # archive can't leave a half-installed, version-skewed toolset.
+  for bin in $BINARIES; do
+    [ -f "${TMP_DIR}/${bin}" ] || fatal "Binary '${bin}' not found in archive"
+  done
+
   INSTALL_DIR="$(select_install_dir)"
   mkdir -p "$INSTALL_DIR"
-  use_sudo=""; [ -w "$INSTALL_DIR" ] || { use_sudo="sudo"; info "Requesting sudo to write to ${INSTALL_DIR}"; }
   info "Installing to ${INSTALL_DIR}..."
   for bin in $BINARIES; do
-    src="${TMP_DIR}/${bin}"
-    [ -f "$src" ] || fatal "Binary '${bin}' not found in archive"
-    install_binary "$src" "$INSTALL_DIR"
+    install_binary "${TMP_DIR}/${bin}" "$INSTALL_DIR"
   done
   check_path "$INSTALL_DIR"
 
