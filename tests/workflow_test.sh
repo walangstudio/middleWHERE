@@ -34,6 +34,10 @@ has "$CI" 'cargo test --workspace --locked' "CI test keeps --locked"
 # Unpatched transitive advisory (rsa via russh) is ignored with a rationale.
 has "$CI" 'ignore: RUSTSEC-2023-0071' "cargo audit ignores unpatched rsa advisory"
 
+# x86_64-apple-darwin builds on macos-14 (Rosetta), not the deprecated Intel macos-13.
+hasnot "$CI"  'macos-13' "ci.yml does not use deprecated macos-13"
+hasnot "$REL" 'macos-13' "release.yml does not use deprecated macos-13"
+
 # Each build.rs hard-fails so a missing resource compiler can't ship a bare PE.
 for c in mwsqld mwsqlctl mwsql; do
   b="${ROOT}/crates/${c}/build.rs"

@@ -32,6 +32,15 @@ Distribution and supply-chain release. No runtime behaviour changes.
   verification (text + binary mode), pre-release selection, atomic
   all-or-nothing multi-binary install with rollback, and PATH handling.
 
+### Security / dependencies
+
+- Bumped `mysql_async` 0.34 → 0.37, which pulls `lru` 0.12 → 0.18 and resolves
+  RUSTSEC-2026-0002 (lru `IterMut` unsoundness). No code changes required.
+- `cargo audit` ignores RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel):
+  transitive via russh SSH key auth, no patched version exists upstream.
+- CI/release: `x86_64-apple-darwin` now builds on `macos-14` (cross-compile +
+  Rosetta) instead of the deprecated Intel `macos-13` runner.
+
 ### Note
 
 - Release binaries are **not code-signed**. Authenticode/SmartScreen
