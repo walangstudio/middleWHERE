@@ -5,6 +5,33 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.2.0] - Unreleased
+
+Distribution and supply-chain release. No runtime behaviour changes.
+
+### Added
+
+- One-line installers `install.sh` (Linux/macOS) and `install.ps1` (Windows)
+  that download the prebuilt binaries from GitHub Releases, verify the
+  archive SHA-256, and install all three (`mwsqld`, `mwsqlctl`, `mwsql`).
+- GitHub Actions CI (`fmt` + `clippy` + `cargo audit`, build + test across
+  linux/macOS/windows x86_64/arm64) and a tag-driven Release workflow that
+  builds all five targets, packages one archive per target, and publishes a
+  GitHub Release with `SHA256SUMS`.
+- Windows binaries now embed version-info (CompanyName, ProductName,
+  FileDescription, version, copyright, OriginalFilename) and an `asInvoker`
+  application manifest via a `winresource` build script, which removes the
+  "unsigned, zero-metadata native executable" heuristic that triggers AV
+  false positives on crypto/network binaries.
+- Workspace package metadata (description, repository, homepage, keywords,
+  categories, authors) and `cargo binstall --git` support.
+- Pinned toolchain (`rust-toolchain.toml`, Rust 1.95.0).
+
+### Note
+
+- Release binaries are **not code-signed**. Authenticode/SmartScreen
+  reputation accrues over download volume; signing is out of scope for now.
+
 ## [0.1.0] - 2026-05-17
 
 Initial release. A security-first SQL gateway that sits between a client

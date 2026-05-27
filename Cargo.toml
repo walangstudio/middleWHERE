@@ -13,6 +13,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
+authors = ["scr1p7k177y <scriptkitty@walang.studio>"]
+description = "Security-first SQL middleware gateway between clients and PostgreSQL/MySQL."
+repository = "https://github.com/walangstudio/middleWHERE"
+homepage = "https://github.com/walangstudio/middleWHERE"
+keywords = ["sql", "proxy", "gateway", "security", "database"]
+categories = ["command-line-utilities", "database"]
 publish = false
 
 [workspace.dependencies]

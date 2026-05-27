@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish.workspace = true
+description = "middleWHERE client wrapper."
+build = "build.rs"
 
 [lib]
 name = "mwsql"
@@ -24,9 +29,22 @@ rpassword = "7"
 tokio.workspace = true
 mysql_async.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 mw-core.workspace = true
 mwsqld = { path = "../mwsqld" }
 mwsqlctl = { path = "../mwsqlctl" }
 tokio.workspace = true
+
+# Lets `cargo binstall --git <repo> mwsql` pull the prebuilt binary out of the
+# shared release archive (asset names match the release workflow).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/middlewhere-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

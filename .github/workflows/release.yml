@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.2.0, v1.0.0-beta.1)'
+        required: true
+        type: string
+      branch:
+        description: 'Branch to release from (default: main)'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref }}
+
+      - name: Create and push tag (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ inputs.tag }}" -m "Release ${{ inputs.tag }}"
+          git push origin "${{ inputs.tag }}"
+
+      - name: Resolve tag and version
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set workspace version from tag
+        shell: bash
+        run: |
+          ver="${{ needs.prepare.outputs.version }}"
+          perl -0pi -e "s/^version = \".*\"/version = \"${ver}\"/m" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
+
+      - name: Build
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir dist
+          bindir="target/${{ matrix.target }}/release"
+          name="middlewhere-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
+          tar -czf "dist/${name}.tar.gz" -C "$bindir" mwsqld mwsqlctl mwsql
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bindir = "target/${{ matrix.target }}/release"
+          $name = "middlewhere-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}"
+          $bins = @("$bindir/mwsqld.exe", "$bindir/mwsqlctl.exe", "$bindir/mwsql.exe")
+          Compress-Archive -Path $bins -DestinationPath "dist/$name.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: middlewhere-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: middleWHERE ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
