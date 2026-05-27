@@ -149,7 +149,8 @@ main() {
     case "$arg" in
       --uninstall)   uninstall; exit 0 ;;
       --pre-release) USE_PRERELEASE=1 ;;
-      --version=*)   REQUESTED_VERSION="${arg#--version=}" ;;
+      --version=*)   REQUESTED_VERSION="${arg#--version=}"
+                     [ -n "$REQUESTED_VERSION" ] || fatal "--version requires a value (e.g. --version=v0.2.0)" ;;
       --version)     need_version=1 ;;
       *) fatal "Unknown option: $arg" ;;
     esac

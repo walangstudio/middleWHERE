@@ -20,11 +20,12 @@ permissions:
   contents: write
 
 # A manual workflow_dispatch pushes the tag, which also matches `on: push: tags`.
-# Without this, the same tag would run the release twice concurrently and race on
-# the GitHub Release. Keyed on the tag so one run per tag wins.
+# Both events resolve to the same group, and cancel-in-progress lets the
+# push-triggered run cancel the now-redundant dispatch run (the tag is already
+# pushed by then) so the release runs exactly once instead of twice.
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   prepare:
@@ -95,8 +96,12 @@ jobs:
           perl -0pi -e "s/^version = \".*\"/version = \"${ver}\"/m" Cargo.toml
           grep -m1 '^version = ' Cargo.toml
 
+      # No --locked here: the version stamp above rewrites the workspace crate
+      # versions, so the committed Cargo.lock no longer matches and --locked
+      # would refuse. Dependency versions stay pinned by the lock regardless;
+      # only the workspace member version entries update.
       - name: Build
-        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+        run: cargo build --workspace --release --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'

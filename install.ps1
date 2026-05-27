@@ -45,7 +45,7 @@ function Get-TargetVersion {
   if ($PreRelease) {
     try { $list = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=100" -ErrorAction Stop }
     catch { Write-Fatal "Could not query GitHub releases (rate limit or network?): $_" }
-    $r = $list | Where-Object { $_.prerelease } | Select-Object -First 1
+    $r = $list | Where-Object { $_.prerelease -and -not $_.draft } | Select-Object -First 1
     if (-not $r) { Write-Fatal "No pre-release found" }
     return $r.tag_name
   }
@@ -76,7 +76,8 @@ function Add-ToUserPath {
   param([string]$Dir)
   $current = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (-not [string]::IsNullOrEmpty($current) -and (($current -split ';') -contains $Dir)) { return }
-  $newPath = if ([string]::IsNullOrEmpty($current)) { $Dir } else { "$current;$Dir" }
+  $trimmed = if ($null -eq $current) { '' } else { $current.TrimEnd(';') }
+  $newPath = if ([string]::IsNullOrEmpty($trimmed)) { $Dir } else { "$trimmed;$Dir" }
   [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
   $env:PATH = "$env:PATH;$Dir"
   Write-Warn "$Dir added to your user PATH (restart the terminal to take effect)"
@@ -181,7 +182,8 @@ function Main {
     if ($installed -and $installed -ne $version) { Write-Success "middleWHERE updated $installed -> $version  (mwsqld, mwsqlctl, mwsql)" }
     else { Write-Success "middleWHERE $version installed successfully  (mwsqld, mwsqlctl, mwsql)" }
     Write-Host ""
-    & (Join-Path $installDir $Probe) --version
+    # Best-effort version echo; never fail the (already successful) install on it.
+    try { & (Join-Path $installDir $Probe) --version } catch { Write-Warn "installed, but '$Probe --version' could not run yet" }
   } finally {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
   }
