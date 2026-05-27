@@ -96,9 +96,12 @@ enum BastionCmd {
 #[derive(Args)]
 struct BastionAddArgs {
     name: String,
-    #[arg(long)] host: String,
-    #[arg(long, default_value_t = 22)] port: u16,
-    #[arg(long)] ssh_user: String,
+    #[arg(long)]
+    host: String,
+    #[arg(long, default_value_t = 22)]
+    port: u16,
+    #[arg(long)]
+    ssh_user: String,
     /// Read password from stdin (one line). Otherwise prompt interactively.
     #[arg(long, group = "auth")]
     password_stdin: bool,
@@ -115,14 +118,19 @@ struct BastionAddArgs {
 enum CredCmd {
     Add {
         name: String,
-        #[arg(long)] user: String,
-        #[arg(long)] password_stdin: bool,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        password_stdin: bool,
     },
     Rotate {
         name: String,
-        #[arg(long)] password_stdin: bool,
+        #[arg(long)]
+        password_stdin: bool,
     },
-    Rm { name: String },
+    Rm {
+        name: String,
+    },
     List,
 }
 
@@ -137,23 +145,34 @@ enum EnvCmd {
 #[derive(Args)]
 struct EnvAddArgs {
     name: String,
-    #[arg(long)] backend_host: String,
+    #[arg(long)]
+    backend_host: String,
     /// Backend port. Defaults to the engine's conventional port
     /// (mysql 3306, postgres 5432, mssql 1433).
-    #[arg(long)] backend_port: Option<u16>,
+    #[arg(long)]
+    backend_port: Option<u16>,
     #[arg(long, value_enum, default_value_t = EngineKindArg::Mysql)]
     engine: EngineKindArg,
-    #[arg(long)] database: Option<String>,
-    #[arg(long)] bastion: Option<String>,
-    #[arg(long)] credential: String,
+    #[arg(long)]
+    database: Option<String>,
+    #[arg(long)]
+    bastion: Option<String>,
+    #[arg(long)]
+    credential: String,
     #[arg(long, value_enum, default_value_t = PolicyKindArg::ReadOnly)]
     policy: PolicyKindArg,
-    #[arg(long)] listen_port: Option<u16>,
-    #[arg(long)] max_pool: Option<u32>,
+    #[arg(long)]
+    listen_port: Option<u16>,
+    #[arg(long)]
+    max_pool: Option<u32>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
-enum EngineKindArg { Mysql, Postgres, Mssql }
+enum EngineKindArg {
+    Mysql,
+    Postgres,
+    Mssql,
+}
 
 impl From<EngineKindArg> for EngineKind {
     fn from(e: EngineKindArg) -> Self {
@@ -166,12 +185,15 @@ impl From<EngineKindArg> for EngineKind {
 }
 
 #[derive(Copy, Clone, ValueEnum)]
-enum PolicyKindArg { ReadOnly, ReadWrite }
+enum PolicyKindArg {
+    ReadOnly,
+    ReadWrite,
+}
 
 impl From<PolicyKindArg> for Policy {
     fn from(p: PolicyKindArg) -> Self {
         match p {
-            PolicyKindArg::ReadOnly  => Policy::ReadOnly,
+            PolicyKindArg::ReadOnly => Policy::ReadOnly,
             PolicyKindArg::ReadWrite => Policy::ReadWrite,
         }
     }
@@ -180,14 +202,18 @@ impl From<PolicyKindArg> for Policy {
 #[derive(Args)]
 struct PolicyArgs {
     env: String,
-    #[arg(long, group = "target")] read_only: bool,
-    #[arg(long, group = "target")] read_write: bool,
-    #[arg(long)] i_know_what_im_doing: bool,
+    #[arg(long, group = "target")]
+    read_only: bool,
+    #[arg(long, group = "target")]
+    read_write: bool,
+    #[arg(long)]
+    i_know_what_im_doing: bool,
 }
 
 #[derive(Args)]
 struct AuditTailArgs {
-    #[arg(short = 'n', long, default_value_t = 20)] n: usize,
+    #[arg(short = 'n', long, default_value_t = 20)]
+    n: usize,
 }
 
 fn main() -> Result<()> {
@@ -207,21 +233,38 @@ fn main() -> Result<()> {
         }
         Cmd::Bastion(BastionCmd::Add(a)) => {
             let auth = if let Some(path) = a.key_file {
-                let pem = std::fs::read(&path)
-                    .with_context(|| format!("read key {}", path.display()))?;
+                let pem =
+                    std::fs::read(&path).with_context(|| format!("read key {}", path.display()))?;
                 let passphrase = if read_yes_no("key has a passphrase? [y/N]: ")? {
                     Some(SecretStr::new(read_secret("key passphrase: ", false)?))
-                } else { None };
-                bastion::BastionAuthInput::Key { pem: SecretBytes::new(pem), passphrase }
+                } else {
+                    None
+                };
+                bastion::BastionAuthInput::Key {
+                    pem: SecretBytes::new(pem),
+                    passphrase,
+                }
             } else {
                 let pw = read_secret("bastion password: ", a.password_stdin)?;
                 bastion::BastionAuthInput::Password(SecretStr::new(pw))
             };
-            let fingerprint = a.fingerprints.first().map(|s| parse_fingerprint(s)).transpose()?;
-            bastion::add(&state_dir, &ks, bastion::BastionAddArgs {
-                name: &a.name, host: &a.host, port: a.port, ssh_user: &a.ssh_user,
-                auth, fingerprint,
-            })?;
+            let fingerprint = a
+                .fingerprints
+                .first()
+                .map(|s| parse_fingerprint(s))
+                .transpose()?;
+            bastion::add(
+                &state_dir,
+                &ks,
+                bastion::BastionAddArgs {
+                    name: &a.name,
+                    host: &a.host,
+                    port: a.port,
+                    ssh_user: &a.ssh_user,
+                    auth,
+                    fingerprint,
+                },
+            )?;
             eprintln!("bastion {:?} added", a.name);
         }
         Cmd::Bastion(BastionCmd::Rm { name }) => {
@@ -230,16 +273,30 @@ fn main() -> Result<()> {
         }
         Cmd::Bastion(BastionCmd::List) => {
             for row in bastion::list(&state_dir, &ks)? {
-                println!("{}\t{}:{}\tuser={}\tauth={}\tfingerprints={}",
-                    row.name, row.host, row.port, row.ssh_user, row.auth_kind, row.pinned_fingerprints);
+                println!(
+                    "{}\t{}:{}\tuser={}\tauth={}\tfingerprints={}",
+                    row.name,
+                    row.host,
+                    row.port,
+                    row.ssh_user,
+                    row.auth_kind,
+                    row.pinned_fingerprints
+                );
             }
         }
-        Cmd::Cred(CredCmd::Add { name, user, password_stdin }) => {
+        Cmd::Cred(CredCmd::Add {
+            name,
+            user,
+            password_stdin,
+        }) => {
             let pw = read_secret("backend password: ", password_stdin)?;
             cred::add(&state_dir, &ks, &name, &user, SecretStr::new(pw))?;
             eprintln!("credential {:?} added", name);
         }
-        Cmd::Cred(CredCmd::Rotate { name, password_stdin }) => {
+        Cmd::Cred(CredCmd::Rotate {
+            name,
+            password_stdin,
+        }) => {
             let pw = read_secret("new backend password: ", password_stdin)?;
             cred::rotate(&state_dir, &ks, &name, SecretStr::new(pw))?;
             eprintln!("credential {:?} rotated", name);
@@ -255,19 +312,26 @@ fn main() -> Result<()> {
         }
         Cmd::Env(EnvCmd::Add(a)) => {
             let engine: EngineKind = a.engine.into();
-            let out = envs::add(&state_dir, &ks, envs::EnvAddArgs {
-                name: &a.name,
-                backend_host: &a.backend_host,
-                backend_port: a.backend_port.unwrap_or_else(|| engine.default_port()),
-                default_database: a.database.as_deref(),
-                bastion: a.bastion.as_deref(),
-                credential: &a.credential,
-                policy: a.policy.into(),
-                listen_port: a.listen_port,
-                max_pool: a.max_pool,
-                engine,
-            })?;
-            eprintln!("env {:?} added, listening on 127.0.0.1:{}", a.name, out.listen_port);
+            let out = envs::add(
+                &state_dir,
+                &ks,
+                envs::EnvAddArgs {
+                    name: &a.name,
+                    backend_host: &a.backend_host,
+                    backend_port: a.backend_port.unwrap_or_else(|| engine.default_port()),
+                    default_database: a.database.as_deref(),
+                    bastion: a.bastion.as_deref(),
+                    credential: &a.credential,
+                    policy: a.policy.into(),
+                    listen_port: a.listen_port,
+                    max_pool: a.max_pool,
+                    engine,
+                },
+            )?;
+            eprintln!(
+                "env {:?} added, listening on 127.0.0.1:{}",
+                a.name, out.listen_port
+            );
             eprintln!("Client token (save now — will not be shown again):");
             println!("{}", out.token.expose());
         }
@@ -282,10 +346,16 @@ fn main() -> Result<()> {
         }
         Cmd::Env(EnvCmd::List) => {
             for row in envs::list(&state_dir, &ks)? {
-                println!("{}\t{}\tengine={}\tbastion={}\tcred={}\tpolicy={}\tport={}",
-                    row.name, row.backend, row.engine,
+                println!(
+                    "{}\t{}\tengine={}\tbastion={}\tcred={}\tpolicy={}\tport={}",
+                    row.name,
+                    row.backend,
+                    row.engine,
                     row.bastion.as_deref().unwrap_or("-"),
-                    row.credential, row.policy, row.listen_port);
+                    row.credential,
+                    row.policy,
+                    row.listen_port
+                );
             }
         }
         Cmd::Policy(p) => {
@@ -313,12 +383,20 @@ fn main() -> Result<()> {
                 state_dir.to_string_lossy().to_string(),
             );
             let (artifact, steps): (String, String) = if cfg!(target_os = "linux") {
-                (installer::systemd_unit(&params), installer::linux_operator_steps(&params))
+                (
+                    installer::systemd_unit(&params),
+                    installer::linux_operator_steps(&params),
+                )
             } else if cfg!(target_os = "macos") {
-                (installer::launchd_plist(&params), installer::macos_account_steps(&params))
+                (
+                    installer::launchd_plist(&params),
+                    installer::macos_account_steps(&params),
+                )
             } else if cfg!(windows) {
-                (installer::windows_install_ps1(&params),
-                 "# Windows — run the generated script elevated (Administrator).".to_string())
+                (
+                    installer::windows_install_ps1(&params),
+                    "# Windows — run the generated script elevated (Administrator).".to_string(),
+                )
             } else {
                 bail!("unsupported platform for install-service");
             };
@@ -339,7 +417,10 @@ fn main() -> Result<()> {
         Cmd::Grant(g) => {
             let out = envs::grant(&state_dir, &ks, &g.env)?;
             if let Some(to) = &g.to {
-                eprintln!("granted env {:?} to {to} (token rotated; any prior token is now dead)", g.env);
+                eprintln!(
+                    "granted env {:?} to {to} (token rotated; any prior token is now dead)",
+                    g.env
+                );
             } else {
                 eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
             }
@@ -351,14 +432,20 @@ fn main() -> Result<()> {
         }
         Cmd::Import(i) => {
             let report = mwsqlctl::import_poc::import(&state_dir, &ks, &i.from_dir)?;
-            eprintln!("imported {} bastion(s), {} credential(s), {} env(s):",
-                report.bastions.len(), report.credentials.len(), report.envs.len());
+            eprintln!(
+                "imported {} bastion(s), {} credential(s), {} env(s):",
+                report.bastions.len(),
+                report.credentials.len(),
+                report.envs.len()
+            );
             for (name, port) in &report.envs {
                 eprintln!("  env {name} -> 127.0.0.1:{port}");
             }
             if !report.warnings.is_empty() {
                 eprintln!("\nwarnings:");
-                for w in &report.warnings { eprintln!("  ! {w}"); }
+                for w in &report.warnings {
+                    eprintln!("  ! {w}");
+                }
             }
             eprintln!("\n{}", mwsqlctl::import_poc::decommission_checklist());
         }
@@ -370,8 +457,14 @@ fn main() -> Result<()> {
 /// of the currently-running mwsqlctl executable.
 fn default_daemon_path() -> Result<PathBuf> {
     let me = std::env::current_exe().context("resolve current exe")?;
-    let dir = me.parent().ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
-    let name = if cfg!(windows) { "mwsqld.exe" } else { "mwsqld" };
+    let dir = me
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
+    let name = if cfg!(windows) {
+        "mwsqld.exe"
+    } else {
+        "mwsqld"
+    };
     Ok(dir.join(name))
 }
 
@@ -388,17 +481,26 @@ fn read_secret(prompt: &str, from_stdin: bool) -> Result<String> {
 }
 
 fn read_yes_no(prompt: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() { return Ok(false); }
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
     eprint!("{prompt}");
     use std::io::BufRead;
     let stdin = std::io::stdin();
     let mut line = String::new();
     stdin.lock().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn parse_fingerprint(s: &str) -> Result<HostKeyFingerprint> {
-    let (algo, b64) = s.split_once(':')
+    let (algo, b64) = s
+        .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("fingerprint must be <algo>:<sha256_b64>"))?;
-    Ok(HostKeyFingerprint { algo: algo.to_string(), sha256_b64: b64.to_string() })
+    Ok(HostKeyFingerprint {
+        algo: algo.to_string(),
+        sha256_b64: b64.to_string(),
+    })
 }

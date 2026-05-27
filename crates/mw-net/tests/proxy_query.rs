@@ -16,7 +16,9 @@ use mw_net::router::serve_session;
 
 const CLIENT_TOKEN: &str = "test-token-9f7a1d";
 
-fn backend_url() -> Option<String> { env::var("MYSQL_TEST_URL").ok() }
+fn backend_url() -> Option<String> {
+    env::var("MYSQL_TEST_URL").ok()
+}
 
 #[tokio::test]
 async fn proxy_select_one_through_real_backend() {
@@ -37,21 +39,33 @@ async fn proxy_select_one_through_real_backend() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let auth = ClientAuth::NativePassword { double_sha1: double_sha1(CLIENT_TOKEN.as_bytes()) };
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(CLIENT_TOKEN.as_bytes()),
+    };
     let pol = Policy::ReadOnly;
 
     tokio::spawn(async move {
         // Serve connections in a loop — the test opens more than one.
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { return; };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             sock.set_nodelay(true).ok();
             let auth = auth.clone();
             let pool = pool.clone();
             let pol = pol.clone();
             tokio::spawn(async move {
-                let Ok(session) = handshake(&mut sock, "stage_w9", &auth, 1).await else { return; };
-                let _ = serve_session(&mut sock, "stage_w9",
-                    &session.client_username_seen, &pool, &pol).await;
+                let Ok(session) = handshake(&mut sock, "stage_w9", &auth, 1).await else {
+                    return;
+                };
+                let _ = serve_session(
+                    &mut sock,
+                    "stage_w9",
+                    &session.client_username_seen,
+                    &pool,
+                    &pol,
+                )
+                .await;
             });
         }
     });
@@ -83,8 +97,13 @@ async fn proxy_select_one_through_real_backend() {
             .tcp_port(addr.port())
             .user(Some("stage_w9"))
             .pass(Some(CLIENT_TOKEN))
-            .stmt_cache_size(0)
-    ).await.unwrap();
+            .stmt_cache_size(0),
+    )
+    .await
+    .unwrap();
     let denied = conn.query_drop("DELETE FROM mysql.user WHERE 1=0").await;
-    assert!(denied.is_err(), "policy must deny DELETE even on a no-op WHERE");
+    assert!(
+        denied.is_err(),
+        "policy must deny DELETE even on a no-op WHERE"
+    );
 }

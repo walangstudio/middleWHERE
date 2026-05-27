@@ -53,7 +53,10 @@ impl client::Handler for ClientHandler {
         let digest = Sha256::digest(&blob);
         let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
         let algo = key.algorithm().to_string();
-        let observed = HostKeyFingerprint { algo: algo.clone(), sha256_b64: b64.clone() };
+        let observed = HostKeyFingerprint {
+            algo: algo.clone(),
+            sha256_b64: b64.clone(),
+        };
         *self.captured.write().await = Some(observed);
 
         if self.pinned.is_empty() {
@@ -69,7 +72,10 @@ impl client::Handler for ClientHandler {
                  first-use (insecure).");
             return Ok(false);
         }
-        let ok = self.pinned.iter().any(|p| p.algo == algo && p.sha256_b64 == b64);
+        let ok = self
+            .pinned
+            .iter()
+            .any(|p| p.algo == algo && p.sha256_b64 == b64);
         if !ok {
             warn!(algo = %algo, sha256 = %b64,
                 "host key did NOT match any pinned fingerprint — refusing");
@@ -99,10 +105,14 @@ impl BastionSession {
             .with_context(|| format!("ssh connect {}:{}", b.host, b.port))?;
 
         let authed = match &b.auth {
-            BastionAuth::Password { password } =>
-                handle.authenticate_password(b.ssh_user.clone(), password.expose()).await?,
-            BastionAuth::Key { .. } =>
-                return Err(anyhow!("ssh key auth not yet wired (Phase 7b)")),
+            BastionAuth::Password { password } => {
+                handle
+                    .authenticate_password(b.ssh_user.clone(), password.expose())
+                    .await?
+            }
+            BastionAuth::Key { .. } => {
+                return Err(anyhow!("ssh key auth not yet wired (Phase 7b)"))
+            }
         };
         if !authed.success() {
             return Err(anyhow!("ssh auth failed for {}@{}", b.ssh_user, b.host));
@@ -110,13 +120,19 @@ impl BastionSession {
         info!(host = %b.host, port = b.port, user = %b.ssh_user, "bastion session open");
 
         let fp = captured.read().await.clone();
-        Ok(Self { handle, captured_fingerprint: fp })
+        Ok(Self {
+            handle,
+            captured_fingerprint: fp,
+        })
     }
 
-    pub async fn open_direct_tcpip(&self, target_host: &str, target_port: u16)
-        -> Result<russh::Channel<client::Msg>>
-    {
-        let ch = self.handle
+    pub async fn open_direct_tcpip(
+        &self,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<russh::Channel<client::Msg>> {
+        let ch = self
+            .handle
             .channel_open_direct_tcpip(target_host, target_port as u32, "127.0.0.1", 0)
             .await
             .with_context(|| format!("direct-tcpip {}:{}", target_host, target_port))?;
@@ -129,15 +145,21 @@ impl BastionSession {
 /// same bastion.
 #[derive(Default, Clone)]
 pub struct BastionRegistry {
+    #[allow(clippy::type_complexity)]
     inner: Arc<RwLock<HashMap<String, Arc<RwLock<Option<BastionSession>>>>>>,
 }
 
 impl BastionRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub async fn get_or_open(&self, name: &str, bastion: &Bastion, allow_tofu: bool)
-        -> Result<Arc<RwLock<Option<BastionSession>>>>
-    {
+    pub async fn get_or_open(
+        &self,
+        name: &str,
+        bastion: &Bastion,
+        allow_tofu: bool,
+    ) -> Result<Arc<RwLock<Option<BastionSession>>>> {
         // Fast path: existing live slot.
         {
             let r = self.inner.read().await;
@@ -211,5 +233,8 @@ pub async fn start_local_forward(
             });
         }
     });
-    Ok(LocalForward { local_port, _task: task })
+    Ok(LocalForward {
+        local_port,
+        _task: task,
+    })
 }

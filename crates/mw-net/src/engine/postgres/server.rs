@@ -159,7 +159,9 @@ fn quote_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
-        if c == '\'' { out.push('\''); }
+        if c == '\'' {
+            out.push('\'');
+        }
         out.push(c);
     }
     out.push('\'');
@@ -167,7 +169,10 @@ fn quote_lit(s: &str) -> String {
 }
 
 fn is_numeric_oid(oid: i32) -> bool {
-    matches!(oid, OID_INT2 | OID_INT4 | OID_INT8 | OID_OID | OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC)
+    matches!(
+        oid,
+        OID_INT2 | OID_INT4 | OID_INT8 | OID_OID | OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC
+    )
 }
 
 /// True only if `s` is a syntactically valid SQL numeric literal. A
@@ -181,20 +186,37 @@ fn is_safe_numeric(s: &str) -> bool {
     }
     let bytes = s.as_bytes();
     let mut i = 0;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') { i += 1; }
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
     let mut digits = false;
-    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; digits = true; }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        digits = true;
+    }
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; digits = true; }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            digits = true;
+        }
     }
-    if !digits { return false; }
+    if !digits {
+        return false;
+    }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
         i += 1;
-        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') { i += 1; }
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
         let mut exp = false;
-        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; exp = true; }
-        if !exp { return false; }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            exp = true;
+        }
+        if !exp {
+            return false;
+        }
     }
     i == bytes.len()
 }
@@ -262,26 +284,35 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
     };
     if fmt == 1 {
         match oid {
-            OID_BOOL => Ok(if b.first().copied().unwrap_or(0) != 0 { "TRUE" } else { "FALSE" }.into()),
+            OID_BOOL => Ok(if b.first().copied().unwrap_or(0) != 0 {
+                "TRUE"
+            } else {
+                "FALSE"
+            }
+            .into()),
             OID_INT2 if b.len() == 2 => Ok(i16::from_be_bytes([b[0], b[1]]).to_string()),
-            OID_INT4 | OID_OID if b.len() == 4 =>
-                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()),
+            OID_INT4 | OID_OID if b.len() == 4 => {
+                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            }
             OID_INT8 if b.len() == 8 => {
-                let mut a = [0u8; 8]; a.copy_from_slice(&b[..8]);
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[..8]);
                 Ok(i64::from_be_bytes(a).to_string())
             }
-            OID_FLOAT4 if b.len() == 4 =>
-                Ok(fmt_float(f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64)),
+            OID_FLOAT4 if b.len() == 4 => Ok(fmt_float(
+                f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64,
+            )),
             OID_FLOAT8 if b.len() == 8 => {
-                let mut a = [0u8; 8]; a.copy_from_slice(&b[..8]);
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[..8]);
                 Ok(fmt_float(f64::from_be_bytes(a)))
             }
             // OID-family / register types are 4-byte big-endian integers
             // (regclass, regnamespace, regproc, regtype, xid, cid, ...).
             // DBeaver's catalog queries bind these heavily.
-            2202 | 2203 | 2204 | 2205 | 2206 | 4089 | 24 | 28 | 29 | 2200
-                if b.len() == 4 =>
-                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()),
+            2202 | 2203 | 2204 | 2205 | 2206 | 4089 | 24 | 28 | 29 | 2200 if b.len() == 4 => {
+                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            }
             // Unknown binary type. If it contains a NUL it cannot be text
             // (which would corrupt the query string) — treat fixed 2/4/8-byte
             // payloads as big-endian integers (the realistic case: an
@@ -293,7 +324,8 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
                         2 => Ok(i16::from_be_bytes([b[0], b[1]]).to_string()),
                         4 => Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()),
                         8 => {
-                            let mut a = [0u8; 8]; a.copy_from_slice(&b[..8]);
+                            let mut a = [0u8; 8];
+                            a.copy_from_slice(&b[..8]);
                             Ok(i64::from_be_bytes(a).to_string())
                         }
                         _ => Err("unsupported binary parameter (NUL)"),
@@ -321,31 +353,47 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
 
 /// Decode a PostgreSQL binary array payload into (element OID, flattened
 /// elements). Multi-dim arrays are flattened (sufficient for `= ANY()`).
+#[allow(clippy::type_complexity)]
 fn decode_bin_array(b: &[u8]) -> Result<(i32, Vec<Option<Vec<u8>>>), &'static str> {
-    if b.len() < 12 { return Err("bad binary array"); }
+    if b.len() < 12 {
+        return Err("bad binary array");
+    }
     let rd = |p: usize| i32::from_be_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]);
     let ndim = rd(0);
     let elem_oid = rd(8);
-    if ndim == 0 { return Ok((elem_oid, Vec::new())); }
-    if !(1..=6).contains(&ndim) { return Err("bad binary array ndim"); }
+    if ndim == 0 {
+        return Ok((elem_oid, Vec::new()));
+    }
+    if !(1..=6).contains(&ndim) {
+        return Err("bad binary array ndim");
+    }
     let mut pos = 12;
     let mut total: i64 = 1;
     for _ in 0..ndim {
-        if pos + 8 > b.len() { return Err("bad binary array dims"); }
+        if pos + 8 > b.len() {
+            return Err("bad binary array dims");
+        }
         let dim = rd(pos).max(0) as i64;
-        total = total.checked_mul(dim).filter(|t| *t <= 10_000_000)
+        total = total
+            .checked_mul(dim)
+            .filter(|t| *t <= 10_000_000)
             .ok_or("binary array too large")?;
         pos += 8;
     }
     let mut out = Vec::with_capacity(total.min(100_000) as usize);
     for _ in 0..total {
-        if pos + 4 > b.len() { return Err("bad binary array elem len"); }
-        let len = rd(pos); pos += 4;
+        if pos + 4 > b.len() {
+            return Err("bad binary array elem len");
+        }
+        let len = rd(pos);
+        pos += 4;
         if len < 0 {
             out.push(None);
         } else {
             let len = len as usize;
-            if pos + len > b.len() { return Err("bad binary array elem"); }
+            if pos + len > b.len() {
+                return Err("bad binary array elem");
+            }
             out.push(Some(b[pos..pos + len].to_vec()));
             pos += len;
         }
@@ -355,11 +403,7 @@ fn decode_bin_array(b: &[u8]) -> Result<(i32, Vec<Option<Vec<u8>>>), &'static st
 
 /// Render one bound parameter as a SQL literal. Handles arrays (`= ANY(?)`,
 /// common in catalog introspection) by emitting an `ARRAY[...]` literal.
-fn render_param(
-    oid: i32,
-    fmt: i16,
-    bytes: &Option<Vec<u8>>,
-) -> Result<String, &'static str> {
+fn render_param(oid: i32, fmt: i16, bytes: &Option<Vec<u8>>) -> Result<String, &'static str> {
     let b = match bytes {
         None => return Ok("NULL".to_string()),
         Some(b) => b,
@@ -377,7 +421,9 @@ fn render_param(
             return Ok(format!("ARRAY[{}]", parts.join(",")));
         } else {
             // text format: bytes are a PG array literal e.g. {a,b}
-            if b.contains(&0) { return Err("array text contains NUL"); }
+            if b.contains(&0) {
+                return Err("array text contains NUL");
+            }
             return Ok(format!(
                 "{}::{}[]",
                 quote_lit(&String::from_utf8_lossy(b)),
@@ -392,7 +438,14 @@ fn render_param(
 /// literals, quoted identifiers and comments so we never rewrite a `$n`
 /// that is actually data.
 fn inline_params(sql: &str, rendered: &[String]) -> String {
-    enum St { Normal, SQuote, DQuote, Line, Block, Dollar(Vec<u8>) }
+    enum St {
+        Normal,
+        SQuote,
+        DQuote,
+        Line,
+        Block,
+        Dollar(Vec<u8>),
+    }
     let mut st = St::Normal;
     let b = sql.as_bytes();
     // Byte buffer (not String): copying raw bytes keeps multibyte UTF-8 in
@@ -403,17 +456,29 @@ fn inline_params(sql: &str, rendered: &[String]) -> String {
         let c = b[i];
         match &st {
             St::Normal => {
-                if c == b'\'' { st = St::SQuote; out.push(c); i += 1; }
-                else if c == b'"' { st = St::DQuote; out.push(c); i += 1; }
-                else if c == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
-                    st = St::Line; out.extend_from_slice(b"--"); i += 2;
+                if c == b'\'' {
+                    st = St::SQuote;
+                    out.push(c);
+                    i += 1;
+                } else if c == b'"' {
+                    st = St::DQuote;
+                    out.push(c);
+                    i += 1;
+                } else if c == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
+                    st = St::Line;
+                    out.extend_from_slice(b"--");
+                    i += 2;
                 } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-                    st = St::Block; out.extend_from_slice(b"/*"); i += 2;
+                    st = St::Block;
+                    out.extend_from_slice(b"/*");
+                    i += 2;
                 } else if c == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
                     // $1.. positional parameter (PG dollar-quote tags may not
                     // start with a digit, so this is unambiguous).
                     let mut j = i + 1;
-                    while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
                     let idx: usize = sql[i + 1..j].parse().unwrap_or(0);
                     if idx >= 1 && idx <= rendered.len() {
                         out.extend_from_slice(rendered[idx - 1].as_bytes());
@@ -427,27 +492,53 @@ fn inline_params(sql: &str, rendered: &[String]) -> String {
                 {
                     // Dollar-quote open: $tag$ (tag may be empty as $$).
                     let mut j = i + 1;
-                    while j < b.len()
-                        && (b[j] == b'_' || b[j].is_ascii_alphanumeric())
-                    { j += 1; }
+                    while j < b.len() && (b[j] == b'_' || b[j].is_ascii_alphanumeric()) {
+                        j += 1;
+                    }
                     if j < b.len() && b[j] == b'$' {
                         let delim = b[i..=j].to_vec();
                         out.extend_from_slice(&delim);
                         st = St::Dollar(delim);
                         i = j + 1;
                     } else {
-                        out.push(c); i += 1;
+                        out.push(c);
+                        i += 1;
                     }
-                } else { out.push(c); i += 1; }
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
             }
-            St::SQuote => { out.push(c); if c == b'\'' { st = St::Normal; } i += 1; }
-            St::DQuote => { out.push(c); if c == b'"' { st = St::Normal; } i += 1; }
-            St::Line => { out.push(c); if c == b'\n' { st = St::Normal; } i += 1; }
+            St::SQuote => {
+                out.push(c);
+                if c == b'\'' {
+                    st = St::Normal;
+                }
+                i += 1;
+            }
+            St::DQuote => {
+                out.push(c);
+                if c == b'"' {
+                    st = St::Normal;
+                }
+                i += 1;
+            }
+            St::Line => {
+                out.push(c);
+                if c == b'\n' {
+                    st = St::Normal;
+                }
+                i += 1;
+            }
             St::Block => {
                 out.push(c);
                 if c == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
-                    out.push(b'/'); st = St::Normal; i += 2;
-                } else { i += 1; }
+                    out.push(b'/');
+                    st = St::Normal;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             St::Dollar(delim) => {
                 if b[i..].starts_with(delim.as_slice()) {
@@ -455,7 +546,8 @@ fn inline_params(sql: &str, rendered: &[String]) -> String {
                     i += delim.len();
                     st = St::Normal;
                 } else {
-                    out.push(c); i += 1;
+                    out.push(c);
+                    i += 1;
                 }
             }
         }
@@ -508,8 +600,7 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
         proto::write_raw(stream, &proto::no_data()).await?;
     } else {
         // Simple-query path has no type info; advertise text (OID 25).
-        let typed: Vec<(String, i32)> =
-            cols.iter().map(|n| (n.clone(), 25)).collect();
+        let typed: Vec<(String, i32)> = cols.iter().map(|n| (n.clone(), 25)).collect();
         proto::write_raw(stream, &proto::row_description(&typed)).await?;
         for row in rows {
             proto::write_raw(stream, &proto::data_row(row)).await?;
@@ -552,18 +643,32 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
     let started = std::time::Instant::now();
     if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
         info!(env = env_name, reason, "pg policy DENY");
-        AuditEvent::new(env_name, client_user, sql,
-            AuditDecision::Deny, Some(reason.to_string()), None, started.elapsed()).emit();
-        proto::write_raw(stream,
-            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason)).await?;
+        AuditEvent::new(
+            env_name,
+            client_user,
+            sql,
+            AuditDecision::Deny,
+            Some(reason.to_string()),
+            None,
+            started.elapsed(),
+        )
+        .emit();
+        proto::write_raw(
+            stream,
+            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason),
+        )
+        .await?;
         return Ok(false);
     }
     let client = match pool.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend unavailable");
-            proto::write_raw(stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable")).await?;
+            proto::write_raw(
+                stream,
+                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
+            )
+            .await?;
             return Ok(false);
         }
     };
@@ -571,10 +676,21 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(rs) => rs,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend query error");
-            AuditEvent::new(env_name, client_user, sql,
-                AuditDecision::Deny, Some("backend error".into()), None, started.elapsed()).emit();
-            proto::write_raw(stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed")).await?;
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Deny,
+                Some("backend error".into()),
+                None,
+                started.elapsed(),
+            )
+            .emit();
+            proto::write_raw(
+                stream,
+                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
+            )
+            .await?;
             return Ok(false);
         }
     };
@@ -582,8 +698,16 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
         proto::write_raw(stream, &proto::data_row(row)).await?;
     }
     proto::write_raw(stream, &proto::command_complete(&rs.2)).await?;
-    AuditEvent::new(env_name, client_user, sql,
-        AuditDecision::Allow, None, Some(rs.1.len() as u64), started.elapsed()).emit();
+    AuditEvent::new(
+        env_name,
+        client_user,
+        sql,
+        AuditDecision::Allow,
+        None,
+        Some(rs.1.len() as u64),
+        started.elapsed(),
+    )
+    .emit();
     Ok(true)
 }
 
@@ -601,18 +725,32 @@ async fn firewalled_exec<S: AsyncRead + AsyncWrite + Unpin>(
     let started = std::time::Instant::now();
     if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
         info!(env = env_name, reason, "pg policy DENY");
-        AuditEvent::new(env_name, client_user, sql,
-            AuditDecision::Deny, Some(reason.to_string()), None, started.elapsed()).emit();
-        proto::write_raw(stream,
-            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason)).await?;
+        AuditEvent::new(
+            env_name,
+            client_user,
+            sql,
+            AuditDecision::Deny,
+            Some(reason.to_string()),
+            None,
+            started.elapsed(),
+        )
+        .emit();
+        proto::write_raw(
+            stream,
+            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason),
+        )
+        .await?;
         return Ok(false);
     }
     let client = match pool.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend unavailable");
-            proto::write_raw(stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable")).await?;
+            proto::write_raw(
+                stream,
+                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
+            )
+            .await?;
             return Ok(false);
         }
     };
@@ -620,17 +758,36 @@ async fn firewalled_exec<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(rs) => rs,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend query error");
-            AuditEvent::new(env_name, client_user, sql,
-                AuditDecision::Deny, Some("backend error".into()), None, started.elapsed()).emit();
-            proto::write_raw(stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed")).await?;
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Deny,
+                Some("backend error".into()),
+                None,
+                started.elapsed(),
+            )
+            .emit();
+            proto::write_raw(
+                stream,
+                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
+            )
+            .await?;
             return Ok(false);
         }
     };
     let n = rs.1.len() as u64;
     write_result_set(stream, &rs).await?;
-    AuditEvent::new(env_name, client_user, sql,
-        AuditDecision::Allow, None, Some(n), started.elapsed()).emit();
+    AuditEvent::new(
+        env_name,
+        client_user,
+        sql,
+        AuditDecision::Allow,
+        None,
+        Some(n),
+        started.elapsed(),
+    )
+    .emit();
     Ok(true)
 }
 
@@ -670,7 +827,9 @@ pub async fn serve(
         match tag {
             // --- Simple query ---
             b'Q' => {
-                let sql = body.split(|&b| b == 0).next()
+                let sql = body
+                    .split(|&b| b == 0)
+                    .next()
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .unwrap_or_default();
                 if sql.trim().is_empty() {
@@ -683,22 +842,36 @@ pub async fn serve(
 
             // --- Extended query ---
             b'P' => {
-                if skip_until_sync { continue; }
+                if skip_until_sync {
+                    continue;
+                }
                 let Some(m) = proto::parse_parse(&body) else {
-                    proto::write_raw(stream,
-                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "bad Parse")).await?;
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "bad Parse"),
+                    )
+                    .await?;
                     skip_until_sync = true;
                     continue;
                 };
-                if let Decision::Deny(reason) =
-                    policy::evaluate(&m.query, pol, &policy::PG_PROFILE)
+                if let Decision::Deny(reason) = policy::evaluate(&m.query, pol, &policy::PG_PROFILE)
                 {
                     info!(env = env_name, reason, "pg policy DENY (parse)");
-                    AuditEvent::new(env_name, client_user, &m.query,
-                        AuditDecision::Deny, Some(reason.to_string()), None,
-                        std::time::Duration::ZERO).emit();
-                    proto::write_raw(stream,
-                        &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason)).await?;
+                    AuditEvent::new(
+                        env_name,
+                        client_user,
+                        &m.query,
+                        AuditDecision::Deny,
+                        Some(reason.to_string()),
+                        None,
+                        std::time::Duration::ZERO,
+                    )
+                    .emit();
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason),
+                    )
+                    .await?;
                     skip_until_sync = true;
                     continue;
                 }
@@ -706,29 +879,46 @@ pub async fn serve(
                 // metadata (pgjdbc relies on this for prepared reuse).
                 match backend_describe(pool, &m.query).await {
                     Ok((param_oids, col_meta)) => {
-                        prepared.insert(m.stmt.clone(),
-                            Prepared { sql: m.query, param_oids, col_meta });
+                        prepared.insert(
+                            m.stmt.clone(),
+                            Prepared {
+                                sql: m.query,
+                                param_oids,
+                                col_meta,
+                            },
+                        );
                         proto::write_raw(stream, &proto::parse_complete()).await?;
                     }
                     Err(e) => {
                         warn!(env = env_name, err = %e, "pg backend parse failed");
-                        proto::write_raw(stream,
-                            &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed")).await?;
+                        proto::write_raw(
+                            stream,
+                            &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed"),
+                        )
+                        .await?;
                         skip_until_sync = true;
                     }
                 }
             }
             b'B' => {
-                if skip_until_sync { continue; }
+                if skip_until_sync {
+                    continue;
+                }
                 let Some(m) = proto::parse_bind(&body) else {
-                    proto::write_raw(stream,
-                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "bad Bind")).await?;
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "bad Bind"),
+                    )
+                    .await?;
                     skip_until_sync = true;
                     continue;
                 };
                 let Some(prep) = prepared.get(&m.stmt) else {
-                    proto::write_raw(stream,
-                        &proto::error_response(SQLSTATE_INTERNAL, "unknown prepared statement")).await?;
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(SQLSTATE_INTERNAL, "unknown prepared statement"),
+                    )
+                    .await?;
                     skip_until_sync = true;
                     continue;
                 };
@@ -739,30 +929,46 @@ pub async fn serve(
                     let fmt = m.param_formats.get(i).copied().unwrap_or(0);
                     match render_param(oid, fmt, val) {
                         Ok(r) => rendered.push(r),
-                        Err(e) => { bad = Some(e); break; }
+                        Err(e) => {
+                            bad = Some(e);
+                            break;
+                        }
                     }
                 }
                 if let Some(e) = bad {
-                    proto::write_raw(stream,
-                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, e)).await?;
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, e),
+                    )
+                    .await?;
                     skip_until_sync = true;
                     continue;
                 }
                 let inlined = inline_params(&prep.sql, &rendered);
-                portals.insert(m.portal.clone(),
-                    Portal { stmt: m.stmt.clone(), sql: inlined });
+                portals.insert(
+                    m.portal.clone(),
+                    Portal {
+                        stmt: m.stmt.clone(),
+                        sql: inlined,
+                    },
+                );
                 proto::write_raw(stream, &proto::bind_complete()).await?;
             }
             b'D' => {
-                if skip_until_sync { continue; }
+                if skip_until_sync {
+                    continue;
+                }
                 let Some((kind, name)) = proto::parse_describe_or_close(&body) else {
                     proto::write_raw(stream, &proto::no_data()).await?;
                     continue;
                 };
                 let meta = if kind == b'S' {
-                    prepared.get(&name).map(|p| (Some(p.param_oids.clone()), p.col_meta.clone()))
+                    prepared
+                        .get(&name)
+                        .map(|p| (Some(p.param_oids.clone()), p.col_meta.clone()))
                 } else {
-                    portals.get(&name)
+                    portals
+                        .get(&name)
                         .and_then(|po| prepared.get(&po.stmt))
                         .map(|p| (None, p.col_meta.clone()))
                 };
@@ -781,13 +987,18 @@ pub async fn serve(
                 }
             }
             b'E' => {
-                if skip_until_sync { continue; }
+                if skip_until_sync {
+                    continue;
+                }
                 let portal_name = proto::parse_execute(&body).unwrap_or_default();
                 let sql = match portals.get(&portal_name) {
                     Some(p) => p.sql.clone(),
                     None => {
-                        proto::write_raw(stream,
-                            &proto::error_response(SQLSTATE_INTERNAL, "unknown portal")).await?;
+                        proto::write_raw(
+                            stream,
+                            &proto::error_response(SQLSTATE_INTERNAL, "unknown portal"),
+                        )
+                        .await?;
                         skip_until_sync = true;
                         continue;
                     }
@@ -800,7 +1011,11 @@ pub async fn serve(
             }
             b'C' => {
                 if let Some((kind, name)) = proto::parse_describe_or_close(&body) {
-                    if kind == b'S' { prepared.remove(&name); } else { portals.remove(&name); }
+                    if kind == b'S' {
+                        prepared.remove(&name);
+                    } else {
+                        portals.remove(&name);
+                    }
                 }
                 proto::write_raw(stream, &proto::close_complete()).await?;
             }
@@ -812,8 +1027,11 @@ pub async fn serve(
             b'X' => return Ok(()),
             other => {
                 warn!(env = env_name, tag = other, "pg: unsupported message");
-                proto::write_raw(stream,
-                    &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "unsupported message")).await?;
+                proto::write_raw(
+                    stream,
+                    &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "unsupported message"),
+                )
+                .await?;
                 proto::write_raw(stream, &proto::ready_for_query()).await?;
             }
         }
@@ -854,12 +1072,28 @@ mod tests {
 
     #[test]
     fn safe_numeric() {
-        for ok in ["0", "123", "-1", "+7", "1.5", "-1.25", ".5", "1.", "1e10",
-                   "1.5e-3", "-2E+4", "NaN", "Infinity", "-Infinity"] {
+        for ok in [
+            "0",
+            "123",
+            "-1",
+            "+7",
+            "1.5",
+            "-1.25",
+            ".5",
+            "1.",
+            "1e10",
+            "1.5e-3",
+            "-2E+4",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ] {
             assert!(is_safe_numeric(ok), "should accept {ok:?}");
         }
-        for bad in ["", " ", "abc", "1 OR 1=1", "1;2", "1,2", "0x10", "1e",
-                    "--1", "1..2", "1 2", ") OR (", "1)"] {
+        for bad in [
+            "", " ", "abc", "1 OR 1=1", "1;2", "1,2", "0x10", "1e", "--1", "1..2", "1 2", ") OR (",
+            "1)",
+        ] {
             assert!(!is_safe_numeric(bad), "should reject {bad:?}");
         }
     }
@@ -883,13 +1117,28 @@ mod tests {
 
     #[test]
     fn render_scalar_binary_ints() {
-        assert_eq!(render_scalar(OID_INT2, 1, Some(&7i16.to_be_bytes())).unwrap(), "7");
-        assert_eq!(render_scalar(OID_INT4, 1, Some(&513i32.to_be_bytes())).unwrap(), "513");
-        assert_eq!(render_scalar(OID_INT8, 1, Some(&9i64.to_be_bytes())).unwrap(), "9");
+        assert_eq!(
+            render_scalar(OID_INT2, 1, Some(&7i16.to_be_bytes())).unwrap(),
+            "7"
+        );
+        assert_eq!(
+            render_scalar(OID_INT4, 1, Some(&513i32.to_be_bytes())).unwrap(),
+            "513"
+        );
+        assert_eq!(
+            render_scalar(OID_INT8, 1, Some(&9i64.to_be_bytes())).unwrap(),
+            "9"
+        );
         // regclass (2205) family decoded as i32
-        assert_eq!(render_scalar(2205, 1, Some(&2200i32.to_be_bytes())).unwrap(), "2200");
+        assert_eq!(
+            render_scalar(2205, 1, Some(&2200i32.to_be_bytes())).unwrap(),
+            "2200"
+        );
         // unknown binary with NUL, 4 bytes -> int
-        assert_eq!(render_scalar(99999, 1, Some(&2200i32.to_be_bytes())).unwrap(), "2200");
+        assert_eq!(
+            render_scalar(99999, 1, Some(&2200i32.to_be_bytes())).unwrap(),
+            "2200"
+        );
         // unknown binary, no NUL -> quoted text
         assert_eq!(render_scalar(99999, 1, Some(b"abc")).unwrap(), "'abc'");
         // unknown binary with NUL but odd length -> rejected
@@ -900,8 +1149,14 @@ mod tests {
     fn render_scalar_text_numeric_injection_guarded() {
         assert_eq!(render_scalar(OID_INT4, 0, Some(b"42")).unwrap(), "42");
         // numeric-typed but not a numeric literal: must be quoted, not raw
-        assert_eq!(render_scalar(OID_INT4, 0, Some(b"0 OR 1=1")).unwrap(), "'0 OR 1=1'");
-        assert_eq!(render_scalar(25, 0, Some(b"O'Brien")).unwrap(), "'O''Brien'");
+        assert_eq!(
+            render_scalar(OID_INT4, 0, Some(b"0 OR 1=1")).unwrap(),
+            "'0 OR 1=1'"
+        );
+        assert_eq!(
+            render_scalar(25, 0, Some(b"O'Brien")).unwrap(),
+            "'O''Brien'"
+        );
     }
 
     #[test]
@@ -926,18 +1181,27 @@ mod tests {
         let p = Some(bin_array(25, &[Some(b"alpha"), Some(b"gamma")]));
         assert_eq!(render_param(1009, 1, &p).unwrap(), "ARRAY['alpha','gamma']");
         // int4[] (oid 1007) binary
-        let p = Some(bin_array(OID_INT4, &[Some(&1i32.to_be_bytes()), Some(&3i32.to_be_bytes())]));
+        let p = Some(bin_array(
+            OID_INT4,
+            &[Some(&1i32.to_be_bytes()), Some(&3i32.to_be_bytes())],
+        ));
         assert_eq!(render_param(1007, 1, &p).unwrap(), "ARRAY[1,3]");
         // empty array -> typed empty
         let mut empty = Vec::new();
         empty.extend_from_slice(&0i32.to_be_bytes());
         empty.extend_from_slice(&0i32.to_be_bytes());
         empty.extend_from_slice(&OID_INT4.to_be_bytes());
-        assert_eq!(render_param(1007, 1, &Some(empty)).unwrap(), "ARRAY[]::int4[]");
+        assert_eq!(
+            render_param(1007, 1, &Some(empty)).unwrap(),
+            "ARRAY[]::int4[]"
+        );
         // NULL whole param
         assert_eq!(render_param(1009, 1, &None).unwrap(), "NULL");
         // text-format array literal
-        assert_eq!(render_param(1009, 0, &Some(b"{a,b}".to_vec())).unwrap(), "'{a,b}'::text[]");
+        assert_eq!(
+            render_param(1009, 0, &Some(b"{a,b}".to_vec())).unwrap(),
+            "'{a,b}'::text[]"
+        );
     }
 
     #[test]
@@ -958,7 +1222,10 @@ mod tests {
         assert_eq!(inline_params("v=$12", &r), "v=12");
         // $$...$$ body must not be substituted; $1 after it must be
         assert_eq!(inline_params("$$ $1 $$ $1", &r), "$$ $1 $$ 1");
-        assert_eq!(inline_params("$tag$ a $1 $tag$ $2", &r), "$tag$ a $1 $tag$ 2");
+        assert_eq!(
+            inline_params("$tag$ a $1 $tag$ $2", &r),
+            "$tag$ a $1 $tag$ 2"
+        );
     }
 
     #[test]

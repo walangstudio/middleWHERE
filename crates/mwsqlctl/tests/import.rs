@@ -117,9 +117,18 @@ fn missing_known_hosts_warns_unpinned() {
     make_poc(poc.path(), false);
     let (state, ks) = fresh_state();
     let report = import_poc::import(state.path(), &ks, poc.path()).unwrap();
-    assert!(report.warnings.iter().any(|w| w.contains("UNPINNED")), "{:?}", report.warnings);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("UNPINNED")),
+        "{:?}",
+        report.warnings
+    );
     let cfg = load_config(state.path(), &ks).unwrap();
-    assert!(cfg.bastions.get("stage").unwrap().pinned_host_keys.is_empty());
+    assert!(cfg
+        .bastions
+        .get("stage")
+        .unwrap()
+        .pinned_host_keys
+        .is_empty());
 }
 
 #[test]
@@ -146,15 +155,21 @@ fn collision_with_existing_env_is_refused() {
 #[test]
 fn parses_quotes_and_export_prefix() {
     let poc = TempDir::new().unwrap();
-    std::fs::write(poc.path().join(".env"),
-        "export DB_HOST=\"quoted.example.com\"\nDB_USER='rootish'\n").unwrap();
+    std::fs::write(
+        poc.path().join(".env"),
+        "export DB_HOST=\"quoted.example.com\"\nDB_USER='rootish'\n",
+    )
+    .unwrap();
     let s = poc.path().join("secrets");
     std::fs::create_dir_all(&s).unwrap();
     std::fs::write(s.join("db_password"), "p\n").unwrap();
     let (state, ks) = fresh_state();
     import_poc::import(state.path(), &ks, poc.path()).unwrap();
     let cfg = load_config(state.path(), &ks).unwrap();
-    assert_eq!(cfg.envs.get("DB").unwrap().backend_host, "quoted.example.com");
+    assert_eq!(
+        cfg.envs.get("DB").unwrap().backend_host,
+        "quoted.example.com"
+    );
     assert_eq!(cfg.credentials.get("db").unwrap().backend_user, "rootish");
 }
 
@@ -165,7 +180,8 @@ fn path_traversal_secret_name_refused() {
     std::fs::write(
         poc.path().join(".env"),
         "../../../etc/shadow_HOST=x\n../../../etc/shadow_USER=root\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::create_dir_all(poc.path().join("secrets")).unwrap();
     let (state, ks) = fresh_state();
     let err = import_poc::import(state.path(), &ks, poc.path()).unwrap_err();

@@ -129,7 +129,10 @@ mod tests {
         let s = t.expose();
         assert!(s.len() >= 40 && s.len() <= 48);
         for c in s.chars() {
-            assert!(c.is_ascii_alphanumeric() || c == '_' || c == '-', "char {c:?}");
+            assert!(
+                c.is_ascii_alphanumeric() || c == '_' || c == '-',
+                "char {c:?}"
+            );
         }
     }
 

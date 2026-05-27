@@ -18,10 +18,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 use mw_core::config::*;
-use mw_core::secret::SecretStr;
-use mw_core::seal::{seal, MasterKey, Passphrase};
-use mw_core::token::double_sha1;
 use mw_core::keyring::{FileStore, MasterKeyStore};
+use mw_core::seal::{seal, MasterKey, Passphrase};
+use mw_core::secret::SecretStr;
+use mw_core::token::double_sha1;
 use mwsqld::{Daemon, KeystoreChoice, CONFIG_FILE_NAME};
 
 const TOKEN: &str = "daemon-bastion-token-c7e1b2";
@@ -54,7 +54,11 @@ struct TestSshHandler {}
 impl server::Handler for TestSshHandler {
     type Error = russh::Error;
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if user == SSH_USER && password == SSH_PASSWORD { Ok(Auth::Accept) } else { Ok(Auth::reject()) }
+        if user == SSH_USER && password == SSH_PASSWORD {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
     }
     async fn channel_open_direct_tcpip(
         &mut self,
@@ -77,8 +81,13 @@ impl server::Handler for TestSshHandler {
         });
         Ok(true)
     }
-    async fn channel_eof(&mut self, _channel: ChannelId, _session: &mut Session)
-        -> Result<(), Self::Error> { Ok(()) }
+    async fn channel_eof(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 async fn spawn_sshd() -> (u16, HostKeyFingerprint) {
@@ -90,7 +99,10 @@ async fn spawn_sshd() -> (u16, HostKeyFingerprint) {
     let blob = public.to_bytes().unwrap();
     let digest = Sha256::digest(&blob);
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
-    let fp = HostKeyFingerprint { algo: public.algorithm().to_string(), sha256_b64: b64 };
+    let fp = HostKeyFingerprint {
+        algo: public.algorithm().to_string(),
+        sha256_b64: b64,
+    };
 
     let config = Arc::new(server::Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
@@ -106,7 +118,8 @@ async fn spawn_sshd() -> (u16, HostKeyFingerprint) {
         let mut server = TestSshServer;
         loop {
             let (sock, peer) = match listener.accept().await {
-                Ok(x) => x, Err(_) => return,
+                Ok(x) => x,
+                Err(_) => return,
             };
             let handler = server.new_client(Some(peer));
             let cfg = config.clone();
@@ -136,8 +149,8 @@ async fn select_one_through_bastion() {
     let backend_host = opts.ip_or_hostname().to_string();
     let backend_port = opts.tcp_port();
     let backend_user = opts.user().unwrap_or("").to_string();
-    let backend_pw   = opts.pass().unwrap_or("").to_string();
-    let backend_db   = opts.db_name().map(|s| s.to_string());
+    let backend_pw = opts.pass().unwrap_or("").to_string();
+    let backend_db = opts.db_name().map(|s| s.to_string());
 
     let (sshd_port, fp) = spawn_sshd().await;
     let tmp = TempDir::new().unwrap();
@@ -146,33 +159,61 @@ async fn select_one_through_bastion() {
     // Seal config with one bastion + one env that uses it.
     let mk = MasterKey::generate();
     let ks = KeystoreChoice::default_file(tmp.path());
-    if let KeystoreChoice::File { path } = &ks { FileStore::new(path).store(&mk).unwrap(); }
+    if let KeystoreChoice::File { path } = &ks {
+        FileStore::new(path).store(&mk).unwrap();
+    }
     let mut bastions = BTreeMap::new();
-    bastions.insert("jump".to_string(), Bastion {
-        host: "127.0.0.1".into(), port: sshd_port,
-        ssh_user: SSH_USER.into(),
-        auth: BastionAuth::Password { password: SecretStr::new(SSH_PASSWORD) },
-        pinned_host_keys: vec![fp],
-    });
+    bastions.insert(
+        "jump".to_string(),
+        Bastion {
+            host: "127.0.0.1".into(),
+            port: sshd_port,
+            ssh_user: SSH_USER.into(),
+            auth: BastionAuth::Password {
+                password: SecretStr::new(SSH_PASSWORD),
+            },
+            pinned_host_keys: vec![fp],
+        },
+    );
     let mut credentials = BTreeMap::new();
-    credentials.insert("c".to_string(), Credential {
-        backend_user, backend_password: SecretStr::new(backend_pw),
-    });
+    credentials.insert(
+        "c".to_string(),
+        Credential {
+            backend_user,
+            backend_password: SecretStr::new(backend_pw),
+        },
+    );
     let mut envs = BTreeMap::new();
-    envs.insert("stage_w9".to_string(), Env {
-        backend_host, backend_port, default_database: backend_db,
-        bastion: Some("jump".into()), credential: "c".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: double_sha1(TOKEN.as_bytes()) },
-        listen_port, pool: PoolSettings::default(),
-        engine: mw_core::config::EngineKind::MySql,
-    });
-    let cfg = Config { schema_version: CURRENT_SCHEMA_VERSION, bastions, credentials, envs };
+    envs.insert(
+        "stage_w9".to_string(),
+        Env {
+            backend_host,
+            backend_port,
+            default_database: backend_db,
+            bastion: Some("jump".into()),
+            credential: "c".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: double_sha1(TOKEN.as_bytes()),
+            },
+            listen_port,
+            pool: PoolSettings::default(),
+            engine: mw_core::config::EngineKind::MySql,
+        },
+    );
+    let cfg = Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        bastions,
+        credentials,
+        envs,
+    };
     let blob = seal(&cfg, &mk, &Passphrase::default()).unwrap();
     std::fs::write(tmp.path().join(CONFIG_FILE_NAME), blob).unwrap();
 
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false).await.unwrap();
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false)
+        .await
+        .unwrap();
     let (tx, rx) = broadcast::channel(1);
     let h = tokio::spawn(daemon.run(rx));
 
@@ -185,14 +226,19 @@ async fn select_one_through_bastion() {
         .pass(Some(TOKEN))
         .stmt_cache_size(0)
         .into();
-    let mut conn = Conn::new(client_opts).await.expect("connect via daemon → bastion");
+    let mut conn = Conn::new(client_opts)
+        .await
+        .expect("connect via daemon → bastion");
     let v: i64 = conn.query_first("SELECT 1").await.unwrap().unwrap();
     assert_eq!(v, 1);
     drop(conn);
 
     tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), h).await
-        .expect("shutdown timed out").unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
+        .expect("shutdown timed out")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -200,35 +246,63 @@ async fn bind_fails_when_bastion_unreachable() {
     let tmp = TempDir::new().unwrap();
     let mk = MasterKey::generate();
     let ks = KeystoreChoice::default_file(tmp.path());
-    if let KeystoreChoice::File { path } = &ks { FileStore::new(path).store(&mk).unwrap(); }
+    if let KeystoreChoice::File { path } = &ks {
+        FileStore::new(path).store(&mk).unwrap();
+    }
 
     let mut bastions = BTreeMap::new();
-    bastions.insert("ghost".to_string(), Bastion {
-        host: "127.0.0.1".into(),
-        port: 1, // closed
-        ssh_user: "x".into(),
-        auth: BastionAuth::Password { password: SecretStr::new("x") },
-        pinned_host_keys: vec![],
-    });
+    bastions.insert(
+        "ghost".to_string(),
+        Bastion {
+            host: "127.0.0.1".into(),
+            port: 1, // closed
+            ssh_user: "x".into(),
+            auth: BastionAuth::Password {
+                password: SecretStr::new("x"),
+            },
+            pinned_host_keys: vec![],
+        },
+    );
     let mut credentials = BTreeMap::new();
-    credentials.insert("c".to_string(), Credential {
-        backend_user: "u".into(), backend_password: SecretStr::new("p"),
-    });
+    credentials.insert(
+        "c".to_string(),
+        Credential {
+            backend_user: "u".into(),
+            backend_password: SecretStr::new("p"),
+        },
+    );
     let listen_port = pick_free_port().await;
     let mut envs = BTreeMap::new();
-    envs.insert("e".to_string(), Env {
-        backend_host: "127.0.0.1".into(), backend_port: 3306, default_database: None,
-        bastion: Some("ghost".into()), credential: "c".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: double_sha1(b"x") },
-        listen_port, pool: PoolSettings::default(),
-        engine: mw_core::config::EngineKind::MySql,
-    });
-    let cfg = Config { schema_version: CURRENT_SCHEMA_VERSION, bastions, credentials, envs };
+    envs.insert(
+        "e".to_string(),
+        Env {
+            backend_host: "127.0.0.1".into(),
+            backend_port: 3306,
+            default_database: None,
+            bastion: Some("ghost".into()),
+            credential: "c".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: double_sha1(b"x"),
+            },
+            listen_port,
+            pool: PoolSettings::default(),
+            engine: mw_core::config::EngineKind::MySql,
+        },
+    );
+    let cfg = Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        bastions,
+        credentials,
+        envs,
+    };
     let blob = seal(&cfg, &mk, &Passphrase::default()).unwrap();
     std::fs::write(tmp.path().join(CONFIG_FILE_NAME), blob).unwrap();
 
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
     let res = Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false).await;
-    assert!(res.is_err(), "expected bind to fail when bastion unreachable");
+    assert!(
+        res.is_err(),
+        "expected bind to fail when bastion unreachable"
+    );
 }

@@ -31,10 +31,7 @@ pub enum Startup {
     Cancel,
 }
 
-async fn read_exact<R: AsyncRead + Unpin>(
-    r: &mut R,
-    buf: &mut [u8],
-) -> Result<(), PgProtoError> {
+async fn read_exact<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<(), PgProtoError> {
     match r.read_exact(buf).await {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(PgProtoError::Closed),
@@ -43,9 +40,7 @@ async fn read_exact<R: AsyncRead + Unpin>(
 }
 
 /// Read one startup-phase packet (no type byte).
-pub async fn read_startup<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<Startup, PgProtoError> {
+pub async fn read_startup<R: AsyncRead + Unpin>(r: &mut R) -> Result<Startup, PgProtoError> {
     let mut len_b = [0u8; 4];
     read_exact(r, &mut len_b).await?;
     let len = i32::from_be_bytes(len_b);
@@ -83,9 +78,7 @@ pub async fn read_startup<R: AsyncRead + Unpin>(
 }
 
 /// Read one typed message: returns `(type_byte, payload)`.
-pub async fn read_message<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<(u8, Vec<u8>), PgProtoError> {
+pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8>), PgProtoError> {
     let mut hdr = [0u8; 5];
     read_exact(r, &mut hdr).await?;
     let tag = hdr[0];
@@ -98,10 +91,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     Ok((tag, body))
 }
 
-pub async fn write_raw<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    bytes: &[u8],
-) -> Result<(), PgProtoError> {
+pub async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<(), PgProtoError> {
     w.write_all(bytes).await?;
     Ok(())
 }
@@ -206,11 +196,21 @@ pub fn command_complete(tag: &str) -> Vec<u8> {
 
 // --- Extended query protocol ---
 
-pub fn parse_complete() -> Vec<u8> { msg(b'1', &[]) }
-pub fn bind_complete() -> Vec<u8> { msg(b'2', &[]) }
-pub fn close_complete() -> Vec<u8> { msg(b'3', &[]) }
-pub fn no_data() -> Vec<u8> { msg(b'n', &[]) }
-pub fn empty_query_response() -> Vec<u8> { msg(b'I', &[]) }
+pub fn parse_complete() -> Vec<u8> {
+    msg(b'1', &[])
+}
+pub fn bind_complete() -> Vec<u8> {
+    msg(b'2', &[])
+}
+pub fn close_complete() -> Vec<u8> {
+    msg(b'3', &[])
+}
+pub fn no_data() -> Vec<u8> {
+    msg(b'n', &[])
+}
+pub fn empty_query_response() -> Vec<u8> {
+    msg(b'I', &[])
+}
 
 /// `ParameterDescription` ('t'): int16 count + int32 type-oid per param.
 pub fn parameter_description(oids: &[i32]) -> Vec<u8> {
@@ -300,7 +300,12 @@ pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
             _ => *fmts.get(i).unwrap_or(&0),
         })
         .collect();
-    Some(BindMsg { portal, stmt, param_formats, params })
+    Some(BindMsg {
+        portal,
+        stmt,
+        param_formats,
+        params,
+    })
 }
 
 /// Describe/Close target: ('S', name) statement or ('P', name) portal.
@@ -416,8 +421,14 @@ mod tests {
     fn describe_close_execute_parse() {
         let mut b = vec![b'S'];
         b.extend_from_slice(b"name\0");
-        assert_eq!(parse_describe_or_close(&b), Some((b'S', "name".to_string())));
-        assert_eq!(parse_execute(b"portal\0\0\0\0\0"), Some("portal".to_string()));
+        assert_eq!(
+            parse_describe_or_close(&b),
+            Some((b'S', "name".to_string()))
+        );
+        assert_eq!(
+            parse_execute(b"portal\0\0\0\0\0"),
+            Some("portal".to_string())
+        );
     }
 
     #[tokio::test]
@@ -438,14 +449,18 @@ mod tests {
         let mut ssl = Vec::new();
         ssl.extend_from_slice(&8i32.to_be_bytes());
         ssl.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
-        assert!(matches!(read_startup(&mut ssl.as_slice()).await.unwrap(),
-            Startup::EncryptionRequest));
+        assert!(matches!(
+            read_startup(&mut ssl.as_slice()).await.unwrap(),
+            Startup::EncryptionRequest
+        ));
         let mut cancel = Vec::new();
         cancel.extend_from_slice(&16i32.to_be_bytes());
         cancel.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
         cancel.extend_from_slice(&[0u8; 8]);
-        assert!(matches!(read_startup(&mut cancel.as_slice()).await.unwrap(),
-            Startup::Cancel));
+        assert!(matches!(
+            read_startup(&mut cancel.as_slice()).await.unwrap(),
+            Startup::Cancel
+        ));
     }
 
     #[tokio::test]

@@ -8,10 +8,10 @@
 
 use std::time::Duration;
 
-use mwsql::{ClientTokenStore, FileClientStore, StoredCred};
 use mw_core::config::Policy;
 use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
+use mwsql::{ClientTokenStore, FileClientStore, StoredCred};
 use mwsqlctl::{cred, envs};
 use tempfile::TempDir;
 
@@ -26,9 +26,13 @@ async fn client_chain() {
     let (bh, bp, bu, bpw, bdb) = match std::env::var("MYSQL_TEST_URL").ok() {
         Some(url) => {
             let o = mysql_async::Opts::from_url(&url).expect("MYSQL_TEST_URL");
-            (o.ip_or_hostname().to_string(), o.tcp_port(),
-             o.user().unwrap_or("").to_string(), o.pass().unwrap_or("").to_string(),
-             o.db_name().map(|s| s.to_string()))
+            (
+                o.ip_or_hostname().to_string(),
+                o.tcp_port(),
+                o.user().unwrap_or("").to_string(),
+                o.pass().unwrap_or("").to_string(),
+                o.db_name().map(|s| s.to_string()),
+            )
         }
         None => ("127.0.0.1".into(), 3306, "noop".into(), "noop".into(), None),
     };
@@ -38,21 +42,37 @@ async fn client_chain() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    envs::add(tmp.path(), &ks, envs::EnvAddArgs {
-        name: "stage_w9", backend_host: &bh, backend_port: bp,
-        default_database: bdb.as_deref(), bastion: None, credential: "c",
-        policy: Policy::ReadOnly, listen_port: Some(listen_port), max_pool: None,
-        engine: Default::default(),
-    }).unwrap();
+    envs::add(
+        tmp.path(),
+        &ks,
+        envs::EnvAddArgs {
+            name: "stage_w9",
+            backend_host: &bh,
+            backend_port: bp,
+            default_database: bdb.as_deref(),
+            bastion: None,
+            credential: "c",
+            policy: Policy::ReadOnly,
+            listen_port: Some(listen_port),
+            max_pool: None,
+            engine: Default::default(),
+        },
+    )
+    .unwrap();
 
     // grant → token; login stores {token,host,port} in the client store.
     let granted = envs::grant(tmp.path(), &ks, "stage_w9").unwrap();
     let store = FileClientStore::new(tmp.path().join("client"));
-    store.save("stage_w9", &StoredCred {
-        token: granted.token.expose().to_string(),
-        host: "127.0.0.1".into(),
-        port: granted.listen_port,
-    }).unwrap();
+    store
+        .save(
+            "stage_w9",
+            &StoredCred {
+                token: granted.token.expose().to_string(),
+                host: "127.0.0.1".into(),
+                port: granted.listen_port,
+            },
+        )
+        .unwrap();
 
     // Offline assertion: the stored token authenticates against the sealed
     // config's stored hash.
@@ -60,8 +80,10 @@ async fn client_chain() {
     let stored_cred = store.load("stage_w9").unwrap();
     match &cfg.envs.get("stage_w9").unwrap().client_auth {
         mw_core::config::ClientAuth::NativePassword { double_sha1 } => {
-            assert_eq!(*double_sha1,
-                mw_core::token::double_sha1(stored_cred.token.as_bytes()));
+            assert_eq!(
+                *double_sha1,
+                mw_core::token::double_sha1(stored_cred.token.as_bytes())
+            );
         }
         other => panic!("expected native password, got {other:?}"),
     }
@@ -75,18 +97,23 @@ async fn client_chain() {
     // Live half: bring up the daemon and run SELECT 1 via the wrapper.
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
     let daemon = mwsqld::Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false)
-        .await.unwrap();
+        .await
+        .unwrap();
     let (txc, rx) = tokio::sync::broadcast::channel(1);
     let h = tokio::spawn(daemon.run(rx));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let out = mwsql::run_sql_as("stage_w9", &stored_cred, None, "SELECT 1 AS one")
-        .await.expect("query via wrapper");
+        .await
+        .expect("query via wrapper");
     assert!(out.contains("one"), "header missing: {out}");
     assert!(out.contains('1'), "value missing: {out}");
     assert!(out.contains("(1 row)"), "row count missing: {out}");
 
     txc.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), h).await
-        .expect("shutdown timed out").unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
+        .expect("shutdown timed out")
+        .unwrap()
+        .unwrap();
 }

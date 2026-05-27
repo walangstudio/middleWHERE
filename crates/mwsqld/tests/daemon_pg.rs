@@ -12,8 +12,8 @@ use tokio::sync::broadcast;
 
 use mw_core::config::*;
 use mw_core::keyring::{FileStore, MasterKeyStore};
-use mw_core::secret::SecretStr;
 use mw_core::seal::{seal, MasterKey, Passphrase};
+use mw_core::secret::SecretStr;
 use mw_core::token::sha256;
 use mwsqld::{Daemon, KeystoreChoice, CONFIG_FILE_NAME};
 
@@ -60,23 +60,31 @@ fn build_pg_state(
     };
 
     let mut credentials = BTreeMap::new();
-    credentials.insert("only".to_string(), Credential {
-        backend_user: user,
-        backend_password: SecretStr::new(pw),
-    });
+    credentials.insert(
+        "only".to_string(),
+        Credential {
+            backend_user: user,
+            backend_password: SecretStr::new(pw),
+        },
+    );
     let mut envs = BTreeMap::new();
-    envs.insert(env_name.to_string(), Env {
-        backend_host: host,
-        backend_port: bport,
-        default_database: db,
-        bastion: None,
-        credential: "only".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::PgCleartext { sha256: sha256(TOKEN.as_bytes()) },
-        listen_port: port,
-        pool: PoolSettings::default(),
-        engine: EngineKind::Postgres,
-    });
+    envs.insert(
+        env_name.to_string(),
+        Env {
+            backend_host: host,
+            backend_port: bport,
+            default_database: db,
+            bastion: None,
+            credential: "only".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::PgCleartext {
+                sha256: sha256(TOKEN.as_bytes()),
+            },
+            listen_port: port,
+            pool: PoolSettings::default(),
+            engine: EngineKind::Postgres,
+        },
+    );
     let cfg = Config {
         schema_version: CURRENT_SCHEMA_VERSION,
         bastions: BTreeMap::new(),
@@ -104,7 +112,8 @@ async fn pg_bind_shutdown_no_backend() {
     let h = tokio::spawn(daemon.run(rx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), h).await
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
         .expect("shutdown timed out")
         .unwrap()
         .unwrap();
@@ -129,18 +138,24 @@ async fn pg_end_to_end_through_real_backend() {
 
     // Happy path: connect with the env name as user and the token as
     // password; an allowed SELECT returns a row.
-    let conn_str = format!(
-        "host=127.0.0.1 port={port} user=pg_env password={TOKEN} dbname=postgres"
-    );
+    let conn_str =
+        format!("host=127.0.0.1 port={port} user=pg_env password={TOKEN} dbname=postgres");
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
         .await
         .expect("connect through proxy");
-    tokio::spawn(async move { let _ = connection.await; });
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
 
-    let rows = client.simple_query("SELECT 1 AS one").await.expect("select");
-    let got = rows.iter().any(|m| matches!(
-        m, tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some("1")
-    ));
+    let rows = client
+        .simple_query("SELECT 1 AS one")
+        .await
+        .expect("select");
+    let got = rows.iter().any(|m| {
+        matches!(
+            m, tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some("1")
+        )
+    });
     assert!(got, "expected SELECT 1 to return 1 through the proxy");
 
     // Firewall: a write under ReadOnly must be rejected by the proxy.
@@ -171,14 +186,19 @@ async fn pg_end_to_end_through_real_backend() {
 
     // Firewall still applies on the extended path.
     assert!(
-        client.execute("CREATE TABLE evil(x int)", &[]).await.is_err(),
+        client
+            .execute("CREATE TABLE evil(x int)", &[])
+            .await
+            .is_err(),
         "DDL must be denied on the extended path too"
     );
 
     // Wrong token must fail authentication.
     let bad = format!("host=127.0.0.1 port={port} user=pg_env password=wrong dbname=postgres");
     assert!(
-        tokio_postgres::connect(&bad, tokio_postgres::NoTls).await.is_err(),
+        tokio_postgres::connect(&bad, tokio_postgres::NoTls)
+            .await
+            .is_err(),
         "wrong token must be rejected"
     );
 

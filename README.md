@@ -63,6 +63,32 @@ Three binaries, no extra runtime, no DLLs:
 - `mwsql` is an optional client wrapper for MySQL that keeps a token in your OS
   keyring so you do not paste it every time. Any native client works too.
 
+## Install
+
+Prebuilt binaries (`mwsqld`, `mwsqlctl`, `mwsql`) for Linux, macOS, and Windows
+are published on the [Releases](https://github.com/walangstudio/middleWHERE/releases)
+page. The installers download the archive, verify its SHA-256, and install all
+three; re-running upgrades in place.
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.sh | sh
+# specific version:  ... | sh -s -- --version v0.2.0
+# uninstall:         ... | sh -s -- --uninstall
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1 | iex
+# specific version:  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1))) -Version v0.2.0
+# uninstall:         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1))) -Uninstall
+```
+
+Or build from source (see [Build and test](#build-and-test)). Windows release
+binaries are unsigned; SmartScreen may warn until reputation accrues.
+
 ## Getting started
 
 Pick a state directory. The daemon and the admin tool both point at it. These

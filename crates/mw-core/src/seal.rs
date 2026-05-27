@@ -64,17 +64,23 @@ pub enum SealError {
 pub struct MasterKey([u8; KEY_LEN]);
 
 impl MasterKey {
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self { Self(bytes) }
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
     pub fn generate() -> Self {
         let mut k = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut k);
         Self(k)
     }
-    pub fn expose(&self) -> &[u8; KEY_LEN] { &self.0 }
+    pub fn expose(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
 }
 
 impl Drop for MasterKey {
-    fn drop(&mut self) { self.0.zeroize(); }
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl std::fmt::Debug for MasterKey {
@@ -111,7 +117,11 @@ fn derive_key(
     Ok(out)
 }
 
-pub fn seal(cfg: &Config, master: &MasterKey, passphrase: &Passphrase) -> Result<Vec<u8>, SealError> {
+pub fn seal(
+    cfg: &Config,
+    master: &MasterKey,
+    passphrase: &Passphrase,
+) -> Result<Vec<u8>, SealError> {
     let mut plaintext = Vec::new();
     ciborium::ser::into_writer(cfg, &mut plaintext)?;
 
@@ -124,7 +134,13 @@ pub fn seal(cfg: &Config, master: &MasterKey, passphrase: &Passphrase) -> Result
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&derived));
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, Payload { msg: &plaintext, aad: AAD })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: &plaintext,
+                aad: AAD,
+            },
+        )
         .map_err(|_| SealError::Encrypt)?;
 
     derived.zeroize();
@@ -139,7 +155,11 @@ pub fn seal(cfg: &Config, master: &MasterKey, passphrase: &Passphrase) -> Result
     Ok(out)
 }
 
-pub fn unseal(blob: &[u8], master: &MasterKey, passphrase: &Passphrase) -> Result<Config, SealError> {
+pub fn unseal(
+    blob: &[u8],
+    master: &MasterKey,
+    passphrase: &Passphrase,
+) -> Result<Config, SealError> {
     const HEADER: usize = 8 + 1 + SALT_LEN + NONCE_LEN;
     if blob.len() < HEADER + 16 {
         return Err(SealError::Format("blob too short"));
@@ -189,7 +209,10 @@ mod tests {
         let mk2 = MasterKey::generate();
         let pp = Passphrase::default();
         let sealed = seal(&cfg, &mk1, &pp).unwrap();
-        assert!(matches!(unseal(&sealed, &mk2, &pp), Err(SealError::Decrypt)));
+        assert!(matches!(
+            unseal(&sealed, &mk2, &pp),
+            Err(SealError::Decrypt)
+        ));
     }
 
     #[test]

@@ -27,25 +27,35 @@ pub enum KeystoreChoice {
 
 impl KeystoreChoice {
     pub fn default_os() -> Self {
-        Self::Os { service: DEFAULT_SERVICE.into(), account: DEFAULT_ACCOUNT.into() }
+        Self::Os {
+            service: DEFAULT_SERVICE.into(),
+            account: DEFAULT_ACCOUNT.into(),
+        }
     }
     pub fn default_file(state_dir: &Path) -> Self {
-        Self::File { path: state_dir.join(FILE_MASTER_KEY_NAME) }
+        Self::File {
+            path: state_dir.join(FILE_MASTER_KEY_NAME),
+        }
     }
     pub fn load(&self) -> Result<MasterKey> {
         match self {
-            KeystoreChoice::Os { service, account } =>
-                Ok(OsStore::new(service.clone(), account.clone()).load()
-                    .with_context(|| format!("loading master key from OS keystore ({service}/{account})"))?),
-            KeystoreChoice::File { path } =>
-                Ok(FileStore::new(path).load()
-                    .with_context(|| format!("loading master key from {}", path.display()))?),
+            KeystoreChoice::Os { service, account } => {
+                Ok(OsStore::new(service.clone(), account.clone())
+                    .load()
+                    .with_context(|| {
+                        format!("loading master key from OS keystore ({service}/{account})")
+                    })?)
+            }
+            KeystoreChoice::File { path } => Ok(FileStore::new(path)
+                .load()
+                .with_context(|| format!("loading master key from {}", path.display()))?),
         }
     }
     pub fn store(&self, key: &MasterKey) -> Result<()> {
         match self {
-            KeystoreChoice::Os { service, account } =>
-                Ok(OsStore::new(service.clone(), account.clone()).store(key)?),
+            KeystoreChoice::Os { service, account } => {
+                Ok(OsStore::new(service.clone(), account.clone()).store(key)?)
+            }
             KeystoreChoice::File { path } => Ok(FileStore::new(path).store(key)?),
         }
     }
@@ -60,20 +70,28 @@ pub fn default_state_dir() -> PathBuf {
         pd.join("middlewhere")
     }
     #[cfg(target_os = "macos")]
-    { PathBuf::from("/Library/Application Support/middlewhere") }
+    {
+        PathBuf::from("/Library/Application Support/middlewhere")
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
-    { PathBuf::from("/var/lib/middlewhere") }
+    {
+        PathBuf::from("/var/lib/middlewhere")
+    }
 }
 
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
 /// sealed empty `Config`. Refuses to overwrite an existing sealed blob.
 pub fn init(state_dir: &Path, keystore: &KeystoreChoice) -> Result<()> {
-    std::fs::create_dir_all(state_dir).with_context(|| format!("create {}", state_dir.display()))?;
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
     std::fs::create_dir_all(state_dir.join("audit"))?;
 
     let sealed_path = state_dir.join(CONFIG_FILE_NAME);
     if sealed_path.exists() {
-        return Err(anyhow!("{} already exists; refusing to overwrite", sealed_path.display()));
+        return Err(anyhow!(
+            "{} already exists; refusing to overwrite",
+            sealed_path.display()
+        ));
     }
 
     let key = MasterKey::generate();
@@ -88,8 +106,8 @@ pub fn init(state_dir: &Path, keystore: &KeystoreChoice) -> Result<()> {
 
 pub fn load_config(state_dir: &Path, keystore: &KeystoreChoice) -> Result<Config> {
     let sealed_path = state_dir.join(CONFIG_FILE_NAME);
-    let blob = std::fs::read(&sealed_path)
-        .with_context(|| format!("read {}", sealed_path.display()))?;
+    let blob =
+        std::fs::read(&sealed_path).with_context(|| format!("read {}", sealed_path.display()))?;
     let key = keystore.load()?;
     let cfg = unseal(&blob, &key, &Passphrase::default())?;
     cfg.validate()?;
@@ -118,7 +136,8 @@ pub fn save_config(state_dir: &Path, keystore: &KeystoreChoice, cfg: &Config) ->
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent()
+    let parent = path
+        .parent()
         .ok_or_else(|| anyhow!("no parent dir for {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(CONFIG_TMP_NAME);
@@ -134,7 +153,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp)
+        let mut f = opts
+            .open(&tmp)
             .with_context(|| format!("open {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -159,10 +179,13 @@ mod tests {
 
         // Mutate and save.
         let mut cfg2 = cfg.clone();
-        cfg2.credentials.insert("c1".into(), crate::config::Credential {
-            backend_user: "u".into(),
-            backend_password: crate::secret::SecretStr::new("p"),
-        });
+        cfg2.credentials.insert(
+            "c1".into(),
+            crate::config::Credential {
+                backend_user: "u".into(),
+                backend_password: crate::secret::SecretStr::new("p"),
+            },
+        );
         save_config(tmp.path(), &ks, &cfg2).unwrap();
 
         let back = load_config(tmp.path(), &ks).unwrap();
@@ -180,18 +203,23 @@ mod tests {
         let ks = KeystoreChoice::default_file(tmp.path());
         init(tmp.path(), &ks).unwrap();
         let mut cfg = load_config(tmp.path(), &ks).unwrap();
-        cfg.envs.insert("dangling".into(), crate::config::Env {
-            backend_host: "h".into(),
-            backend_port: 3306,
-            default_database: None,
-            bastion: None,
-            credential: "missing".into(),
-            policy: crate::config::Policy::ReadOnly,
-            client_auth: crate::config::ClientAuth::NativePassword { double_sha1: [0; 20] },
-            listen_port: 6033,
-            pool: crate::config::PoolSettings::default(),
-            engine: crate::config::EngineKind::MySql,
-        });
+        cfg.envs.insert(
+            "dangling".into(),
+            crate::config::Env {
+                backend_host: "h".into(),
+                backend_port: 3306,
+                default_database: None,
+                bastion: None,
+                credential: "missing".into(),
+                policy: crate::config::Policy::ReadOnly,
+                client_auth: crate::config::ClientAuth::NativePassword {
+                    double_sha1: [0; 20],
+                },
+                listen_port: 6033,
+                pool: crate::config::PoolSettings::default(),
+                engine: crate::config::EngineKind::MySql,
+            },
+        );
         assert!(save_config(tmp.path(), &ks, &cfg).is_err());
     }
 }

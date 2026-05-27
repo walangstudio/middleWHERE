@@ -14,22 +14,30 @@ use client::{build_pg_pool, PgPool};
 pub struct PgEngine;
 
 impl PgEngine {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for PgEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct PgBackend(pub PgPool);
 
 impl Backend for PgBackend {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
 impl Engine for PgEngine {
-    fn kind(&self) -> EngineKind { EngineKind::Postgres }
+    fn kind(&self) -> EngineKind {
+        EngineKind::Postgres
+    }
 
     async fn accept(
         &self,

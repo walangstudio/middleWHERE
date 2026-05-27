@@ -15,8 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-    ServiceType,
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
@@ -71,7 +70,12 @@ fn run_service() -> Result<()> {
     };
     let status = service_control_handler::register(SERVICE_NAME, handler)?;
 
-    report(&status, ServiceState::StartPending, ServiceControlAccept::empty(), 1)?;
+    report(
+        &status,
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        1,
+    )?;
 
     let state_dir = crate::default_state_dir();
     let ks = crate::KeystoreChoice::default_file(&state_dir);
@@ -93,12 +97,26 @@ fn run_service() -> Result<()> {
             let _ = tx.send(());
         });
 
-        report(&status, ServiceState::Running,
-               ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0)?;
+        report(
+            &status,
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            0,
+        )?;
         daemon.run(rx).await
     });
 
-    report(&status, ServiceState::StopPending, ServiceControlAccept::empty(), 1)?;
-    report(&status, ServiceState::Stopped, ServiceControlAccept::empty(), 0)?;
+    report(
+        &status,
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        1,
+    )?;
+    report(
+        &status,
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        0,
+    )?;
     serve_result
 }

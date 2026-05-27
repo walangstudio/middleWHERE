@@ -28,9 +28,9 @@ pub enum RouterError {
 }
 
 const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
-const ER_PARSE_ERROR:           u16 = 1064;
-const ER_NOT_ALLOWED_COMMAND:   u16 = 1148;
-const ER_INTERNAL:              u16 = 1815;
+const ER_PARSE_ERROR: u16 = 1064;
+const ER_NOT_ALLOWED_COMMAND: u16 = 1148;
+const ER_INTERNAL: u16 = 1815;
 
 pub async fn serve_session<S>(
     stream: &mut S,
@@ -52,7 +52,10 @@ where
         };
         let Some(cmd) = pkt.first().copied() else {
             return Err(FramingError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData, "empty command packet")).into());
+                std::io::ErrorKind::InvalidData,
+                "empty command packet",
+            ))
+            .into());
         };
         match cmd {
             0x01 => {
@@ -68,10 +71,21 @@ where
                 handle_com_query(stream, &mut seq, env_name, client_user, &sql, pool, pol).await?;
             }
             other => {
-                warn!(env = env_name, cmd = format!("0x{other:02x}"), "rejecting unsupported command");
-                write_packet(stream, &mut seq,
-                    &err_packet(ER_NOT_ALLOWED_COMMAND, b"42000",
-                        &format!("command 0x{other:02x} not supported"))).await?;
+                warn!(
+                    env = env_name,
+                    cmd = format!("0x{other:02x}"),
+                    "rejecting unsupported command"
+                );
+                write_packet(
+                    stream,
+                    &mut seq,
+                    &err_packet(
+                        ER_NOT_ALLOWED_COMMAND,
+                        b"42000",
+                        &format!("command 0x{other:02x} not supported"),
+                    ),
+                )
+                .await?;
             }
         }
     }
@@ -92,10 +106,22 @@ where
     let started = Instant::now();
     let decision = policy::evaluate(sql, pol, &policy::MYSQL_PROFILE);
     if let Some(reason) = decision.reason() {
-        info!(env = env_name, reason = reason, sql_first = &sql[..sql.len().min(64)],
-              "policy DENY");
-        AuditEvent::new(env_name, client_user, sql,
-            AuditDecision::Deny, Some(reason.to_string()), None, started.elapsed()).emit();
+        info!(
+            env = env_name,
+            reason = reason,
+            sql_first = &sql[..sql.len().min(64)],
+            "policy DENY"
+        );
+        AuditEvent::new(
+            env_name,
+            client_user,
+            sql,
+            AuditDecision::Deny,
+            Some(reason.to_string()),
+            None,
+            started.elapsed(),
+        )
+        .emit();
         write_packet(stream, seq, &err_packet(ER_PARSE_ERROR, b"42000", reason)).await?;
         return Ok(());
     }
@@ -104,13 +130,25 @@ where
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pool exhausted / unreachable");
-            AuditEvent::new(env_name, client_user, sql,
-                AuditDecision::Error, Some(format!("pool: {e}")), None, started.elapsed()).emit();
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Error,
+                Some(format!("pool: {e}")),
+                None,
+                started.elapsed(),
+            )
+            .emit();
             // Generic message to the client: the detail (host, schema,
             // mysql_async error) is in the audit log + warn! above, not on
             // the wire where the client could fingerprint the backend.
-            write_packet(stream, seq,
-                &err_packet(ER_INTERNAL, b"HY000", "backend unavailable")).await?;
+            write_packet(
+                stream,
+                seq,
+                &err_packet(ER_INTERNAL, b"HY000", "backend unavailable"),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -120,10 +158,22 @@ where
         Ok(qr) => qr,
         Err(e) => {
             warn!(env = env_name, err = %e, "backend rejected query");
-            AuditEvent::new(env_name, client_user, sql,
-                AuditDecision::Error, Some(format!("backend: {e}")), None, started.elapsed()).emit();
-            write_packet(stream, seq,
-                &err_packet(ER_INTERNAL, b"HY000", "query execution failed")).await?;
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Error,
+                Some(format!("backend: {e}")),
+                None,
+                started.elapsed(),
+            )
+            .emit();
+            write_packet(
+                stream,
+                seq,
+                &err_packet(ER_INTERNAL, b"HY000", "query execution failed"),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -150,8 +200,16 @@ where
         }
     };
     debug!(env = env_name, rows = row_count, "query ok");
-    AuditEvent::new(env_name, client_user, sql,
-        AuditDecision::Allow, None, Some(row_count), started.elapsed()).emit();
+    AuditEvent::new(
+        env_name,
+        client_user,
+        sql,
+        AuditDecision::Allow,
+        None,
+        Some(row_count),
+        started.elapsed(),
+    )
+    .emit();
     Ok(())
 }
 

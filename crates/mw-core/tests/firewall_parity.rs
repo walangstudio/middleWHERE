@@ -37,8 +37,14 @@ fn core_dangerous_statements_deny_under_both_dialects() {
 #[test]
 fn plain_select_allowed_under_both_dialects() {
     for sql in ["SELECT 1", "SELECT id, name FROM accounts WHERE id = 1"] {
-        assert_eq!(evaluate(sql, &Policy::ReadOnly, &MYSQL_PROFILE), Decision::Allow);
-        assert_eq!(evaluate(sql, &Policy::ReadOnly, &PG_PROFILE), Decision::Allow);
+        assert_eq!(
+            evaluate(sql, &Policy::ReadOnly, &MYSQL_PROFILE),
+            Decision::Allow
+        );
+        assert_eq!(
+            evaluate(sql, &Policy::ReadOnly, &PG_PROFILE),
+            Decision::Allow
+        );
     }
 }
 

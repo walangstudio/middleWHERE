@@ -14,10 +14,10 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use mw_core::config::*;
-use mw_core::secret::SecretStr;
-use mw_core::seal::{seal, MasterKey, Passphrase};
-use mw_core::token::double_sha1;
 use mw_core::keyring::{FileStore, MasterKeyStore};
+use mw_core::seal::{seal, MasterKey, Passphrase};
+use mw_core::secret::SecretStr;
+use mw_core::token::double_sha1;
 use mwsqld::{Daemon, KeystoreChoice, CONFIG_FILE_NAME};
 
 const TOKEN: &str = "daemon-test-token-9f7a1d";
@@ -29,7 +29,12 @@ async fn pick_free_port() -> u16 {
     p
 }
 
-fn build_state(state_dir: &std::path::Path, env_name: &str, port: u16, backend_url: Option<&str>) -> KeystoreChoice {
+fn build_state(
+    state_dir: &std::path::Path,
+    env_name: &str,
+    port: u16,
+    backend_url: Option<&str>,
+) -> KeystoreChoice {
     std::fs::create_dir_all(state_dir).unwrap();
 
     let mk = MasterKey::generate();
@@ -51,28 +56,47 @@ fn build_state(state_dir: &std::path::Path, env_name: &str, port: u16, backend_u
                 o.db_name().map(|s| s.to_string()),
             )
         }
-        None => ("127.0.0.1".to_string(), 3306, "noop".into(), "noop".into(), None),
+        None => (
+            "127.0.0.1".to_string(),
+            3306,
+            "noop".into(),
+            "noop".into(),
+            None,
+        ),
     };
 
     let mut credentials = BTreeMap::new();
-    credentials.insert("only".to_string(), Credential {
-        backend_user, backend_password: SecretStr::new(backend_pw),
-    });
+    credentials.insert(
+        "only".to_string(),
+        Credential {
+            backend_user,
+            backend_password: SecretStr::new(backend_pw),
+        },
+    );
     let mut envs = BTreeMap::new();
-    envs.insert(env_name.to_string(), Env {
-        backend_host,
-        backend_port,
-        default_database: db,
-        bastion: None,
-        credential: "only".into(),
-        policy: Policy::ReadOnly,
-        client_auth: ClientAuth::NativePassword { double_sha1: double_sha1(TOKEN.as_bytes()) },
-        listen_port: port,
-        pool: PoolSettings::default(),
-        engine: mw_core::config::EngineKind::MySql,
-    });
-    let cfg = Config { schema_version: CURRENT_SCHEMA_VERSION,
-        bastions: BTreeMap::new(), credentials, envs };
+    envs.insert(
+        env_name.to_string(),
+        Env {
+            backend_host,
+            backend_port,
+            default_database: db,
+            bastion: None,
+            credential: "only".into(),
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: double_sha1(TOKEN.as_bytes()),
+            },
+            listen_port: port,
+            pool: PoolSettings::default(),
+            engine: mw_core::config::EngineKind::MySql,
+        },
+    );
+    let cfg = Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        bastions: BTreeMap::new(),
+        credentials,
+        envs,
+    };
 
     let blob = seal(&cfg, &mk, &Passphrase::default()).unwrap();
     std::fs::write(state_dir.join(CONFIG_FILE_NAME), blob).unwrap();
@@ -86,7 +110,9 @@ async fn init_load_bind_shutdown_no_backend() {
     let ks = build_state(tmp.path(), "stage_w9", port, None);
 
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false).await.unwrap();
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+        .await
+        .unwrap();
     assert_eq!(daemon.bound.len(), 1);
 
     let (tx, rx) = broadcast::channel(1);
@@ -94,7 +120,8 @@ async fn init_load_bind_shutdown_no_backend() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     tx.send(()).unwrap();
     // Shutdown should complete within a reasonable window even with no traffic.
-    tokio::time::timeout(Duration::from_secs(2), h).await
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
         .expect("shutdown timed out")
         .unwrap()
         .unwrap();
@@ -116,7 +143,9 @@ async fn end_to_end_through_real_backend() {
     let _audit = mwsqld::install_audit(tmp.path()).unwrap();
 
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false).await.unwrap();
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+        .await
+        .unwrap();
     let (tx, rx) = broadcast::channel(1);
     let h = tokio::spawn(daemon.run(rx));
 
@@ -136,20 +165,24 @@ async fn end_to_end_through_real_backend() {
     drop(conn);
 
     tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), h).await
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
         .expect("shutdown timed out")
         .unwrap()
         .unwrap();
 
     // Audit log should have at least one allow record.
     let audit_dir = tmp.path().join("audit");
-    let entry = std::fs::read_dir(&audit_dir).unwrap()
+    let entry = std::fs::read_dir(&audit_dir)
+        .unwrap()
         .filter_map(|e| e.ok())
         .find(|e| e.file_name().to_string_lossy().starts_with("audit.jsonl"));
     if let Some(entry) = entry {
         let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        assert!(body.contains("\"decision\":\"allow\""),
-            "expected an allow event in audit log, got: {body}");
+        assert!(
+            body.contains("\"decision\":\"allow\""),
+            "expected an allow event in audit log, got: {body}"
+        );
     }
 }
 

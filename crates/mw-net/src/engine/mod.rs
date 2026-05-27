@@ -14,8 +14,8 @@ use mw_core::config::{ClientAuth, EngineKind, Policy};
 
 pub use crate::mysql_client::BackendOpts;
 
-pub mod mysql;
 pub mod mssql;
+pub mod mysql;
 pub mod postgres;
 
 /// Post-auth connection metadata, engine-neutral.
