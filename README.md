@@ -86,6 +86,10 @@ irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1 
 # uninstall:         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1))) -Uninstall
 ```
 
+The installers place **only the binaries** — they do not register or start a
+service. You run `mwsqld run` yourself, or opt into a managed service; see
+[Running as a service](#running-as-a-service).
+
 Or build from source (see [Build and test](#build-and-test)). Windows release
 binaries are unsigned; SmartScreen may warn until reputation accrues.
 
@@ -103,123 +107,137 @@ mwsqlctl --state-dir /var/lib/middlewhere --file-keystore init
 That generates a master key, seals an empty config, and creates the directory
 layout. Nothing is exposed in plaintext except the audit log.
 
-### A worked example: staging1, staging2, prod
+### A worked example
 
-In this setup the two staging environments share one database login and one
-jump host. Production uses a different jump host with its own SSH user and
-password, and it logs into the database with the same username as staging but
-a different password.
+This builds a real layout: two SSH jump hosts (one for staging, one for prod),
+two staging databases that share a single login behind the staging jump host, a
+production database that uses the same database username but a different
+password behind its own jump host, and a local database running in Docker on
+the daemon host. Values in `<angle brackets>` are yours to fill in; everything
+else is literal. `<state-dir>` is wherever you ran `init`.
 
-A credential is a backend database user plus its password. Add the one the two
-staging environments will share. The password is read from stdin and never
-echoed.
-
-```sh
-printf '%s' "$STAGING_DB_PASSWORD" | \
-  mwsqlctl --state-dir /var/lib/middlewhere --file-keystore \
-  cred add app_ro --user app_readonly --password-stdin
-```
-
-Add the jump host that both staging environments sit behind. Its host, SSH
-user, and password are stored once, here. You can pin its host key so a
-swapped jump host is rejected.
+**Bastions.** Add the two jump hosts. Pinning the host key (`--fingerprint`)
+makes a swapped jump host fail closed; repeat the flag to pin more than one key.
 
 ```sh
-printf '%s' "$STAGING_JUMP_PASSWORD" | \
-  mwsqlctl --state-dir /var/lib/middlewhere --file-keystore \
-  bastion add staging_jump --host jump.staging.internal --ssh-user tunnel \
-  --password-stdin --fingerprint ssh-ed25519:AAAAC3Nz...
+printf '%s' '<staging-jump-password>' | \
+  mwsqlctl --state-dir <state-dir> --file-keystore \
+  bastion add <staging-bastion> --host <jump.staging.example> --ssh-user <tunnel-user> \
+  --password-stdin --fingerprint ssh-ed25519:<sha256-b64>
+
+printf '%s' '<prod-jump-password>' | \
+  mwsqlctl --state-dir <state-dir> --file-keystore \
+  bastion add <prod-bastion> --host <jump.prod.example> --ssh-user <prod-tunnel-user> \
+  --password-stdin --fingerprint ssh-ed25519:<sha256-b64>
 ```
 
-Create the two staging environments. Both point at the same credential and the
-same bastion, so they share that one database login and that one jump host.
-Each still gets its own local port and its own client token.
+SSH **key auth** is accepted by the CLI (`--key-file <private-key.pem>`, which
+replaces `--password-stdin`) but is **not yet active at runtime** — the daemon
+currently returns `ssh key auth not yet wired` (Phase 7b). Use password
+bastions for now.
+
+**Credentials.** A credential is a backend database user plus its password,
+read from stdin and never echoed. Add the one login the two staging
+environments will share:
 
 ```sh
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore env add staging1 \
-  --engine postgres --backend-host db-staging1.internal --database app \
-  --credential app_ro --bastion staging_jump --listen-port 6433
-
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore env add staging2 \
-  --engine postgres --backend-host db-staging2.internal --database app \
-  --credential app_ro --bastion staging_jump --listen-port 6434
+printf '%s' '<staging-db-password>' | \
+  mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <staging-cred> --user <db-user> --password-stdin
 ```
 
-Production reaches the database through a different jump host, with a
-different SSH user and password from the staging one.
+Production uses the **same username but a different password** — that is just a
+second credential entry with the same `--user` value:
 
 ```sh
-printf '%s' "$PROD_JUMP_PASSWORD" | \
-  mwsqlctl --state-dir /var/lib/middlewhere --file-keystore \
-  bastion add prod_jump --host jump.prod.internal --ssh-user prod_tunnel \
-  --password-stdin --fingerprint ssh-ed25519:AAAAB3Nz...
+printf '%s' '<prod-db-password>' | \
+  mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <prod-cred> --user <db-user> --password-stdin
 ```
 
-Production's database login uses the same username as staging,
-`app_readonly`, but a different password. Same username, different password is
-just a second credential entry with the same `--user` value.
+And the local Docker database's login:
 
 ```sh
-printf '%s' "$PROD_DB_PASSWORD" | \
-  mwsqlctl --state-dir /var/lib/middlewhere --file-keystore \
-  cred add prod_ro --user app_readonly --password-stdin
-
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore env add prod \
-  --engine postgres --backend-host db.prod.internal --database app \
-  --credential prod_ro --bastion prod_jump --listen-port 6543
+printf '%s' '<local-db-password>' | \
+  mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <local-cred> --user <db-user> --password-stdin
 ```
 
-The same `env add` works for MySQL by passing `--engine mysql`.
+**Environments.** The two staging envs name the *same* credential and the
+*same* bastion, so they share that one login and jump host; each still gets its
+own loopback port and its own client token. Rotating `<staging-cred>` updates
+both at once. (Sharing is by naming the same credential/bastion — using the
+same database username across two different credentials does *not* share them.)
 
-### Shared versus own
+```sh
+mwsqlctl --state-dir <state-dir> --file-keystore env add <staging-1> \
+  --engine <mysql|postgres> --backend-host <db1.staging.internal> --database <app> \
+  --credential <staging-cred> --bastion <staging-bastion> --listen-port <6433>
 
-A credential or a bastion is shared by naming it from more than one
-environment. `app_ro` and `staging_jump` are shared because `staging1` and
-`staging2` both reference them; rotating that one credential's password
-updates both staging environments at once. Production stays separate because
-it names its own `prod_ro` and `prod_jump`. Note that `app_ro` and `prod_ro`
-both use the database username `app_readonly`: the username being the same
-across environments does not make the login shared, only naming the same
-credential does.
+mwsqlctl --state-dir <state-dir> --file-keystore env add <staging-2> \
+  --engine <mysql|postgres> --backend-host <db2.staging.internal> --database <app> \
+  --credential <staging-cred> --bastion <staging-bastion> --listen-port <6434>
+```
 
-An environment that omits `--bastion` connects to its backend directly from
-the daemon host, with no jump host at all.
+Production names its own credential and its own bastion, so it stays fully
+separate from staging:
+
+```sh
+mwsqlctl --state-dir <state-dir> --file-keystore env add <prod> \
+  --engine <mysql|postgres> --backend-host <db.prod.internal> --database <app> \
+  --credential <prod-cred> --bastion <prod-bastion> --listen-port <6543>
+```
+
+The local Docker database needs no jump host: omit `--bastion` and point at
+loopback, and the daemon connects to it directly.
+
+```sh
+mwsqlctl --state-dir <state-dir> --file-keystore env add <local> \
+  --engine <mysql|postgres> --backend-host 127.0.0.1 --backend-port <3306> \
+  --database <app> --credential <local-cred> --listen-port <6033>
+```
+
+Every env defaults to `read-only`. Pass `--policy read-write` at creation, or
+flip it later:
+
+```sh
+mwsqlctl --state-dir <state-dir> --file-keystore policy <env> --read-write --i-know-what-im-doing
+```
 
 ### Handing out access
 
-Each environment has a token. Mint one and give it to whoever needs that
-environment:
+Each env has a token — the only thing the caller ever holds. Mint one for
+whoever needs that env; rotating it kills the old one:
 
 ```sh
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore grant staging1
+mwsqlctl --state-dir <state-dir> --file-keystore grant <staging-1>
 ```
 
-That prints the connection line and the token. Rotating it invalidates the old
-one. The token is the only thing the caller ever holds.
+That prints the connection line and the token.
 
 ### Running queries
 
-Start the daemon:
+Start the daemon (foreground, or as the service above):
 
 ```sh
-mwsqld --state-dir /var/lib/middlewhere --file-keystore run
+mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-Then connect with any client. With `psql`:
+Connect with any client. With `psql` against a Postgres env:
 
 ```sh
-PGPASSWORD=<token> psql -h 127.0.0.1 -p 6433 -U staging1 -d app -c 'SELECT 1'
+PGPASSWORD=<token> psql -h 127.0.0.1 -p <6433> -U <staging-1> -d <app> -c 'SELECT 1'
 ```
 
-Or with the MySQL wrapper, which remembers the token for you:
+Or the MySQL wrapper, which remembers the token for you:
 
 ```sh
-mwsql login staging1 --port 6433
-mwsql staging1 -e "SELECT count(*) FROM users"
+mwsql login <staging-1> --port <6433>
+mwsql <staging-1> -e "SELECT count(*) FROM <table>"
 ```
 
-A write attempt comes back as a denied query, not a modified row, and the
-attempt is recorded in the audit log.
+Under the default read-only policy a write comes back as a denied query, not a
+modified row, and the denial is recorded in the audit log.
 
 ## State directory
 
@@ -235,12 +253,40 @@ holds no secrets.
 
 ## Running as a service
 
-There is no separate installer. `mwsqlctl install-service` prints the platform
-file (a systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows
-PowerShell script) and the exact privileged steps to apply it. You run that one
-step yourself. The daemon then runs as an account your client user cannot read,
-so the master key and sealed config stay out of reach. The reference files and
-the reasoning are in `installers/`.
+There is no auto-installed service. The simplest way to run is in the
+foreground:
+
+```sh
+mwsqld --state-dir <state-dir> --file-keystore run
+```
+
+For a managed service, `mwsqlctl install-service` *generates* the platform file
+(a systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows
+PowerShell script) — it never escalates, enables it, or creates accounts
+itself. You apply it. On Linux:
+
+```sh
+# 1. Generate the unit (prints to stdout; --write needs an already-elevated shell):
+sudo mwsqlctl install-service \
+  --service-name mwsqld \
+  --exec-path /usr/local/bin/mwsqld \
+  --state-dir <state-dir> --file-keystore \
+  --write /etc/systemd/system/mwsqld.service
+
+# 2. Enable and start it:
+sudo systemctl daemon-reload
+sudo systemctl enable --now mwsqld
+sudo systemctl status mwsqld
+```
+
+macOS (launchd) and Windows (SCM) are the same two-step shape — `install-service`
+emits the right artifact, you apply it. The daemon then runs as an account your
+client user cannot read, so the master key and sealed config stay out of reach.
+The reference files and the reasoning are in `installers/`.
+
+Service mode must use `--file-keystore`: the dedicated daemon account has no
+login session, so the OS keyring is unreachable; the master key lives in a
+`0700`/ACL-locked state dir instead.
 
 For a non-loopback PostgreSQL bind the daemon refuses cleartext auth unless you
 set `MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1`. Use a tunnel instead.
