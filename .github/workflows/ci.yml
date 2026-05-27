@@ -28,6 +28,10 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel): no patched
+          # version exists; pulled in transitively by russh for SSH bastion key
+          # auth. Not actionable until russh/ssh-key migrate off the rsa crate.
+          ignore: RUSTSEC-2023-0071
 
   installers:
     name: installer + workflow tests
