@@ -29,6 +29,19 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  installers:
+    name: installer + workflow tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shell installer unit tests
+        run: bash tests/install_sh_test.sh
+      - name: workflow / build-script guards
+        run: bash tests/workflow_test.sh
+      - name: powershell installer unit tests
+        shell: pwsh
+        run: ./tests/install_ps1_test.ps1
+
   test:
     name: build + test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

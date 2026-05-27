@@ -26,6 +26,11 @@ Distribution and supply-chain release. No runtime behaviour changes.
 - Workspace package metadata (description, repository, homepage, keywords,
   categories, authors) and `cargo binstall --git` support.
 - Pinned toolchain (`rust-toolchain.toml`, Rust 1.95.0).
+- Unit tests for both installers and the release/build workflow logic
+  (`tests/install_sh_test.sh`, `tests/install_ps1_test.ps1`,
+  `tests/workflow_test.sh`), run by a CI job. Cover target detection, checksum
+  verification (text + binary mode), pre-release selection, atomic
+  all-or-nothing multi-binary install with rollback, and PATH handling.
 
 ### Note
 

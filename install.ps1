@@ -34,6 +34,21 @@ function Get-Target {
 
 function Get-InstallDir { return "$env:LOCALAPPDATA\Programs\middleWHERE" }
 
+# Newest published pre-release tag (skips drafts). Pure; testable without network.
+function Select-PreReleaseTag {
+  param($Releases)
+  ($Releases | Where-Object { $_.prerelease -and -not $_.draft } | Select-Object -First 1).tag_name
+}
+
+# Compute the user PATH after adding $Dir. Pure; returns $Current unchanged if
+# already present, trims a trailing ';' so we never write a ';;' empty entry.
+function Get-NewUserPath {
+  param([string]$Current, [string]$Dir)
+  if (-not [string]::IsNullOrEmpty($Current) -and (($Current -split ';') -contains $Dir)) { return $Current }
+  $trimmed = if ($null -eq $Current) { '' } else { $Current.TrimEnd(';') }
+  if ([string]::IsNullOrEmpty($trimmed)) { return $Dir } else { return "$trimmed;$Dir" }
+}
+
 function Get-TargetVersion {
   if ($Version) {
     $tag = $Version.Trim(); if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
@@ -45,9 +60,9 @@ function Get-TargetVersion {
   if ($PreRelease) {
     try { $list = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=100" -ErrorAction Stop }
     catch { Write-Fatal "Could not query GitHub releases (rate limit or network?): $_" }
-    $r = $list | Where-Object { $_.prerelease -and -not $_.draft } | Select-Object -First 1
-    if (-not $r) { Write-Fatal "No pre-release found" }
-    return $r.tag_name
+    $tag = Select-PreReleaseTag $list
+    if (-not $tag) { Write-Fatal "No pre-release found" }
+    return $tag
   }
   try { return (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -ErrorAction Stop).tag_name }
   catch { Write-Fatal "Could not query the latest GitHub release (rate limit or network?): $_" }
@@ -75,9 +90,8 @@ function Get-InstalledVersion {
 function Add-ToUserPath {
   param([string]$Dir)
   $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not [string]::IsNullOrEmpty($current) -and (($current -split ';') -contains $Dir)) { return }
-  $trimmed = if ($null -eq $current) { '' } else { $current.TrimEnd(';') }
-  $newPath = if ([string]::IsNullOrEmpty($trimmed)) { $Dir } else { "$trimmed;$Dir" }
+  $newPath = Get-NewUserPath $current $Dir
+  if ($newPath -eq $current) { return }
   [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
   $env:PATH = "$env:PATH;$Dir"
   Write-Warn "$Dir added to your user PATH (restart the terminal to take effect)"
@@ -86,12 +100,42 @@ function Add-ToUserPath {
 function Confirm-Checksum {
   param([string]$Archive, [string]$SumsFile)
   $name = Split-Path $Archive -Leaf
-  $entry = Get-Content $SumsFile | Where-Object { $_ -match "\s$([regex]::Escape($name))$" } | Select-Object -First 1
+  # Accept text-mode ("<hash>  name") and binary-mode ("<hash> *name") output.
+  $entry = Get-Content $SumsFile | Where-Object { $_ -match "\s\*?$([regex]::Escape($name))$" } | Select-Object -First 1
   if (-not $entry) { Write-Warn "No checksum entry for $name, skipping verification"; return }
   $expected = ($entry -split '\s+')[0].ToLower()
   $actual   = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLower()
   if ($actual -ne $expected) { Write-Fatal "Checksum mismatch!`n  expected: $expected`n  got:      $actual" }
   Write-Success "Checksum verified"
+}
+
+# Install every binary from $SrcDir into $InstallDir atomically: rename each
+# existing one to .old, copy all three in, and on ANY failure restore the prior
+# set (or remove freshly-copied ones on a first install). Throws on failure so
+# the caller can decide how to report; never leaves a version-skewed toolset.
+function Install-Binaries {
+  param([string]$SrcDir, [string]$InstallDir)
+  $backedUp = @()   # bins whose prior version was moved to .old
+  $copied   = @()   # bins copied this run
+  try {
+    foreach ($bin in $Binaries) {
+      $dest = Join-Path $InstallDir $bin
+      if (Test-Path $dest) {
+        Remove-Item "$dest.old" -Force -ErrorAction SilentlyContinue
+        Rename-Item $dest "$dest.old" -Force   # throws if locked (binary running)
+        $backedUp += $bin
+      }
+    }
+    foreach ($bin in $Binaries) {
+      Copy-Item (Join-Path $SrcDir $bin) (Join-Path $InstallDir $bin) -Force
+      $copied += $bin
+    }
+  } catch {
+    foreach ($bin in $copied)   { Remove-Item (Join-Path $InstallDir $bin) -Force -ErrorAction SilentlyContinue }
+    foreach ($bin in $backedUp) { Rename-Item (Join-Path $InstallDir "$bin.old") (Join-Path $InstallDir $bin) -Force -ErrorAction SilentlyContinue }
+    throw "Installation failed; previous state restored. (Is a middleWHERE binary still running?)"
+  }
+  foreach ($bin in $backedUp) { Remove-Item (Join-Path $InstallDir "$bin.old") -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-Uninstall {
@@ -100,11 +144,13 @@ function Invoke-Uninstall {
   # Only remove from our own install dir; a same-named binary elsewhere on PATH
   # is not ours to delete.
   foreach ($bin in $Binaries) {
-    $path = Join-Path $dir $bin
-    if (Test-Path $path) { Write-Info "Removing $path..."; Remove-Item $path -Force; $removed = $true }
+    foreach ($p in @((Join-Path $dir $bin), (Join-Path $dir "$bin.old"))) {
+      if (Test-Path $p) { Write-Info "Removing $p..."; Remove-Item $p -Force; $removed = $true }
+    }
   }
+  # @(...) forces an array so .Count is reliable when 0 or 1 items remain.
   if (Test-Path $dir) {
-    if ((Get-ChildItem $dir -ErrorAction SilentlyContinue).Count -eq 0) { Remove-Item $dir -Force -ErrorAction SilentlyContinue }
+    if (@(Get-ChildItem $dir -Force -ErrorAction SilentlyContinue).Count -eq 0) { Remove-Item $dir -Force -ErrorAction SilentlyContinue }
   }
   if ($removed) { Write-Success "middleWHERE uninstalled" } else { Write-Warn "middleWHERE is not installed" }
 }
@@ -158,24 +204,7 @@ function Main {
 
     $installDir = Get-InstallDir
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-
-    foreach ($bin in $Binaries) {
-      $extracted = Join-Path $tmpDir $bin
-      $dest = Join-Path $installDir $bin
-      $backup = "$dest.old"; $hasBackup = $false
-      if (Test-Path $dest) {
-        Remove-Item $backup -Force -ErrorAction SilentlyContinue
-        try { Rename-Item $dest $backup -Force; $hasBackup = $true }
-        catch { Write-Fatal "Cannot replace $bin - is it running? Close it and retry." }
-      }
-      try {
-        Copy-Item $extracted $dest -Force
-        if ($hasBackup) { Remove-Item $backup -Force -ErrorAction SilentlyContinue }
-      } catch {
-        if ($hasBackup) { Write-Warn "Install of $bin failed, restoring previous version..."; Rename-Item $backup $dest -Force -ErrorAction SilentlyContinue }
-        Write-Fatal "Installation of $bin failed: $_"
-      }
-    }
+    try { Install-Binaries $tmpDir $installDir } catch { Write-Fatal $_.Exception.Message }
 
     Add-ToUserPath $installDir
 
@@ -189,4 +218,6 @@ function Main {
   }
 }
 
-Main
+# Skip the entrypoint when dot-sourced by the test harness; normal
+# `irm ... | iex` execution leaves $env:MW_INSTALL_NO_MAIN unset.
+if ($env:MW_INSTALL_NO_MAIN -ne '1') { Main }

@@ -94,7 +94,10 @@ get_installed_version() {
 
 verify_checksum() {
   archive="$1"; sums="$2"; name="$(basename "$archive")"
-  expected="$(grep " ${name}\$" "$sums" | awk '{print $1}')"
+  # Compare the filename field literally (not as a regex, so dots in the name
+  # can't match loosely), accepting both text-mode ("<hash>  name") and
+  # binary-mode ("<hash> *name") sha256sum output.
+  expected="$(awk -v n="$name" '{ f=$2; sub(/^\*/, "", f); if (f == n) { print $1; exit } }' "$sums")"
   [ -n "$expected" ] || { warn "No checksum entry for ${name}, skipping verification"; return; }
   if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$archive" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
@@ -109,16 +112,38 @@ select_install_dir() {
   else echo "${HOME}/.local/bin"; fi
 }
 
-install_binary() {
-  src="$1"; dir="$2"; bin="$(basename "$src")"; dest="${dir}/${bin}"; backup="${dest}.old"
+# Install every binary from $src_dir into $dir atomically: back them all up,
+# copy them all in, and on ANY failure restore the prior set (or remove the
+# freshly-copied ones on a first-time install). Avoids a version-skewed install.
+install_all() {
+  src_dir="$1"; dir="$2"
   use_sudo=""; [ -w "$dir" ] || use_sudo="sudo"
-  [ -f "$dest" ] && $use_sudo cp "$dest" "$backup"
-  if $use_sudo cp "$src" "$dest" && $use_sudo chmod 755 "$dest"; then
-    $use_sudo rm -f "$backup"
-  else
-    [ -f "$backup" ] && { warn "Install of ${bin} failed, restoring previous version..."; $use_sudo mv "$backup" "$dest"; }
-    fatal "Installation of ${bin} failed"
-  fi
+  [ -n "$use_sudo" ] && info "Requesting sudo to write to ${dir}"
+
+  # Back up existing binaries first; a failed backup aborts before any change.
+  for bin in $BINARIES; do
+    dest="${dir}/${bin}"
+    if [ -f "$dest" ]; then
+      $use_sudo cp "$dest" "${dest}.old" || fatal "Could not back up existing ${bin}; aborting before any change"
+    fi
+  done
+
+  # Copy the new binaries in. On the first failure, roll the whole set back.
+  for bin in $BINARIES; do
+    dest="${dir}/${bin}"
+    if ! { $use_sudo cp "${src_dir}/${bin}" "$dest" && $use_sudo chmod 755 "$dest"; }; then
+      warn "Install of ${bin} failed; rolling back..."
+      for b in $BINARIES; do
+        d="${dir}/${b}"
+        if [ -f "${d}.old" ]; then $use_sudo mv "${d}.old" "$d"
+        else $use_sudo rm -f "$d"; fi
+      done
+      fatal "Installation failed; previous state restored"
+    fi
+  done
+
+  # Success: drop the backups.
+  for bin in $BINARIES; do $use_sudo rm -f "${dir}/${bin}.old"; done
 }
 
 check_path() {
@@ -208,9 +233,7 @@ main() {
     else fatal "Cannot create ${INSTALL_DIR}"; fi
   fi
   info "Installing to ${INSTALL_DIR}..."
-  for bin in $BINARIES; do
-    install_binary "${TMP_DIR}/${bin}" "$INSTALL_DIR"
-  done
+  install_all "$TMP_DIR" "$INSTALL_DIR"
   check_path "$INSTALL_DIR"
 
   if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" != "$VERSION" ]; then
@@ -222,4 +245,6 @@ main() {
   command -v "$VERSION_PROBE" >/dev/null 2>&1 && "$VERSION_PROBE" --version || warn "middleWHERE is not in PATH yet. Open a new shell or update your PATH."
 }
 
-main "$@"
+# Skip the entrypoint when sourced by the test harness (it calls the functions
+# directly). Normal `curl ... | sh` execution leaves MW_INSTALL_NO_MAIN unset.
+[ "${MW_INSTALL_NO_MAIN:-}" = "1" ] || main "$@"
