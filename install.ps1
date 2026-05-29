@@ -24,6 +24,17 @@ function Write-Success { Write-Host "ok $args" -ForegroundColor Green }
 function Write-Warn    { Write-Host "warning: $args" -ForegroundColor Yellow }
 function Write-Fatal   { Write-Host "error: $args" -ForegroundColor Red; exit 1 }
 
+function Write-NextSteps {
+  Write-Host ""
+  Write-Host "Next steps" -ForegroundColor White
+  Write-Host "  1. Initialize a state directory (one time):"
+  Write-Host "       mwsqlctl --state-dir <dir> --file-keystore init" -ForegroundColor Cyan
+  Write-Host "  2. Add a credential + environment, then run the daemon:"
+  Write-Host "       mwsqld --state-dir <dir> --file-keystore run" -ForegroundColor Cyan
+  Write-Host "  Service install? See https://github.com/$Repo#running-as-a-service"
+  Write-Host "  Guide: https://github.com/$Repo#getting-started"
+}
+
 function Get-Target {
   switch ($env:PROCESSOR_ARCHITECTURE) {
     'AMD64' { return 'x86_64-pc-windows-msvc' }
@@ -169,7 +180,7 @@ function Main {
   if ($installed) {
     if ($installed -eq $version) {
       if (-not $PreRelease -and -not $Version) {
-        Write-Success "middleWHERE $version is already installed - nothing to do"; exit 0
+        Write-Success "middleWHERE $version is already installed - nothing to do"; Write-NextSteps; exit 0
       }
       Write-Warn "middleWHERE $version is already installed; reinstalling."
     } else {
@@ -213,15 +224,7 @@ function Main {
     Write-Host ""
     # Best-effort version echo; never fail the (already successful) install on it.
     try { & (Join-Path $installDir $Probe) --version } catch { Write-Warn "installed, but '$Probe --version' could not run yet" }
-
-    Write-Host ""
-    Write-Host "Next steps" -ForegroundColor White
-    Write-Host "  1. Initialize a state directory (one time):"
-    Write-Host "       mwsqlctl --state-dir <dir> --file-keystore init" -ForegroundColor Cyan
-    Write-Host "  2. Add a credential + environment, then run the daemon:"
-    Write-Host "       mwsqld --state-dir <dir> --file-keystore run" -ForegroundColor Cyan
-    Write-Host "  Service install? See https://github.com/$Repo#running-as-a-service"
-    Write-Host "  Guide: https://github.com/$Repo#getting-started"
+    Write-NextSteps
   } finally {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
   }
