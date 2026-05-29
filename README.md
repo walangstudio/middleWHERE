@@ -1,9 +1,9 @@
 # middleWHERE
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+[![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-150%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-149%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -119,48 +119,52 @@ else is literal. `<state-dir>` is wherever you ran `init`.
 **Bastions.** Add the two jump hosts. Pinning the host key (`--fingerprint`)
 makes a swapped jump host fail closed; repeat the flag to pin more than one key.
 
-```sh
-printf '%s' '<staging-jump-password>' | \
-  mwsqlctl --state-dir <state-dir> --file-keystore \
-  bastion add <staging-bastion> --host <jump.staging.example> --ssh-user <tunnel-user> \
-  --password-stdin --fingerprint ssh-ed25519:<sha256-b64>
+Run it without a password flag and `mwsqlctl` prompts for the password with echo
+off — nothing secret reaches your shell history or the process table:
 
-printf '%s' '<prod-jump-password>' | \
-  mwsqlctl --state-dir <state-dir> --file-keystore \
+```sh
+mwsqlctl --state-dir <state-dir> --file-keystore \
+  bastion add <staging-bastion> --host <jump.staging.example> --ssh-user <tunnel-user> \
+  --fingerprint ssh-ed25519:<sha256-b64>
+# bastion password: ‹typed, hidden›
+
+mwsqlctl --state-dir <state-dir> --file-keystore \
   bastion add <prod-bastion> --host <jump.prod.example> --ssh-user <prod-tunnel-user> \
-  --password-stdin --fingerprint ssh-ed25519:<sha256-b64>
+  --fingerprint ssh-ed25519:<sha256-b64>
 ```
 
+For unattended/CI use only, pass `--password-stdin` and feed the secret in on
+stdin from a file or fd — never an inline literal, which would land in shell
+history. See [Scripting credential setup](#scripting-credential-setup).
+
 SSH **key auth** is accepted by the CLI (`--key-file <private-key.pem>`, which
-replaces `--password-stdin`) but is **not yet active at runtime** — the daemon
+replaces the password entirely) but is **not yet active at runtime** — the daemon
 currently returns `ssh key auth not yet wired` (Phase 7b). Use password
 bastions for now.
 
-**Credentials.** A credential is a backend database user plus its password,
-read from stdin and never echoed. Add the one login the two staging
-environments will share:
+**Credentials.** A credential is a backend database user plus its password.
+Same rule as bastions: omit the flag and the password is prompted, hidden. Add
+the one login the two staging environments will share:
 
 ```sh
-printf '%s' '<staging-db-password>' | \
-  mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --user <db-user> --password-stdin
+mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <staging-cred> --user <db-user>
+# backend password: ‹typed, hidden›
 ```
 
 Production uses the **same username but a different password** — that is just a
 second credential entry with the same `--user` value:
 
 ```sh
-printf '%s' '<prod-db-password>' | \
-  mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <prod-cred> --user <db-user> --password-stdin
+mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <prod-cred> --user <db-user>
 ```
 
 And the local Docker database's login:
 
 ```sh
-printf '%s' '<local-db-password>' | \
-  mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <local-cred> --user <db-user> --password-stdin
+mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <local-cred> --user <db-user>
 ```
 
 **Environments.** The two staging envs name the *same* credential and the
@@ -203,6 +207,36 @@ flip it later:
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore policy <env> --read-write --i-know-what-im-doing
 ```
+
+### Scripting credential setup
+
+The interactive prompt is the right default for a human. When you must automate
+`bastion add` / `cred add` (CI, provisioning), pass `--password-stdin` and feed
+the secret in **without** writing it on the command line — an inline
+`printf '...secret...' | ...` puts the literal in your shell history.
+
+Redirect from a file you create out-of-band and then destroy:
+
+```sh
+# Linux / macOS — tmpfs keeps it off disk; shred removes the trace.
+umask 077
+printf '%s' "$SECRET_FROM_VAULT" > /dev/shm/pw   # $SECRET injected by your CI secret store
+mwsqlctl --state-dir <state-dir> --file-keystore \
+  cred add <staging-cred> --user <db-user> --password-stdin < /dev/shm/pw
+shred -u /dev/shm/pw
+```
+
+```powershell
+# Windows (PowerShell 7+). On Windows PowerShell 5.1 wrap in: cmd /c "mwsqlctl ... < pw.txt"
+$env:SECRET_FROM_VAULT | Out-File -NoNewline -Encoding ascii pw.txt
+mwsqlctl --state-dir <state-dir> --file-keystore `
+  cred add <staging-cred> --user <db-user> --password-stdin < pw.txt
+Remove-Item pw.txt
+```
+
+`--password-stdin` keeps the secret out of the process table (`ps`,
+`/proc/<pid>/cmdline`); reading from a file/fd instead of an inline literal
+keeps it out of shell history. Do both.
 
 ### Handing out access
 
@@ -279,10 +313,50 @@ sudo systemctl enable --now mwsqld
 sudo systemctl status mwsqld
 ```
 
-macOS (launchd) and Windows (SCM) are the same two-step shape — `install-service`
-emits the right artifact, you apply it. The daemon then runs as an account your
-client user cannot read, so the master key and sealed config stay out of reach.
-The reference files and the reasoning are in `installers/`.
+macOS and Windows follow the same two-step shape — `install-service` emits the
+platform artifact for the OS you run it on, you apply it.
+
+macOS (launchd):
+
+```sh
+# 1. Generate the plist (run on a Mac; --write needs sudo):
+sudo mwsqlctl install-service \
+  --service-name mwsqld \
+  --exec-path /usr/local/bin/mwsqld \
+  --state-dir <state-dir> --file-keystore \
+  --write com.middlewhere.mwsqld.plist
+
+# 2. The emitted file's leading comments include the one-time steps to create the
+#    dedicated `_middlewhere` account and lock the state dir; run them, then:
+sudo install -m0644 com.middlewhere.mwsqld.plist \
+  /Library/LaunchDaemons/com.middlewhere.mwsqld.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.middlewhere.mwsqld.plist
+```
+
+Windows (SCM) — run in an elevated (Administrator) PowerShell:
+
+```powershell
+# 1. Generate the install script (on the target host):
+mwsqlctl install-service `
+  --service-name mwsqld `
+  --exec-path 'C:\Program Files\middleWHERE\mwsqld.exe' `
+  --state-dir <state-dir> --file-keystore `
+  --write install-mwsqld.ps1
+
+# 2. Run it elevated. It registers the service under the NT SERVICE\mwsqld
+#    virtual account, locks the state dir to that account + Administrators
+#    (your client user is denied by omission), and sets auto-start + restart-on-fail:
+.\install-mwsqld.ps1
+sc.exe start mwsqld
+```
+
+On Windows the sealed config must be initialized **as the service account** (or
+pre-seeded) before first start, since the daemon account has no login session —
+the generated script prints the exact `mwsqlctl ... init` line to run.
+
+The daemon then runs as an account your client user cannot read, so the master
+key and sealed config stay out of reach. The reference files and the reasoning
+are in `installers/`.
 
 Service mode must use `--file-keystore`: the dedicated daemon account has no
 login session, so the OS keyring is unreachable; the master key lives in a
