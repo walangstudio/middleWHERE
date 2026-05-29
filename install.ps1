@@ -213,6 +213,15 @@ function Main {
     Write-Host ""
     # Best-effort version echo; never fail the (already successful) install on it.
     try { & (Join-Path $installDir $Probe) --version } catch { Write-Warn "installed, but '$Probe --version' could not run yet" }
+
+    Write-Host ""
+    Write-Host "Next steps" -ForegroundColor White
+    Write-Host "  1. Initialize a state directory (one time):"
+    Write-Host "       mwsqlctl --state-dir <dir> --file-keystore init" -ForegroundColor Cyan
+    Write-Host "  2. Add a credential + environment, then run the daemon:"
+    Write-Host "       mwsqld --state-dir <dir> --file-keystore run" -ForegroundColor Cyan
+    Write-Host "  Service install? See https://github.com/$Repo#running-as-a-service"
+    Write-Host "  Guide: https://github.com/$Repo#getting-started"
   } finally {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
   }
