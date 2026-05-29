@@ -5,7 +5,25 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
-## [0.2.0] - Unreleased
+## [0.2.1] - 2026-05-29
+
+### Added
+
+- `init` now locks the state directory to `0700` (owner-only) on Unix, so the
+  audit log and file names are not readable by other local users. Previously
+  only the sealed config and master key were owner-restricted.
+- `mwsqlctl init` / `mwsqld init` print a clear, actionable error when the
+  default state directory (under `/var/lib`, etc.) cannot be created
+  unprivileged: re-run with `sudo`, or pass `--state-dir <a path you own>`.
+- `mwsqlctl init` points at `install-service` on success for running as a
+  managed service.
+
+### Changed
+
+- Installers (`install.sh` / `install.ps1`) print a "Next steps" footer after a
+  successful install, including on the already-installed no-op re-run.
+
+## [0.2.0] - 2026-05-27
 
 Distribution and supply-chain release. No runtime behaviour changes.
 

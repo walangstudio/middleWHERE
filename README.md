@@ -100,12 +100,35 @@ examples use `--file-keystore`, which keeps the master key in a locked file in
 the state directory; drop it to use the OS keychain instead when you have a
 real login session.
 
+`init` creates the directory (and its `audit/` subdir), and locks it to
+`0700` (owner-only) so nobody else can read the audit log or file names — no
+`mkdir` or `chmod` first.
+
+You don't have to pass `--state-dir`. Omit it and both the daemon and `mwsqlctl`
+use the same machine-wide default — `/var/lib/middlewhere` on Linux,
+`/Library/Application Support/middlewhere` on macOS, `%ProgramData%\middlewhere`
+on Windows. Creating that needs root, so `init` runs under `sudo`:
+
 ```sh
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore init
+sudo mwsqlctl --file-keystore init
+```
+
+If you run it unprivileged it tells you to re-run with `sudo` or pass a path you
+own. For a single-user dev setup, do exactly that — point `--state-dir` anywhere
+writable and skip `sudo`:
+
+```sh
+mwsqlctl --state-dir ~/.middlewhere --file-keystore init
 ```
 
 That generates a master key, seals an empty config, and creates the directory
-layout. Nothing is exposed in plaintext except the audit log.
+layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
+overwrite an existing `config.sealed`, so re-running is safe.
+
+Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
+— so either omit `--state-dir` on both (default), or pass the same value to
+both. To run the daemon as a managed service afterward, see
+[Running as a service](#running-as-a-service).
 
 ### A worked example
 

@@ -27,11 +27,12 @@ function Write-Fatal   { Write-Host "error: $args" -ForegroundColor Red; exit 1 
 function Write-NextSteps {
   Write-Host ""
   Write-Host "Next steps" -ForegroundColor White
-  Write-Host "  1. Initialize a state directory (one time):"
-  Write-Host "       mwsqlctl --state-dir <dir> --file-keystore init" -ForegroundColor Cyan
+  Write-Host "  1. Initialize (one time; default state dir needs an elevated shell):"
+  Write-Host "       mwsqlctl --file-keystore init" -ForegroundColor Cyan
+  Write-Host "       dev / no admin: add --state-dir `$HOME\.middlewhere" -ForegroundColor Cyan
   Write-Host "  2. Add a credential + environment, then run the daemon:"
-  Write-Host "       mwsqld --state-dir <dir> --file-keystore run" -ForegroundColor Cyan
-  Write-Host "  Service install? See https://github.com/$Repo#running-as-a-service"
+  Write-Host "       mwsqld --file-keystore run" -ForegroundColor Cyan
+  Write-Host "  Run as a managed service: mwsqlctl install-service --help"
   Write-Host "  Guide: https://github.com/$Repo#getting-started"
 }
 
