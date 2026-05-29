@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use mwsqld::{default_state_dir, init as init_state, load_config, Daemon, KeystoreChoice};
+use mwsqld::{default_user_state_dir, init as init_state, load_config, Daemon, KeystoreChoice};
 
 #[derive(Parser)]
 #[command(
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
         return mwsqld::winsvc::run();
     }
 
-    let state_dir = cli.state_dir.unwrap_or_else(default_state_dir);
+    let state_dir = cli.state_dir.unwrap_or_else(default_user_state_dir);
     let keystore = if cli.file_keystore {
         KeystoreChoice::default_file(&state_dir)
     } else {

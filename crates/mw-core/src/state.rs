@@ -61,6 +61,10 @@ impl KeystoreChoice {
     }
 }
 
+/// System-wide state dir for a daemon running as its own service account.
+/// Used when baking a service unit (`install-service`) and by the Windows
+/// service entrypoint. Needs elevation to create. Interactive CLI use defaults
+/// to [`default_user_state_dir`] instead.
 pub fn default_state_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -77,6 +81,36 @@ pub fn default_state_dir() -> PathBuf {
     {
         PathBuf::from("/var/lib/middlewhere")
     }
+}
+
+/// Per-user state dir, the default for interactive `mwsqld`/`mwsqlctl` use so
+/// `init`/`run` work with no elevation. Mirrors where the binaries install by
+/// default (`~/.local/bin`, `%LOCALAPPDATA%`). A service deployment overrides
+/// this with an explicit `--state-dir` (see [`default_state_dir`]). Falls back
+/// to the system dir only if the home directory cannot be resolved.
+pub fn default_user_state_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join("middlewhere");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join("Library/Application Support/middlewhere");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+            return PathBuf::from(state).join("middlewhere");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".local/state/middlewhere");
+        }
+    }
+    default_state_dir()
 }
 
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
@@ -219,6 +253,30 @@ mod tests {
         assert!(tmp.path().join(CONFIG_BACKUP_NAME).exists());
         // Tmp file gone after save.
         assert!(!tmp.path().join(CONFIG_TMP_NAME).exists());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn user_state_dir_honors_xdg_state_home() {
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", "/tmp/mw-xdg-test");
+        assert_eq!(
+            default_user_state_dir(),
+            PathBuf::from("/tmp/mw-xdg-test/middlewhere")
+        );
+        match prev {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
+    fn user_state_dir_differs_from_system_default() {
+        // The per-user default must not silently fall back to the system path
+        // in a normal environment (HOME / LOCALAPPDATA set).
+        if default_user_state_dir() != default_state_dir() {
+            assert!(default_user_state_dir().ends_with("middlewhere"));
+        }
     }
 
     #[cfg(unix)]

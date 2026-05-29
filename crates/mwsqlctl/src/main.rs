@@ -6,7 +6,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use mw_core::config::{EngineKind, HostKeyFingerprint, Policy};
 use mw_core::secret::{SecretBytes, SecretStr};
-use mw_core::state::{default_state_dir, init as state_init, KeystoreChoice};
+use mw_core::state::{
+    default_state_dir, default_user_state_dir, init as state_init, KeystoreChoice,
+};
 
 use mwsqlctl::installer::{self, InstallParams};
 use mwsqlctl::{audit_tail, bastion, cred, envs, policy};
@@ -219,7 +221,7 @@ struct AuditTailArgs {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let state_dir = cli.state_dir.unwrap_or_else(default_state_dir);
+    let state_dir = cli.state_dir.clone().unwrap_or_else(default_user_state_dir);
     let ks = if cli.file_keystore {
         KeystoreChoice::default_file(&state_dir)
     } else {
@@ -376,6 +378,10 @@ fn main() -> Result<()> {
             }
         }
         Cmd::InstallService(a) => {
+            // A generated service unit runs as a dedicated account, so it
+            // defaults to the system state dir, not the per-user interactive
+            // default. An explicit --state-dir still wins.
+            let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
             let exec_path = match a.exec_path {
                 Some(p) => p,
                 None => default_daemon_path()?,

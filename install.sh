@@ -157,12 +157,13 @@ check_path() {
 
 print_next_steps() {
   printf "\n${BOLD}Next steps${RESET}\n"
-  printf "  1. Initialize (one time; default state dir needs root):\n"
-  printf "       ${CYAN}sudo mwsqlctl --file-keystore init${RESET}\n"
-  printf "       dev / no sudo: add ${CYAN}--state-dir ~/.middlewhere${RESET}\n"
-  printf "  2. Add a credential + environment, then run the daemon:\n"
-  printf "       ${CYAN}sudo mwsqld --file-keystore run${RESET}\n"
-  printf "  Run as a managed service:  ${CYAN}mwsqlctl install-service --help${RESET}\n"
+  printf "  1. Initialize (no sudo; per-user state dir):\n"
+  printf "       ${CYAN}mwsqlctl --file-keystore init${RESET}\n"
+  printf "  2. Add a connection, then mint a token:\n"
+  printf "       ${CYAN}mwsqlctl cred add ...  &&  mwsqlctl env add ...  &&  mwsqlctl grant <env>${RESET}\n"
+  printf "  3. Serve it:\n"
+  printf "       auto-start as a service:  ${CYAN}mwsqlctl install-service --help${RESET}\n"
+  printf "       or run manually:          ${CYAN}mwsqld --file-keystore run${RESET}\n"
   printf "  Guide: https://github.com/${REPO}#getting-started\n"
 }
 
