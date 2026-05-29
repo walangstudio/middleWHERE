@@ -105,21 +105,16 @@ real login session.
 `mkdir` or `chmod` first.
 
 You don't have to pass `--state-dir`. Omit it and both the daemon and `mwsqlctl`
-use the same machine-wide default — `/var/lib/middlewhere` on Linux,
-`/Library/Application Support/middlewhere` on macOS, `%ProgramData%\middlewhere`
-on Windows. Creating that needs root, so `init` runs under `sudo`:
+default to a **per-user** dir — `~/.local/state/middlewhere` on Linux (honors
+`$XDG_STATE_HOME`), `~/Library/Application Support/middlewhere` on macOS,
+`%LOCALAPPDATA%\middlewhere` on Windows. No elevation:
 
 ```sh
-sudo mwsqlctl --file-keystore init
+mwsqlctl --file-keystore init
 ```
 
-If you run it unprivileged it tells you to re-run with `sudo` or pass a path you
-own. For a single-user dev setup, do exactly that — point `--state-dir` anywhere
-writable and skip `sudo`:
-
-```sh
-mwsqlctl --state-dir ~/.middlewhere --file-keystore init
-```
+This matches where the binaries install by default, so the common case needs no
+`sudo`. Point `--state-dir` elsewhere if you want a shared location.
 
 That generates a master key, seals an empty config, and creates the directory
 layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
@@ -127,7 +122,11 @@ overwrite an existing `config.sealed`, so re-running is safe.
 
 Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
 — so either omit `--state-dir` on both (default), or pass the same value to
-both. To run the daemon as a managed service afterward, see
+both.
+
+For a system-wide service (one shared store owned by a dedicated daemon
+account), use the machine-wide path instead — `/var/lib/middlewhere` and
+friends. That needs root and is wired up by `install-service`; see
 [Running as a service](#running-as-a-service).
 
 ### A worked example

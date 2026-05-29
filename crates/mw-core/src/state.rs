@@ -61,6 +61,10 @@ impl KeystoreChoice {
     }
 }
 
+/// System-wide state dir for a daemon running as its own service account.
+/// Used when baking a service unit (`install-service`) and by the Windows
+/// service entrypoint. Needs elevation to create. Interactive CLI use defaults
+/// to [`default_user_state_dir`] instead.
 pub fn default_state_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -77,6 +81,44 @@ pub fn default_state_dir() -> PathBuf {
     {
         PathBuf::from("/var/lib/middlewhere")
     }
+}
+
+/// Per-user state dir, the default for interactive `mwsqld`/`mwsqlctl` use so
+/// `init`/`run` work with no elevation. Mirrors where the binaries install by
+/// default (`~/.local/bin`, `%LOCALAPPDATA%`). A service deployment overrides
+/// this with an explicit `--state-dir` (see [`default_state_dir`]). Falls back
+/// to the system dir only if the home directory cannot be resolved.
+pub fn default_user_state_dir() -> PathBuf {
+    // An env var that is set but empty must be treated as unset (XDG spec), or
+    // PathBuf::from("").join(..) yields a relative path and state lands under
+    // the CWD.
+    fn env_dir(key: &str) -> Option<PathBuf> {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(windows)]
+    {
+        if let Some(local) = env_dir("LOCALAPPDATA") {
+            return local.join("middlewhere");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = env_dir("HOME") {
+            return home.join("Library/Application Support/middlewhere");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(state) = env_dir("XDG_STATE_HOME") {
+            return state.join("middlewhere");
+        }
+        if let Some(home) = env_dir("HOME") {
+            return home.join(".local/state/middlewhere");
+        }
+    }
+    default_state_dir()
 }
 
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
@@ -219,6 +261,62 @@ mod tests {
         assert!(tmp.path().join(CONFIG_BACKUP_NAME).exists());
         // Tmp file gone after save.
         assert!(!tmp.path().join(CONFIG_TMP_NAME).exists());
+    }
+
+    // Serializes the tests that read or mutate process-global env so they
+    // never race; poison-tolerant so one failure doesn't cascade.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn user_state_dir_xdg_resolution() {
+        use std::ffi::OsString;
+        let _g = env_lock();
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        let prev_home = std::env::var_os("HOME");
+
+        // Capture all results while we hold the env, then restore BEFORE
+        // asserting so a failed assert can't leak the override.
+        std::env::set_var("XDG_STATE_HOME", "/tmp/mw-xdg");
+        let with_xdg = default_user_state_dir();
+        std::env::set_var("XDG_STATE_HOME", ""); // empty must be ignored
+        std::env::set_var("HOME", "/home/tester");
+        let empty_xdg = default_user_state_dir();
+        std::env::remove_var("XDG_STATE_HOME");
+        let no_xdg = default_user_state_dir();
+
+        let restore = |k: &str, v: Option<OsString>| match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        };
+        restore("XDG_STATE_HOME", prev_xdg);
+        restore("HOME", prev_home);
+
+        assert_eq!(with_xdg, PathBuf::from("/tmp/mw-xdg/middlewhere"));
+        assert_eq!(
+            empty_xdg,
+            PathBuf::from("/home/tester/.local/state/middlewhere"),
+            "empty XDG_STATE_HOME must fall back to HOME, not a relative path"
+        );
+        assert_eq!(
+            no_xdg,
+            PathBuf::from("/home/tester/.local/state/middlewhere")
+        );
+    }
+
+    #[test]
+    fn user_state_dir_is_always_absolute() {
+        // Whatever the environment, the resolved dir must be absolute — never a
+        // CWD-relative path (the empty-env-var regression).
+        let _g = env_lock();
+        assert!(
+            default_user_state_dir().is_absolute(),
+            "state dir must be absolute, got {:?}",
+            default_user_state_dir()
+        );
     }
 
     #[cfg(unix)]

@@ -5,6 +5,22 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.2.2] - 2026-05-29
+
+### Changed
+
+- Interactive `mwsqld` / `mwsqlctl` now default to a **per-user** state dir
+  when `--state-dir` is omitted — `~/.local/state/middlewhere` (Linux, honors
+  `$XDG_STATE_HOME`), `~/Library/Application Support/middlewhere` (macOS),
+  `%LOCALAPPDATA%\middlewhere` (Windows). This matches where the binaries
+  install by default and lets `init` / `run` work with no elevation. The
+  system dir (`/var/lib/middlewhere`, etc.) is still the default that
+  `install-service` bakes into generated service units and that the Windows
+  service entrypoint uses; a service deployment overrides with an explicit
+  `--state-dir`.
+- Installer "Next steps" footer rewritten as init -> configure -> serve, with
+  running as a managed service (auto-start) presented alongside a manual run.
+
 ## [0.2.1] - 2026-05-29
 
 ### Added
