@@ -100,12 +100,36 @@ examples use `--file-keystore`, which keeps the master key in a locked file in
 the state directory; drop it to use the OS keychain instead when you have a
 real login session.
 
-```sh
-mwsqlctl --state-dir /var/lib/middlewhere --file-keystore init
-```
+`init` creates the directory (and its `audit/` subdir) for you — no `mkdir`
+first. **Where to put it:**
+
+- **System service (production):** the default is a machine-wide path —
+  `/var/lib/middlewhere` on Linux, `/Library/Application Support/middlewhere` on
+  macOS, `%ProgramData%\middlewhere` on Windows. Creating it needs elevation, and
+  it must be owned by (and readable only to) the daemon account, not your client
+  user. Omit `--state-dir` to use the default.
+
+  ```sh
+  sudo mwsqlctl --state-dir /var/lib/middlewhere --file-keystore init
+  sudo chmod 700 /var/lib/middlewhere   # init does not lock the dir itself; do it
+  ```
+
+- **Single user / dev (no sudo):** point it at a directory you own, e.g.
+  `~/.middlewhere`. No elevation needed; the master key and sealed config are
+  written owner-only regardless of the dir's mode. On a shared box, `chmod 700`
+  it too so other local users can't read the audit log or file names.
+
+  ```sh
+  mwsqlctl --state-dir ~/.middlewhere --file-keystore init
+  ```
 
 That generates a master key, seals an empty config, and creates the directory
-layout. Nothing is exposed in plaintext except the audit log.
+layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
+overwrite an existing `config.sealed`, so re-running is safe. The rest of these
+examples write `<state-dir>` — substitute whichever path you chose.
+
+Whichever you pick, the daemon and `mwsqlctl` must both be given the **same**
+`--state-dir`.
 
 ### A worked example
 
