@@ -243,6 +243,14 @@ main() {
   fi
   printf "\n"
   command -v "$VERSION_PROBE" >/dev/null 2>&1 && "$VERSION_PROBE" --version || warn "middleWHERE is not in PATH yet. Open a new shell or update your PATH."
+
+  printf "\n${BOLD}Next steps${RESET}\n"
+  printf "  1. Initialize a state directory (one time, dev/foreground):\n"
+  printf "       ${CYAN}mwsqlctl --state-dir <dir> --file-keystore init${RESET}\n"
+  printf "  2. Add a credential + environment, then run the daemon:\n"
+  printf "       ${CYAN}mwsqld --state-dir <dir> --file-keystore run${RESET}\n"
+  printf "  Running as a service? init must run as the daemon account - see the guide.\n"
+  printf "  Guide: https://github.com/${REPO}#getting-started\n"
 }
 
 # Skip the entrypoint when sourced by the test harness (it calls the functions
