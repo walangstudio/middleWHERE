@@ -230,7 +230,9 @@ fn main() -> Result<()> {
         Cmd::Init => {
             state_init(&state_dir, &ks)?;
             eprintln!("initialized at {}", state_dir.display());
-            eprintln!("to run continuously as a managed service, see: mwsqlctl install-service --help");
+            eprintln!(
+                "to run continuously as a managed service, see: mwsqlctl install-service --help"
+            );
         }
         Cmd::Bastion(BastionCmd::Add(a)) => {
             let auth = if let Some(path) = a.key_file {
