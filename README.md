@@ -100,36 +100,35 @@ examples use `--file-keystore`, which keeps the master key in a locked file in
 the state directory; drop it to use the OS keychain instead when you have a
 real login session.
 
-`init` creates the directory (and its `audit/` subdir) for you — no `mkdir`
-first. **Where to put it:**
+`init` creates the directory (and its `audit/` subdir), and locks it to
+`0700` (owner-only) so nobody else can read the audit log or file names — no
+`mkdir` or `chmod` first.
 
-- **System service (production):** the default is a machine-wide path —
-  `/var/lib/middlewhere` on Linux, `/Library/Application Support/middlewhere` on
-  macOS, `%ProgramData%\middlewhere` on Windows. Creating it needs elevation, and
-  it must be owned by (and readable only to) the daemon account, not your client
-  user. Omit `--state-dir` to use the default.
+You don't have to pass `--state-dir`. Omit it and both the daemon and `mwsqlctl`
+use the same machine-wide default — `/var/lib/middlewhere` on Linux,
+`/Library/Application Support/middlewhere` on macOS, `%ProgramData%\middlewhere`
+on Windows. Creating that needs root, so `init` runs under `sudo`:
 
-  ```sh
-  sudo mwsqlctl --state-dir /var/lib/middlewhere --file-keystore init
-  sudo chmod 700 /var/lib/middlewhere   # init does not lock the dir itself; do it
-  ```
+```sh
+sudo mwsqlctl --file-keystore init
+```
 
-- **Single user / dev (no sudo):** point it at a directory you own, e.g.
-  `~/.middlewhere`. No elevation needed; the master key and sealed config are
-  written owner-only regardless of the dir's mode. On a shared box, `chmod 700`
-  it too so other local users can't read the audit log or file names.
+If you run it unprivileged it tells you to re-run with `sudo` or pass a path you
+own. For a single-user dev setup, do exactly that — point `--state-dir` anywhere
+writable and skip `sudo`:
 
-  ```sh
-  mwsqlctl --state-dir ~/.middlewhere --file-keystore init
-  ```
+```sh
+mwsqlctl --state-dir ~/.middlewhere --file-keystore init
+```
 
 That generates a master key, seals an empty config, and creates the directory
 layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
-overwrite an existing `config.sealed`, so re-running is safe. The rest of these
-examples write `<state-dir>` — substitute whichever path you chose.
+overwrite an existing `config.sealed`, so re-running is safe.
 
-Whichever you pick, the daemon and `mwsqlctl` must both be given the **same**
-`--state-dir`.
+Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
+— so either omit `--state-dir` on both (default), or pass the same value to
+both. To run the daemon as a managed service afterward, see
+[Running as a service](#running-as-a-service).
 
 ### A worked example
 

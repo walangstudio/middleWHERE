@@ -81,10 +81,34 @@ pub fn default_state_dir() -> PathBuf {
 
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
 /// sealed empty `Config`. Refuses to overwrite an existing sealed blob.
+// Create a directory (and parents) and lock it to the owner. On a
+// permission-denied — the common case when the default state dir lives under
+// /var/lib and init was run unprivileged — translate the raw OS error into an
+// actionable hint instead of a bare "Permission denied".
+fn create_dir_secure(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow!(
+                "permission denied creating {}: re-run with sudo, or pass \
+                 --state-dir <a path you own> (e.g. ~/.middlewhere)",
+                dir.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("create {}", dir.display()))
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("lock {} to 0700", dir.display()))?;
+    }
+    Ok(())
+}
+
 pub fn init(state_dir: &Path, keystore: &KeystoreChoice) -> Result<()> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("create {}", state_dir.display()))?;
-    std::fs::create_dir_all(state_dir.join("audit"))?;
+    create_dir_secure(state_dir)?;
+    create_dir_secure(&state_dir.join("audit"))?;
 
     let sealed_path = state_dir.join(CONFIG_FILE_NAME);
     if sealed_path.exists() {
@@ -195,6 +219,24 @@ mod tests {
         assert!(tmp.path().join(CONFIG_BACKUP_NAME).exists());
         // Tmp file gone after save.
         assert!(!tmp.path().join(CONFIG_TMP_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_locks_state_and_audit_dirs_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let sd = tmp.path().join("state");
+        let ks = KeystoreChoice::default_file(&sd);
+        init(&sd, &ks).unwrap();
+        let mode = std::fs::metadata(&sd).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state dir must be owner-only");
+        let audit_mode = std::fs::metadata(sd.join("audit"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(audit_mode, 0o700, "audit dir must be owner-only");
     }
 
     #[test]
