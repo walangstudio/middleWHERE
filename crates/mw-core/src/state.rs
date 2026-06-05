@@ -62,9 +62,10 @@ impl KeystoreChoice {
 }
 
 /// System-wide state dir for a daemon running as its own service account.
-/// Used when baking a service unit (`install-service`) and by the Windows
-/// service entrypoint. Needs elevation to create. Interactive CLI use defaults
-/// to [`default_user_state_dir`] instead.
+/// This is the **default** for `mwsqld`/`mwsqlctl` (service-first): the common
+/// deployment is a managed service, so a flagless invocation targets it and
+/// nudges `sudo` on EPERM. `--user` selects [`default_user_state_dir`] instead.
+/// Needs elevation to create.
 pub fn default_state_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -83,11 +84,11 @@ pub fn default_state_dir() -> PathBuf {
     }
 }
 
-/// Per-user state dir, the default for interactive `mwsqld`/`mwsqlctl` use so
-/// `init`/`run` work with no elevation. Mirrors where the binaries install by
-/// default (`~/.local/bin`, `%LOCALAPPDATA%`). A service deployment overrides
-/// this with an explicit `--state-dir` (see [`default_state_dir`]). Falls back
-/// to the system dir only if the home directory cannot be resolved.
+/// Per-user state dir, selected by the `--user` flag so `init`/`run` work with
+/// no elevation. Mirrors where the binaries install by default (`~/.local/bin`,
+/// `%LOCALAPPDATA%`). The flagless default is the service dir
+/// (see [`default_state_dir`]). Falls back to the system dir only if the home
+/// directory cannot be resolved.
 pub fn default_user_state_dir() -> PathBuf {
     // An env var that is set but empty must be treated as unset (XDG spec), or
     // PathBuf::from("").join(..) yields a relative path and state lands under
@@ -119,6 +120,51 @@ pub fn default_user_state_dir() -> PathBuf {
         }
     }
     default_state_dir()
+}
+
+/// True when an environment variable holds a truthy value (`1`/`true`/`yes`/
+/// `on`, case-insensitive). Unset, empty, or a falsey value is false. Used for
+/// `MW_FILE_KEYSTORE` / `MW_USER`, where a clap `bool` + `env` would reject a
+/// non-`true` string like `1`.
+pub fn env_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Resolve the state dir + keystore from the three flags every CLI shares
+/// (`--state-dir`, `--user`, `--file-keystore`). Service-first rules:
+///
+/// * state dir = explicit `--state-dir`, else the service dir, else the
+///   per-user dir when `--user` is set.
+/// * keystore  = file when `--file-keystore` or in the (default) service mode —
+///   a daemon under a service account has no login session to reach an OS
+///   keychain — and the OS keychain only in `--user` mode.
+///
+/// So the daemon's master key always lands in `master.key` for a service
+/// deployment, and an interactive `--user` run gets the OS-integrated store.
+pub fn resolve_cli_target(
+    state_dir: Option<PathBuf>,
+    user: bool,
+    file_keystore: bool,
+) -> (PathBuf, KeystoreChoice) {
+    let dir = state_dir.unwrap_or_else(|| {
+        if user {
+            default_user_state_dir()
+        } else {
+            default_state_dir()
+        }
+    });
+    let ks = if user && !file_keystore {
+        KeystoreChoice::default_os()
+    } else {
+        KeystoreChoice::default_file(&dir)
+    };
+    (dir, ks)
 }
 
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
@@ -305,6 +351,53 @@ mod tests {
             no_xdg,
             PathBuf::from("/home/tester/.local/state/middlewhere")
         );
+    }
+
+    #[test]
+    fn env_flag_truthy_values() {
+        let _g = env_lock();
+        let prev = std::env::var_os("MW_TEST_FLAG");
+        for (v, want) in [
+            ("1", true),
+            ("true", true),
+            ("YES", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+        ] {
+            std::env::set_var("MW_TEST_FLAG", v);
+            assert_eq!(env_flag("MW_TEST_FLAG"), want, "value {v:?}");
+        }
+        std::env::remove_var("MW_TEST_FLAG");
+        assert!(!env_flag("MW_TEST_FLAG"), "unset must be false");
+        match prev {
+            Some(v) => std::env::set_var("MW_TEST_FLAG", v),
+            None => std::env::remove_var("MW_TEST_FLAG"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_is_service_first() {
+        let _g = env_lock();
+        // Flagless: service dir + file keystore.
+        let (dir, ks) = resolve_cli_target(None, false, false);
+        assert_eq!(dir, default_state_dir());
+        assert!(matches!(ks, KeystoreChoice::File { .. }));
+
+        // --user: per-user dir + OS keychain.
+        let (udir, uks) = resolve_cli_target(None, true, false);
+        assert_eq!(udir, default_user_state_dir());
+        assert!(matches!(uks, KeystoreChoice::Os { .. }));
+
+        // --user --file-keystore: per-user dir but file keystore.
+        let (_, fks) = resolve_cli_target(None, true, true);
+        assert!(matches!(fks, KeystoreChoice::File { .. }));
+
+        // Explicit --state-dir wins over the mode default.
+        let custom = PathBuf::from("/srv/mw");
+        let (cdir, _) = resolve_cli_target(Some(custom.clone()), false, false);
+        assert_eq!(cdir, custom);
     }
 
     #[test]

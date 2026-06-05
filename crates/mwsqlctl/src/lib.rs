@@ -12,5 +12,7 @@ pub mod cred;
 pub mod envs;
 pub mod import_poc;
 pub mod installer;
+pub mod ops;
 pub mod policy;
 pub mod store;
+pub mod wizard;

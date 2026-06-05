@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use mwsqld::{default_user_state_dir, init as init_state, load_config, Daemon, KeystoreChoice};
+use mwsqld::{env_flag, init as init_state, load_config, resolve_cli_target, Daemon};
 
 #[derive(Parser)]
 #[command(
@@ -12,12 +12,20 @@ use mwsqld::{default_user_state_dir, init as init_state, load_config, Daemon, Ke
     about = "middleWHERE secure SQL gateway daemon"
 )]
 struct Cli {
-    /// State directory (config.sealed + audit/).
-    #[arg(long, global = true)]
+    /// State directory (config.sealed + audit/). Defaults to the system
+    /// service dir; `--user` switches to the per-user dir.
+    #[arg(long, global = true, env = "MW_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
+    /// Per-user deployment: store under the home dir and use the OS keychain.
+    /// Without it, the default targets the system service dir + file keystore.
+    /// Also set by MW_USER=1.
+    #[arg(long, global = true)]
+    user: bool,
+
     /// Use a file-backed master key instead of the OS keystore.
-    /// Recommended only for headless Linux without D-Bus.
+    /// Recommended only for headless Linux without D-Bus. Also set by
+    /// MW_FILE_KEYSTORE=1.
     #[arg(long, global = true)]
     file_keystore: bool,
 
@@ -56,12 +64,9 @@ fn main() -> Result<()> {
         return mwsqld::winsvc::run();
     }
 
-    let state_dir = cli.state_dir.unwrap_or_else(default_user_state_dir);
-    let keystore = if cli.file_keystore {
-        KeystoreChoice::default_file(&state_dir)
-    } else {
-        KeystoreChoice::default_os()
-    };
+    let user = cli.user || env_flag("MW_USER");
+    let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+    let (state_dir, keystore) = resolve_cli_target(cli.state_dir, user, file_keystore);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {

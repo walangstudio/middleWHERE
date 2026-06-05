@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
@@ -45,7 +45,7 @@ tracing-appender = "0.2"
 time           = { version = "0.3", features = ["formatting", "serde-human-readable"] }
 serde_json     = "1"
 sha2           = "0.10"
-clap           = { version = "4", features = ["derive"] }
+clap           = { version = "4", features = ["derive", "env"] }
 tokio-postgres = "0.7"
 mysql_async    = { version = "0.37", default-features = false, features = ["minimal"] }
 mysql_common   = { version = "0.37", default-features = false }

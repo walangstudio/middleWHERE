@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-149%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -95,39 +95,70 @@ binaries are unsigned; SmartScreen may warn until reputation accrues.
 
 ## Getting started
 
-Pick a state directory. The daemon and the admin tool both point at it. These
-examples use `--file-keystore`, which keeps the master key in a locked file in
-the state directory; drop it to use the OS keychain instead when you have a
-real login session.
+### The guided way (recommended)
+
+```sh
+mwsqlctl wizard
+```
+
+One command takes you from a fresh install to a running systemd service. It
+self-elevates with `sudo` (confirming first), creates the `mwsqld` system
+account, seeds the sealed config as it walks you through adding bastions,
+credentials, and environments — passwords are prompted and masked, never on the
+command line — then writes the hardened unit and starts it. Re-run it any time to
+add more; it detects the existing config and picks up where you left off.
+
+For a per-user install with no elevation (handy for local dev), add `--user`:
+
+```sh
+mwsqlctl wizard --user
+```
+
+The rest of this section covers the manual commands the wizard runs, for when you
+want to script them or understand the moving parts.
+
+### The manual way
+
+Pick a state directory. The daemon and the admin tool both point at it. Service
+deployments use `--file-keystore`, which keeps the master key in a locked file in
+the state directory (a daemon account has no login session to reach an OS
+keychain); a `--user` install gets the OS keychain instead.
 
 `init` creates the directory (and its `audit/` subdir), and locks it to
 `0700` (owner-only) so nobody else can read the audit log or file names — no
 `mkdir` or `chmod` first.
 
-You don't have to pass `--state-dir`. Omit it and both the daemon and `mwsqlctl`
-default to a **per-user** dir — `~/.local/state/middlewhere` on Linux (honors
-`$XDG_STATE_HOME`), `~/Library/Application Support/middlewhere` on macOS,
-`%LOCALAPPDATA%\middlewhere` on Windows. No elevation:
+The flagless default targets the **system service** dir — `/var/lib/middlewhere`
+(Linux), `/Library/Application Support/middlewhere` (macOS),
+`C:\ProgramData\middlewhere` (Windows) — and the file keystore, because the
+common deployment is a managed service. It needs root, so `init` nudges you to
+`sudo` on a permission error:
 
 ```sh
-mwsqlctl --file-keystore init
+sudo mwsqlctl init        # system service dir + file keystore
 ```
 
-This matches where the binaries install by default, so the common case needs no
-`sudo`. Point `--state-dir` elsewhere if you want a shared location.
+Pass `--user` for the per-user dir (`~/.local/state/middlewhere` on Linux,
+honoring `$XDG_STATE_HOME`; `~/Library/Application Support/middlewhere` on macOS;
+`%LOCALAPPDATA%\middlewhere` on Windows) and the OS keychain — no elevation:
+
+```sh
+mwsqlctl --user init
+```
 
 That generates a master key, seals an empty config, and creates the directory
 layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
 overwrite an existing `config.sealed`, so re-running is safe.
 
-Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
-— so either omit `--state-dir` on both (default), or pass the same value to
-both.
+To skip repeating the flags on every command, export them once:
 
-For a system-wide service (one shared store owned by a dedicated daemon
-account), use the machine-wide path instead — `/var/lib/middlewhere` and
-friends. That needs root and is wired up by `install-service`; see
-[Running as a service](#running-as-a-service).
+```sh
+export MW_STATE_DIR=/var/lib/middlewhere MW_FILE_KEYSTORE=1
+```
+
+Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
+— so either rely on the same default on both, set the same `MW_STATE_DIR`, or
+pass the same `--state-dir` to both.
 
 ### A worked example
 
@@ -309,16 +340,20 @@ holds no secrets.
 
 ## Running as a service
 
-There is no auto-installed service. The simplest way to run is in the
-foreground:
+The one-command path is `mwsqlctl wizard` (see
+[Getting started](#getting-started)): on Linux it self-elevates, creates a fixed
+`mwsqld` system user, seeds the config, writes a hardened `User=mwsqld` systemd
+unit, and runs `systemctl enable --now` for you.
+
+To run by hand in the foreground instead:
 
 ```sh
-mwsqld --state-dir <state-dir> --file-keystore run
+sudo mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-For a managed service, `mwsqlctl install-service` *generates* the platform file
-(a systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows
-PowerShell script) — it never escalates, enables it, or creates accounts
+To generate the unit without the wizard, `mwsqlctl install-service` *generates*
+the platform file (a systemd unit with `DynamicUser=yes`, a launchd plist, or a
+Windows PowerShell script) — it never escalates, enables it, or creates accounts
 itself. You apply it. On Linux:
 
 ```sh

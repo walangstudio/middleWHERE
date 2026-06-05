@@ -31,7 +31,9 @@ jobs:
           # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel): no patched
           # version exists; pulled in transitively by russh for SSH bastion key
           # auth. Not actionable until russh/ssh-key migrate off the rsa crate.
-          ignore: RUSTSEC-2023-0071
+          # RUSTSEC-2025-0057 (fxhash unmaintained): warning only, pulled in
+          # transitively by inquire (fuzzy-matcher) for the setup wizard.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2025-0057
 
   installers:
     name: installer + workflow tests

@@ -20,8 +20,8 @@ use mw_net::engine::{engine_for, Backend, BackendOpts, Engine};
 use mw_net::ssh::{start_local_forward, BastionRegistry, LocalForward};
 
 pub use mw_core::state::{
-    default_state_dir, default_user_state_dir, init, load_config, save_config, KeystoreChoice,
-    CONFIG_FILE_NAME, FILE_MASTER_KEY_NAME,
+    default_state_dir, default_user_state_dir, env_flag, init, load_config, resolve_cli_target,
+    save_config, KeystoreChoice, CONFIG_FILE_NAME, FILE_MASTER_KEY_NAME,
 };
 
 #[cfg(windows)]

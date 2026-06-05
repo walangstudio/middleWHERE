@@ -1,23 +1,32 @@
-use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use mw_core::config::{EngineKind, HostKeyFingerprint, Policy};
-use mw_core::secret::{SecretBytes, SecretStr};
-use mw_core::state::{
-    default_state_dir, default_user_state_dir, init as state_init, KeystoreChoice,
-};
+use mw_core::config::{EngineKind, Policy};
+use mw_core::state::{default_state_dir, env_flag, resolve_cli_target};
 
-use mwsqlctl::installer::{self, InstallParams};
+use mwsqlctl::installer::InstallParams;
+use mwsqlctl::ops::{self, Target};
+use mwsqlctl::wizard;
 use mwsqlctl::{audit_tail, bastion, cred, envs, policy};
 
 #[derive(Parser)]
 #[command(name = "mwsqlctl", version, about = "middleWHERE admin CLI")]
 struct Cli {
-    #[arg(long, global = true)]
+    /// State directory (config.sealed + audit/). Defaults to the system
+    /// service dir; `--user` switches to the per-user dir.
+    #[arg(long, global = true, env = "MW_STATE_DIR")]
     state_dir: Option<PathBuf>,
+
+    /// Per-user deployment: store under the home dir and use the OS keychain.
+    /// Without it, the default targets the system service dir + file keystore.
+    /// Also set by MW_USER=1.
+    #[arg(long, global = true)]
+    user: bool,
+
+    /// Use a file-backed master key instead of the OS keystore. Also set by
+    /// MW_FILE_KEYSTORE=1.
     #[arg(long, global = true)]
     file_keystore: bool,
 
@@ -51,6 +60,21 @@ enum Cmd {
     Grant(GrantArgs),
     /// Import an existing `.env` + `secrets/` deployment into the sealed config.
     Import(ImportArgs),
+    /// Guided end-to-end setup. Defaults to a systemd service deployment
+    /// (self-elevates), or pass `--user` for a per-user install.
+    #[command(alias = "setup")]
+    Wizard(WizardArgs),
+}
+
+#[derive(Args)]
+struct WizardArgs {
+    /// Service name for the generated systemd unit + system account.
+    #[arg(long, default_value = "mwsqld")]
+    service_name: String,
+    /// Path to the mwsqld binary baked into the unit. Defaults to a `mwsqld`
+    /// sibling of this executable.
+    #[arg(long)]
+    exec_path: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -221,56 +245,50 @@ struct AuditTailArgs {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let state_dir = cli.state_dir.clone().unwrap_or_else(default_user_state_dir);
-    let ks = if cli.file_keystore {
-        KeystoreChoice::default_file(&state_dir)
-    } else {
-        KeystoreChoice::default_os()
-    };
+
+    // The bool flags also honor MW_USER / MW_FILE_KEYSTORE (truthy), which a
+    // clap bool + env can't express ("1" wouldn't parse as a bool).
+    let user = cli.user || env_flag("MW_USER");
+    let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+
+    // The wizard owns its own mode/elevation resolution from the raw flags.
+    if let Cmd::Wizard(w) = cli.cmd {
+        return wizard::run(wizard::WizardOpts {
+            state_dir: cli.state_dir,
+            user,
+            file_keystore,
+            service_name: w.service_name,
+            exec_path: w.exec_path,
+        });
+    }
+
+    let (state_dir, ks) = resolve_cli_target(cli.state_dir.clone(), user, file_keystore);
+    let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {
+        Cmd::Wizard(_) => unreachable!("handled above"),
         Cmd::Init => {
-            state_init(&state_dir, &ks)?;
+            ops::init(t)?;
             eprintln!("initialized at {}", state_dir.display());
             eprintln!(
                 "to run continuously as a managed service, see: mwsqlctl install-service --help"
             );
         }
         Cmd::Bastion(BastionCmd::Add(a)) => {
-            let auth = if let Some(path) = a.key_file {
-                let pem =
-                    std::fs::read(&path).with_context(|| format!("read key {}", path.display()))?;
-                let passphrase = if read_yes_no("key has a passphrase? [y/N]: ")? {
-                    Some(SecretStr::new(read_secret("key passphrase: ", false)?))
-                } else {
-                    None
-                };
-                bastion::BastionAuthInput::Key {
-                    pem: SecretBytes::new(pem),
-                    passphrase,
-                }
-            } else {
-                let pw = read_secret("bastion password: ", a.password_stdin)?;
-                bastion::BastionAuthInput::Password(SecretStr::new(pw))
-            };
-            let fingerprint = a
-                .fingerprints
-                .first()
-                .map(|s| parse_fingerprint(s))
-                .transpose()?;
-            bastion::add(
-                &state_dir,
-                &ks,
-                bastion::BastionAddArgs {
-                    name: &a.name,
-                    host: &a.host,
+            let name = a.name.clone();
+            ops::add_bastion(
+                t,
+                ops::BastionInput {
+                    name: a.name,
+                    host: a.host,
                     port: a.port,
-                    ssh_user: &a.ssh_user,
-                    auth,
-                    fingerprint,
+                    ssh_user: a.ssh_user,
+                    key_file: a.key_file,
+                    password_stdin: a.password_stdin,
+                    fingerprints: a.fingerprints,
                 },
             )?;
-            eprintln!("bastion {:?} added", a.name);
+            eprintln!("bastion {name:?} added");
         }
         Cmd::Bastion(BastionCmd::Rm { name }) => {
             bastion::rm(&state_dir, &ks, &name)?;
@@ -294,17 +312,15 @@ fn main() -> Result<()> {
             user,
             password_stdin,
         }) => {
-            let pw = read_secret("backend password: ", password_stdin)?;
-            cred::add(&state_dir, &ks, &name, &user, SecretStr::new(pw))?;
-            eprintln!("credential {:?} added", name);
+            ops::add_credential(t, &name, &user, password_stdin)?;
+            eprintln!("credential {name:?} added");
         }
         Cmd::Cred(CredCmd::Rotate {
             name,
             password_stdin,
         }) => {
-            let pw = read_secret("new backend password: ", password_stdin)?;
-            cred::rotate(&state_dir, &ks, &name, SecretStr::new(pw))?;
-            eprintln!("credential {:?} rotated", name);
+            ops::rotate_credential(t, &name, password_stdin)?;
+            eprintln!("credential {name:?} rotated");
         }
         Cmd::Cred(CredCmd::Rm { name }) => {
             cred::rm(&state_dir, &ks, &name)?;
@@ -316,26 +332,25 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Env(EnvCmd::Add(a)) => {
-            let engine: EngineKind = a.engine.into();
-            let out = envs::add(
-                &state_dir,
-                &ks,
-                envs::EnvAddArgs {
-                    name: &a.name,
-                    backend_host: &a.backend_host,
-                    backend_port: a.backend_port.unwrap_or_else(|| engine.default_port()),
-                    default_database: a.database.as_deref(),
-                    bastion: a.bastion.as_deref(),
-                    credential: &a.credential,
+            let name = a.name.clone();
+            let out = ops::add_env(
+                t,
+                ops::EnvInput {
+                    name: a.name,
+                    backend_host: a.backend_host,
+                    backend_port: a.backend_port,
+                    engine: a.engine.into(),
+                    database: a.database,
+                    bastion: a.bastion,
+                    credential: a.credential,
                     policy: a.policy.into(),
                     listen_port: a.listen_port,
                     max_pool: a.max_pool,
-                    engine,
                 },
             )?;
             eprintln!(
-                "env {:?} added, listening on 127.0.0.1:{}",
-                a.name, out.listen_port
+                "env {name:?} added, listening on 127.0.0.1:{}",
+                out.listen_port
             );
             eprintln!("Client token (save now — will not be shown again):");
             println!("{}", out.token.expose());
@@ -379,52 +394,34 @@ fn main() -> Result<()> {
         }
         Cmd::InstallService(a) => {
             // A generated service unit runs as a dedicated account, so it
-            // defaults to the system state dir, not the per-user interactive
-            // default. An explicit --state-dir still wins.
-            let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+            // always targets the system state dir regardless of --user. An
+            // explicit --state-dir still wins. This command keeps the
+            // DynamicUser unit; the wizard generates the fixed-user variant.
+            let svc_state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
             let exec_path = match a.exec_path {
                 Some(p) => p,
-                None => default_daemon_path()?,
+                None => ops::default_daemon_path()?,
             };
             let params = InstallParams::new(
                 &a.service_name,
                 exec_path.to_string_lossy().to_string(),
-                state_dir.to_string_lossy().to_string(),
+                svc_state_dir.to_string_lossy().to_string(),
             );
-            let (artifact, steps): (String, String) = if cfg!(target_os = "linux") {
-                (
-                    installer::systemd_unit(&params),
-                    installer::linux_operator_steps(&params),
-                )
-            } else if cfg!(target_os = "macos") {
-                (
-                    installer::launchd_plist(&params),
-                    installer::macos_account_steps(&params),
-                )
-            } else if cfg!(windows) {
-                (
-                    installer::windows_install_ps1(&params),
-                    "# Windows — run the generated script elevated (Administrator).".to_string(),
-                )
-            } else {
-                bail!("unsupported platform for install-service");
-            };
-
+            let art = ops::build_service_artifact(&params, false)?;
             if let Some(path) = a.write {
-                if path.exists() && !a.force {
-                    bail!("{} exists; pass --force to overwrite", path.display());
-                }
-                std::fs::write(&path, &artifact)
-                    .with_context(|| format!("write {}", path.display()))?;
+                ops::write_service_artifact(&path, &art.artifact, a.force)?;
                 eprintln!("wrote {}", path.display());
-                eprintln!("\nNext steps (run with the privileges they require):\n{steps}");
+                eprintln!(
+                    "\nNext steps (run with the privileges they require):\n{}",
+                    art.steps
+                );
             } else {
-                print!("{artifact}");
-                eprintln!("\n# ---- operator steps ----\n{steps}");
+                print!("{}", art.artifact);
+                eprintln!("\n# ---- operator steps ----\n{}", art.steps);
             }
         }
         Cmd::Grant(g) => {
-            let out = envs::grant(&state_dir, &ks, &g.env)?;
+            let out = ops::grant(t, &g.env)?;
             if let Some(to) = &g.to {
                 eprintln!(
                     "granted env {:?} to {to} (token rotated; any prior token is now dead)",
@@ -462,54 +459,80 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolve the mwsqld binary that should run as the service: a sibling
-/// of the currently-running mwsqlctl executable.
-fn default_daemon_path() -> Result<PathBuf> {
-    let me = std::env::current_exe().context("resolve current exe")?;
-    let dir = me
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
-    let name = if cfg!(windows) {
-        "mwsqld.exe"
-    } else {
-        "mwsqld"
-    };
-    Ok(dir.join(name))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
 
-fn read_secret(prompt: &str, from_stdin: bool) -> Result<String> {
-    if from_stdin {
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s)?;
-        Ok(s.trim_end_matches(['\n', '\r']).to_string())
-    } else if std::io::stdin().is_terminal() {
-        Ok(rpassword::prompt_password(prompt)?)
-    } else {
-        bail!("stdin is not a terminal; pass --password-stdin");
+    // Serializes tests that set process-global env so they never race.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
-}
 
-fn read_yes_no(prompt: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        return Ok(false);
+    #[test]
+    fn env_supplies_state_dir_and_truthy_file_keystore() {
+        let _g = env_lock();
+        let prev_sd = std::env::var_os("MW_STATE_DIR");
+        let prev_fk = std::env::var_os("MW_FILE_KEYSTORE");
+        std::env::set_var("MW_STATE_DIR", "/tmp/mw-env-test");
+        std::env::set_var("MW_FILE_KEYSTORE", "1");
+
+        // MW_STATE_DIR flows through clap's `env` on the value arg.
+        let cli = Cli::try_parse_from(["mwsqlctl", "init"]).unwrap();
+        // MW_FILE_KEYSTORE="1" is OR'd in via env_flag (a clap bool+env would
+        // reject "1"); the effective flag is what main computes.
+        let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+
+        let restore = |k: &str, v: Option<std::ffi::OsString>| match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        };
+        restore("MW_STATE_DIR", prev_sd);
+        restore("MW_FILE_KEYSTORE", prev_fk);
+
+        assert_eq!(
+            cli.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/mw-env-test"))
+        );
+        assert!(
+            file_keystore,
+            "MW_FILE_KEYSTORE=1 must enable the file keystore"
+        );
     }
-    eprint!("{prompt}");
-    use std::io::BufRead;
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    Ok(matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
 
-fn parse_fingerprint(s: &str) -> Result<HostKeyFingerprint> {
-    let (algo, b64) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("fingerprint must be <algo>:<sha256_b64>"))?;
-    Ok(HostKeyFingerprint {
-        algo: algo.to_string(),
-        sha256_b64: b64.to_string(),
-    })
+    #[test]
+    fn defaults_are_service_first_when_no_flags() {
+        let _g = env_lock();
+        // Clear env that could leak in from the host/CI.
+        let prev_sd = std::env::var_os("MW_STATE_DIR");
+        let prev_fk = std::env::var_os("MW_FILE_KEYSTORE");
+        let prev_u = std::env::var_os("MW_USER");
+        std::env::remove_var("MW_STATE_DIR");
+        std::env::remove_var("MW_FILE_KEYSTORE");
+        std::env::remove_var("MW_USER");
+
+        let cli = Cli::try_parse_from(["mwsqlctl", "init"]).unwrap();
+
+        let restore = |k: &str, v: Option<std::ffi::OsString>| match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        };
+        restore("MW_STATE_DIR", prev_sd);
+        restore("MW_FILE_KEYSTORE", prev_fk);
+        restore("MW_USER", prev_u);
+
+        assert!(cli.state_dir.is_none());
+        assert!(!cli.user);
+        let (dir, ks) = resolve_cli_target(cli.state_dir, cli.user, cli.file_keystore);
+        assert_eq!(
+            dir,
+            default_state_dir(),
+            "flagless default must be the service dir"
+        );
+        assert!(
+            matches!(ks, mw_core::state::KeystoreChoice::File { .. }),
+            "service-mode keystore must be file-backed"
+        );
+    }
 }

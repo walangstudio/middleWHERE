@@ -27,13 +27,10 @@ function Write-Fatal   { Write-Host "error: $args" -ForegroundColor Red; exit 1 
 function Write-NextSteps {
   Write-Host ""
   Write-Host "Next steps" -ForegroundColor White
-  Write-Host "  1. Initialize (no admin; per-user state dir):"
-  Write-Host "       mwsqlctl --file-keystore init" -ForegroundColor Cyan
-  Write-Host "  2. Add a connection, then mint a token:"
-  Write-Host "       mwsqlctl cred add ...; mwsqlctl env add ...; mwsqlctl grant <env>" -ForegroundColor Cyan
-  Write-Host "  3. Serve it:"
-  Write-Host "       auto-start as a service: mwsqlctl install-service --help" -ForegroundColor Cyan
-  Write-Host "       or run manually:         mwsqld --file-keystore run" -ForegroundColor Cyan
+  Write-Host "  Guided setup (installs + starts the service):"
+  Write-Host "       mwsqlctl wizard" -ForegroundColor Cyan
+  Write-Host "  Per-user, no admin (local dev):"
+  Write-Host "       mwsqlctl wizard --user" -ForegroundColor Cyan
   Write-Host "  Guide: https://github.com/$Repo#getting-started"
 }
 

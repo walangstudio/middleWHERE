@@ -5,6 +5,36 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.3.0] - 2026-06-05
+
+### Added
+
+- `mwsqlctl wizard` (alias `setup`): a guided, service-first setup that takes a
+  junior operator from a fresh install to a running systemd service in one
+  command. On Linux it self-elevates with `sudo` (elevate-first, so secrets are
+  only ever entered in the root process — none crosses the sudo boundary),
+  creates a fixed `mwsqld` system user, seeds the sealed config through masked
+  prompts for bastions / credentials / environments, writes a hardened
+  `User=mwsqld` unit, and runs `systemctl enable --now`. Re-running detects an
+  existing config and offers add-more / show-current. `--user` does a
+  no-elevation per-user install instead.
+- A fixed-system-user systemd unit variant (`User=mwsqld` + `ReadWritePaths`)
+  alongside the existing `DynamicUser` one. Ownership is stable and inspectable
+  with `ls -l`, so "seed as root, then `enable --now`" is predictable — the
+  model the wizard uses. `install-service` still emits the `DynamicUser` unit.
+- `MW_STATE_DIR`, `MW_FILE_KEYSTORE`, and `MW_USER` environment variables back
+  the corresponding global flags on `mwsqld` / `mwsqlctl`, so a service operator
+  exports them once instead of repeating `--state-dir … --file-keystore`.
+
+### Changed
+
+- **Service-first defaults (reverts the 0.2.2 per-user default).** A flagless
+  `mwsqld` / `mwsqlctl` now targets the **system service** dir
+  (`/var/lib/middlewhere`, etc.) and the **file** keystore, because the common
+  deployment is a managed service; `init` nudges `sudo` on a permission error.
+  Pass `--user` for the per-user dir + OS keychain (the previous default). The
+  shared resolution lives in `mw_core::state::resolve_cli_target`.
+
 ## [0.2.2] - 2026-05-29
 
 ### Changed
