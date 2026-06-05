@@ -24,7 +24,6 @@ mw-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rpassword = "7"
-inquire = "0.7"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 base64.workspace = true

@@ -12,12 +12,11 @@
 //! crosses the sudo boundary.
 
 use std::ffi::OsString;
-use std::io::IsTerminal;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use inquire::{Confirm, Select, Text};
 
 use mw_core::config::{EngineKind, Policy};
 use mw_core::state::{default_state_dir, resolve_cli_target};
@@ -132,30 +131,101 @@ fn validate_service_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for a port, re-asking on a non-numeric entry instead of aborting the
-/// whole wizard. Only a terminal/cancel error from inquire propagates.
-fn prompt_port(msg: &str, default: u16) -> Result<u16> {
-    let dflt = default.to_string();
+// ---- line-based prompts (no TUI dependency; works on every target) -----
+
+/// Print a label and read one trimmed line. EOF (closed stdin) is an error —
+/// the wizard requires a real terminal (checked up front in `run`).
+fn read_line(label: &str) -> Result<String> {
+    print!("{label} ");
+    io::stdout().flush().ok();
+    let mut s = String::new();
+    if io::stdin().lock().read_line(&mut s)? == 0 {
+        bail!("unexpected end of input");
+    }
+    Ok(s.trim().to_string())
+}
+
+/// Required free text; re-asks on a blank line.
+fn prompt_text(label: &str) -> Result<String> {
     loop {
-        let s = Text::new(msg).with_default(&dflt).prompt()?;
-        match s.trim().parse::<u16>() {
+        let s = read_line(label)?;
+        if !s.is_empty() {
+            return Ok(s);
+        }
+        eprintln!("  ! required");
+    }
+}
+
+/// Free text with a default applied on a blank line.
+fn prompt_text_default(label: &str, default: &str) -> Result<String> {
+    let s = read_line(&format!("{label} [{default}]:"))?;
+    Ok(if s.is_empty() { default.to_string() } else { s })
+}
+
+/// Optional free text; a blank line means None.
+fn prompt_optional_text(label: &str) -> Result<Option<String>> {
+    let s = read_line(label)?;
+    Ok(if s.is_empty() { None } else { Some(s) })
+}
+
+fn confirm(label: &str, default_yes: bool) -> Result<bool> {
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    loop {
+        match read_line(&format!("{label} {hint}"))?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" => return Ok(default_yes),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("  ! please answer y or n"),
+        }
+    }
+}
+
+/// Numbered single-select; returns the chosen 0-based index.
+fn select_index(label: &str, labels: &[&str]) -> Result<usize> {
+    println!("{label}");
+    for (i, o) in labels.iter().enumerate() {
+        println!("  {}) {o}", i + 1);
+    }
+    loop {
+        let s = read_line("  choose [number]:")?;
+        if let Ok(n) = s.parse::<usize>() {
+            if (1..=labels.len()).contains(&n) {
+                return Ok(n - 1);
+            }
+        }
+        eprintln!("  ! enter a number 1-{}", labels.len());
+    }
+}
+
+/// Numbered single-select over owned strings; returns the chosen value.
+fn select_owned(label: &str, options: &[String]) -> Result<String> {
+    let refs: Vec<&str> = options.iter().map(String::as_str).collect();
+    Ok(options[select_index(label, &refs)?].clone())
+}
+
+/// Prompt for a port, re-asking on a non-numeric entry instead of aborting the
+/// whole wizard.
+fn prompt_port(label: &str, default: u16) -> Result<u16> {
+    loop {
+        match prompt_text_default(label, &default.to_string())?.parse::<u16>() {
             Ok(p) => return Ok(p),
             Err(_) => eprintln!("  ! not a valid port (0-65535); try again"),
         }
     }
 }
 
-/// Like [`prompt_port`] but blank means "use the engine default" (None).
-fn prompt_optional_port(msg: &str) -> Result<Option<u16>> {
+/// Like [`prompt_port`] but a blank line means "use the engine default" (None).
+fn prompt_optional_port(label: &str) -> Result<Option<u16>> {
     loop {
-        let s = Text::new(msg).with_default("").prompt()?;
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(None);
-        }
-        match s.parse::<u16>() {
-            Ok(p) => return Ok(Some(p)),
-            Err(_) => eprintln!("  ! not a valid port (0-65535); try again"),
+        match prompt_optional_text(label)? {
+            None => return Ok(None),
+            Some(s) => match s.parse::<u16>() {
+                Ok(p) => return Ok(Some(p)),
+                Err(_) => eprintln!("  ! not a valid port (0-65535); try again"),
+            },
         }
     }
 }
@@ -227,10 +297,7 @@ fn elevate_or_print(opts: &WizardOpts) -> Result<()> {
         svc = opts.service_name,
         state = target_dir.display()
     );
-    let proceed = Confirm::new("Re-run this wizard under sudo now?")
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+    let proceed = confirm("Re-run this wizard under sudo now?", true).unwrap_or(false);
     if !proceed {
         println!("\nNo changes made. Run it yourself when ready:");
         print!("  sudo {} wizard", me.display());
@@ -322,10 +389,9 @@ enum Existing {
 fn existing_config_action(t: Target) -> Result<Existing> {
     println!("Found an existing config at {}.", t.state_dir.display());
     loop {
-        let choice = Select::new("What now?", vec!["Add more", "Show current", "Quit"]).prompt()?;
-        match choice {
-            "Show current" => show_current(t)?,
-            "Quit" => return Ok(Existing::Quit),
+        match select_index("What now?", &["Add more", "Show current", "Quit"])? {
+            1 => show_current(t)?,
+            2 => return Ok(Existing::Quit),
             _ => return Ok(Existing::AddMore),
         }
     }
@@ -359,24 +425,20 @@ fn show_current(t: Target) -> Result<()> {
 // ---- add loops ---------------------------------------------------------
 
 fn add_bastions_loop(t: Target) -> Result<()> {
-    while Confirm::new("Add a bastion?").with_default(true).prompt()? {
-        let name = Text::new("Bastion name:").prompt()?;
-        let host = Text::new("SSH host:").prompt()?;
+    while confirm("Add a bastion?", true)? {
+        let name = prompt_text("Bastion name:")?;
+        let host = prompt_text("SSH host:")?;
         let port = prompt_port("SSH port:", 22)?;
-        let ssh_user = Text::new("SSH user:").prompt()?;
-        let auth = Select::new("Auth method:", vec!["password", "private key file"]).prompt()?;
-        let key_file = if auth == "private key file" {
-            Some(PathBuf::from(Text::new("PEM private-key path:").prompt()?))
-        } else {
-            None
+        let ssh_user = prompt_text("SSH user:")?;
+        let key_file = match select_index("Auth method:", &["password", "private key file"])? {
+            1 => Some(PathBuf::from(prompt_text("PEM private-key path:")?)),
+            _ => None,
         };
-        let fp = Text::new("Pinned host-key fingerprint <algo>:<sha256_b64> (blank to skip):")
-            .with_default("")
-            .prompt()?;
-        let fingerprints = if fp.trim().is_empty() {
-            vec![]
-        } else {
-            vec![fp.trim().to_string()]
+        let fingerprints = match prompt_optional_text(
+            "Pinned host-key fingerprint <algo>:<sha256_b64> (blank to skip):",
+        )? {
+            Some(fp) => vec![fp],
+            None => vec![],
         };
         // add_bastion prompts the password / passphrase in-process (masked).
         match ops::add_bastion(
@@ -399,12 +461,9 @@ fn add_bastions_loop(t: Target) -> Result<()> {
 }
 
 fn add_credentials_loop(t: Target) -> Result<()> {
-    while Confirm::new("Add a credential?")
-        .with_default(true)
-        .prompt()?
-    {
-        let name = Text::new("Credential name:").prompt()?;
-        let user = Text::new("Backend DB user:").prompt()?;
+    while confirm("Add a credential?", true)? {
+        let name = prompt_text("Credential name:")?;
+        let user = prompt_text("Backend DB user:")?;
         match ops::add_credential(t, &name, &user, false) {
             Ok(()) => println!("  added credential {name}"),
             Err(e) => eprintln!("  ! {e}"),
@@ -414,26 +473,23 @@ fn add_credentials_loop(t: Target) -> Result<()> {
 }
 
 fn add_envs_loop(t: Target) -> Result<()> {
-    while Confirm::new("Add an environment (a client listener)?")
-        .with_default(true)
-        .prompt()?
-    {
+    while confirm("Add an environment (a client listener)?", true)? {
         let creds = cred_names(t)?;
         if creds.is_empty() {
             println!("  (no credentials yet — add one first; skipping envs)");
             break;
         }
-        let name = Text::new("Env name:").prompt()?;
-        let backend_host = Text::new("Backend DB host:").prompt()?;
-        let engine = match Select::new("Engine:", vec!["mysql", "postgres"]).prompt()? {
-            "postgres" => EngineKind::Postgres,
+        let name = prompt_text("Env name:")?;
+        let backend_host = prompt_text("Backend DB host:")?;
+        let engine = match select_index("Engine:", &["mysql", "postgres"])? {
+            1 => EngineKind::Postgres,
             _ => EngineKind::MySql,
         };
         let backend_port = prompt_optional_port("Backend port (blank = engine default):")?;
         let bastion = pick_optional("Bastion (reuse or none):", bastion_names(t)?)?;
-        let credential = Select::new("Credential (reuse):", creds).prompt()?;
-        let policy = match Select::new("Policy:", vec!["read-only", "read-write"]).prompt()? {
-            "read-write" => Policy::ReadWrite,
+        let credential = select_owned("Credential (reuse):", &creds)?;
+        let policy = match select_index("Policy:", &["read-only", "read-write"])? {
+            1 => Policy::ReadWrite,
             _ => Policy::ReadOnly,
         };
         match ops::add_env(
@@ -482,7 +538,7 @@ fn pick_optional(msg: &str, names: Vec<String>) -> Result<Option<String>> {
     }
     let mut opts = vec!["(none)".to_string()];
     opts.extend(names);
-    let pick = Select::new(msg, opts).prompt()?;
+    let pick = select_owned(msg, &opts)?;
     Ok(if pick == "(none)" { None } else { Some(pick) })
 }
 
