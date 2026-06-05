@@ -335,7 +335,7 @@ holds no secrets.
 | --- | --- |
 | `config.sealed` | All credentials, bastion keys, and environment definitions, sealed with ChaCha20-Poly1305. |
 | `config.sealed.bak` | The previous sealed copy, kept for atomic writes. |
-| `master.key` | Only with `--file-keystore`, locked to the owner. Otherwise the key lives in the OS keychain and there is no file. |
+| `master.key` | Present with the file keystore (the default, and what service mode always uses), locked to the owner. With `--user` the key lives in the OS keychain and there is no file. |
 | `audit/audit.jsonl.YYYY-MM-DD` | One JSON line per query: decision, statement hash, row count, duration. No statement text, no secrets. |
 
 ## Running as a service
