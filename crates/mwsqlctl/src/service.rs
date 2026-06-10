@@ -125,6 +125,57 @@ fn relaunch_elevated_windows(_subcommand: &str, _forward: &[OsString]) -> Result
     Ok(())
 }
 
+/// Relaunch the *exact* current command elevated (verbatim argv + `--uac`). Used
+/// by the non-interactive config commands (`env list`, `grant`, …) that would
+/// otherwise just fail reading the admin-locked state dir. Output appears (and
+/// is paused) in the elevated console — see [`run_elevated_or`].
+#[cfg(windows)]
+pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
+    let me = std::env::current_exe().context("resolve current exe")?;
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut parts: Vec<String> = std::env::args().skip(1).map(|a| quote(&a)).collect();
+    parts.push(quote("--uac"));
+    let script = format!(
+        "Start-Process -FilePath {} -Verb RunAs -ArgumentList {}",
+        quote(&me.to_string_lossy()),
+        parts.join(",")
+    );
+    println!("Requesting administrator privileges (a UAC prompt will appear)…");
+    let status = run_powershell(&script).context("relaunch elevated")?;
+    if !status.success() {
+        bail!("elevation was cancelled or failed; run this from an elevated PowerShell instead.");
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
+    Ok(())
+}
+
+/// Wrap a config-touching command: on Windows service mode, relaunch elevated if
+/// needed (the command then re-runs verbatim in an admin console); otherwise run
+/// it, pausing afterward when we are the elevated child so its output (incl. a
+/// one-time `grant` token) stays readable before the throwaway console closes.
+pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
+    service: bool,
+    uac: bool,
+    needs_config: bool,
+    run: F,
+) -> Result<()> {
+    if service && cfg!(windows) && needs_config && needs_service_elevation(uac) {
+        return relaunch_self_elevated_windows();
+    }
+    let result = run();
+    if cfg!(windows) && uac && std::io::stdin().is_terminal() {
+        if let Err(e) = &result {
+            eprintln!("\nError: {e:#}");
+        }
+        let _ = prompt::read_line("\nDone. Press Enter to close this window:");
+        return Ok(());
+    }
+    result
+}
+
 /// Run a PowerShell script via `-EncodedCommand` (base64 UTF-16LE). Avoids
 /// command-line quoting/injection entirely, and — unlike a temp `.ps1` — never
 /// writes a predictable-named script an attacker could pre-stage in the shared

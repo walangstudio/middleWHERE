@@ -19,3 +19,16 @@ pub(crate) mod prompt;
 pub(crate) mod service;
 pub mod store;
 pub mod wizard;
+
+/// Run a config-touching `mwsqlctl` command, auto-elevating on Windows service
+/// mode so it does not just fail against the admin-locked state dir. The bin
+/// wraps its command dispatch (everything except the self-elevating `init` /
+/// `wizard`) in this.
+pub fn run_elevated_or<F: FnOnce() -> anyhow::Result<()>>(
+    service: bool,
+    uac: bool,
+    needs_config: bool,
+    run: F,
+) -> anyhow::Result<()> {
+    crate::service::run_elevated_or(service, uac, needs_config, run)
+}
