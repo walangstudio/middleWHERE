@@ -8,8 +8,7 @@ use mw_core::state::{default_state_dir, env_flag, resolve_cli_target};
 
 use mwsqlctl::installer::InstallParams;
 use mwsqlctl::ops::{self, Target};
-use mwsqlctl::wizard;
-use mwsqlctl::{audit_tail, bastion, cred, envs, policy};
+use mwsqlctl::{audit_tail, bastion, cred, envs, init, policy, wizard};
 
 #[derive(Parser)]
 #[command(name = "mwsqlctl", version, about = "middleWHERE admin CLI")]
@@ -36,8 +35,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate a master key, seal an empty config, and create state dirs.
-    Init,
+    /// Install middleWHERE as a managed service: self-elevates, creates the
+    /// system account, seeds the sealed config, writes the hardened unit, and
+    /// starts it, then offers to configure connections. Pass `--user` to seed a
+    /// per-user config instead (no service, no elevation).
+    Init(InitArgs),
     /// Manage bastions.
     #[command(subcommand)]
     Bastion(BastionCmd),
@@ -60,14 +62,16 @@ enum Cmd {
     Grant(GrantArgs),
     /// Import an existing `.env` + `secrets/` deployment into the sealed config.
     Import(ImportArgs),
-    /// Guided end-to-end setup. Defaults to a systemd service deployment
-    /// (self-elevates), or pass `--user` for a per-user install.
+    /// Configure connections (bastions, credentials, envs) on an
+    /// already-installed deployment, then restart the service. Run `init`
+    /// first. Service mode self-elevates; `--user` configures the per-user
+    /// deployment.
     #[command(alias = "setup")]
     Wizard(WizardArgs),
 }
 
 #[derive(Args)]
-struct WizardArgs {
+struct InitArgs {
     /// Service name for the generated systemd unit + system account.
     #[arg(long, default_value = "mwsqld")]
     service_name: String,
@@ -75,6 +79,13 @@ struct WizardArgs {
     /// sibling of this executable.
     #[arg(long)]
     exec_path: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct WizardArgs {
+    /// Service to restart after applying config (service mode).
+    #[arg(long, default_value = "mwsqld")]
+    service_name: String,
 }
 
 #[derive(Args)]
@@ -251,14 +262,23 @@ fn main() -> Result<()> {
     let user = cli.user || env_flag("MW_USER");
     let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
 
-    // The wizard owns its own mode/elevation resolution from the raw flags.
-    if let Cmd::Wizard(w) = cli.cmd {
+    // init and the wizard own their own mode/elevation resolution from the raw
+    // flags, so dispatch them before resolving a single Target.
+    if let Cmd::Wizard(w) = &cli.cmd {
         return wizard::run(wizard::WizardOpts {
-            state_dir: cli.state_dir,
+            state_dir: cli.state_dir.clone(),
             user,
             file_keystore,
-            service_name: w.service_name,
-            exec_path: w.exec_path,
+            service_name: w.service_name.clone(),
+        });
+    }
+    if let Cmd::Init(a) = &cli.cmd {
+        return init::run(init::InitOpts {
+            state_dir: cli.state_dir.clone(),
+            user,
+            file_keystore,
+            service_name: a.service_name.clone(),
+            exec_path: a.exec_path.clone(),
         });
     }
 
@@ -266,14 +286,7 @@ fn main() -> Result<()> {
     let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {
-        Cmd::Wizard(_) => unreachable!("handled above"),
-        Cmd::Init => {
-            ops::init(t)?;
-            eprintln!("initialized at {}", state_dir.display());
-            eprintln!(
-                "to run continuously as a managed service, see: mwsqlctl install-service --help"
-            );
-        }
+        Cmd::Wizard(_) | Cmd::Init(_) => unreachable!("handled above"),
         Cmd::Bastion(BastionCmd::Add(a)) => {
             let name = a.name.clone();
             ops::add_bastion(
