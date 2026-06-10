@@ -328,9 +328,7 @@ fn add_envs_loop(t: Target) -> Result<bool> {
             },
         ) {
             Ok(out) => {
-                println!("  env {name} -> 127.0.0.1:{}", out.listen_port);
-                println!("    client:  mwsql login {name} --port {}", out.listen_port);
-                println!("    token (save now, shown once): {}", out.token.expose());
+                crate::print_token_block(&name, out.listen_port, out.token.expose());
                 added = true;
             }
             Err(e) => eprintln!("  ! {e}"),

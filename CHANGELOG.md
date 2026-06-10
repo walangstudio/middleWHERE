@@ -54,6 +54,20 @@ versions are fixes only.
   whose result was not visible to the later `sudo`, which was the original cause
   of the broken service install.
 
+### Fixed
+
+- **`cred add --user` paniced** (clap "could not downcast to bool ... String"):
+  the credential's backend-user flag collided with the global `--user`
+  deployment flag added this release. Renamed to **`--db-user`**. A
+  `Cli::command().debug_assert()` test now guards against this class of arg
+  conflict.
+- The one-time client token is printed as an **unmissable block** (env name,
+  token, port, connection details) by `env add`, `grant`, and the wizard, so it
+  can't be scrolled past — previously a single easily-missed line. On Windows the
+  Read/inspect commands (`env list`, `cred list`, `grant`, `audit-tail`) and
+  service-mode `init` / `wizard` self-elevate via UAC instead of failing against
+  the admin-locked state dir.
+
 ## [0.2.2] - 2026-05-29
 
 ### Changed

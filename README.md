@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-168%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -229,7 +229,7 @@ the one login the two staging environments will share:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --user <db-user>
+  cred add <staging-cred> --db-user <db-user>
 # backend password: ‹typed, hidden›
 ```
 
@@ -238,14 +238,14 @@ second credential entry with the same `--user` value:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <prod-cred> --user <db-user>
+  cred add <prod-cred> --db-user <db-user>
 ```
 
 And the local Docker database's login:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <local-cred> --user <db-user>
+  cred add <local-cred> --db-user <db-user>
 ```
 
 **Environments.** The two staging envs name the *same* credential and the
@@ -303,7 +303,7 @@ Redirect from a file you create out-of-band and then destroy:
 umask 077
 printf '%s' "$SECRET_FROM_VAULT" > /dev/shm/pw   # $SECRET injected by your CI secret store
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --user <db-user> --password-stdin < /dev/shm/pw
+  cred add <staging-cred> --db-user <db-user> --password-stdin < /dev/shm/pw
 shred -u /dev/shm/pw
 ```
 
@@ -311,7 +311,7 @@ shred -u /dev/shm/pw
 # Windows (PowerShell 7+). On Windows PowerShell 5.1 wrap in: cmd /c "mwsqlctl ... < pw.txt"
 $env:SECRET_FROM_VAULT | Out-File -NoNewline -Encoding ascii pw.txt
 mwsqlctl --state-dir <state-dir> --file-keystore `
-  cred add <staging-cred> --user <db-user> --password-stdin < pw.txt
+  cred add <staging-cred> --db-user <db-user> --password-stdin < pw.txt
 Remove-Item pw.txt
 ```
 

@@ -160,8 +160,11 @@ struct BastionAddArgs {
 enum CredCmd {
     Add {
         name: String,
-        #[arg(long)]
-        user: String,
+        /// Backend database username this credential logs in as. Named
+        /// `--db-user` (not `--user`) to avoid the global `--user` deployment
+        /// flag.
+        #[arg(long = "db-user")]
+        db_user: String,
         #[arg(long)]
         password_stdin: bool,
     },
@@ -336,10 +339,10 @@ fn main() -> Result<()> {
             }
             Cmd::Cred(CredCmd::Add {
                 name,
-                user,
+                db_user,
                 password_stdin,
             }) => {
-                ops::add_credential(t, &name, &user, password_stdin)?;
+                ops::add_credential(t, &name, &db_user, password_stdin)?;
                 eprintln!("credential {name:?} added");
             }
             Cmd::Cred(CredCmd::Rotate {
@@ -375,12 +378,8 @@ fn main() -> Result<()> {
                         max_pool: a.max_pool,
                     },
                 )?;
-                eprintln!(
-                    "env {name:?} added, listening on 127.0.0.1:{}",
-                    out.listen_port
-                );
-                eprintln!("Client token (save now — will not be shown again):");
-                println!("{}", out.token.expose());
+                eprintln!("env {name:?} added.");
+                mwsqlctl::print_token_block(&name, out.listen_port, out.token.expose());
             }
             Cmd::Env(EnvCmd::Rm { name }) => {
                 envs::rm(&state_dir, &ks, &name)?;
@@ -457,11 +456,8 @@ fn main() -> Result<()> {
                 } else {
                     eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
                 }
-                eprintln!("Deliver the line below to that identity over a secure channel.");
-                eprintln!("They run it, then paste the token at the prompt:\n");
-                eprintln!("  mwsql login {} --port {}", g.env, out.listen_port);
-                eprintln!("\nToken (shown once):");
-                println!("{}", out.token.expose());
+                eprintln!("Deliver the token below to that identity over a secure channel.");
+                mwsqlctl::print_token_block(&g.env, out.listen_port, out.token.expose());
             }
             Cmd::Import(i) => {
                 let report = mwsqlctl::import_poc::import(&state_dir, &ks, &i.from_dir)?;
@@ -496,6 +492,31 @@ mod tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // Catches arg-definition conflicts (e.g. a subcommand flag colliding with a
+    // global one) at test time instead of panicking at runtime on parse.
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    // Regression: the global `--user` deployment flag (bool) must not collide
+    // with `cred add`'s backend-user flag (String) — that paniced with a clap
+    // downcast error. The latter is `--db-user`.
+    #[test]
+    fn cred_add_db_user_parses_without_global_user_collision() {
+        let cli =
+            Cli::try_parse_from(["mwsqlctl", "cred", "add", "local", "--db-user", "root"]).unwrap();
+        assert!(!cli.user, "global --user must default off here");
+        match cli.cmd {
+            Cmd::Cred(CredCmd::Add { name, db_user, .. }) => {
+                assert_eq!(name, "local");
+                assert_eq!(db_user, "root");
+            }
+            _ => panic!("expected cred add"),
+        }
     }
 
     #[test]

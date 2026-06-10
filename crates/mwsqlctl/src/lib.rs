@@ -20,6 +20,25 @@ pub(crate) mod service;
 pub mod store;
 pub mod wizard;
 
+/// Print the per-env client token as an unmissable block. The token is shown
+/// **once** (only its hash is stored), so it must be impossible to scroll past
+/// unnoticed. Used by `env add`, `grant`, and the wizard so the operator always
+/// sees the same prominent output.
+pub fn print_token_block(env: &str, port: u16, token: &str) {
+    let bar = "=".repeat(70);
+    println!("\n{bar}");
+    println!("  CLIENT TOKEN  —  SAVE NOW (shown only once)");
+    println!("{bar}");
+    println!("  env:     {env}");
+    println!("  token:   {token}");
+    println!("  connect: mwsql login {env} --port {port}");
+    println!(
+        "           any client -> host 127.0.0.1  port {port}  user {env}  \
+         password <token>  ssl off"
+    );
+    println!("{bar}\n");
+}
+
 /// Run a config-touching `mwsqlctl` command, auto-elevating on Windows service
 /// mode so it does not just fail against the admin-locked state dir. The bin
 /// wraps its command dispatch (everything except the self-elevating `init` /
