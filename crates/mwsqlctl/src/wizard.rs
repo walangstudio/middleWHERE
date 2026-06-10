@@ -34,9 +34,27 @@ pub struct WizardOpts {
     pub file_keystore: bool,
     /// Which service to restart after applying config (service mode only).
     pub service_name: String,
+    /// Set on the Windows UAC-relaunched child (see [`crate::init::InitOpts`]).
+    pub uac: bool,
 }
 
 pub fn run(opts: WizardOpts) -> Result<()> {
+    // Pause the throwaway elevated console so its output stays readable, but
+    // only with a real console to read Enter from (a piped `--uac` run won't
+    // hang). See init.rs for the rationale.
+    let uac = cfg!(windows) && opts.uac;
+    let result = run_inner(opts);
+    if uac && std::io::stdin().is_terminal() {
+        if let Err(e) = &result {
+            eprintln!("\nError: {e:#}");
+        }
+        let _ = crate::prompt::read_line("\nDone. Press Enter to close this window:");
+        return Ok(());
+    }
+    result
+}
+
+fn run_inner(opts: WizardOpts) -> Result<()> {
     let service = !opts.user;
 
     // Interactive-only. Fail BEFORE elevating when there's no terminal to
@@ -53,9 +71,10 @@ pub fn run(opts: WizardOpts) -> Result<()> {
         service::validate_service_name(&opts.service_name)?;
     }
 
-    // Configuring writes to the root-owned state dir, so service mode needs
-    // root. Elevate-first (Linux, not already root) before any prompt.
-    if service && cfg!(target_os = "linux") && !service::is_root() && !service::already_elevated() {
+    // Configuring writes to the root-owned/Admin-owned state dir, so service
+    // mode needs root (Linux) / admin (Windows). Elevate-first before any
+    // prompt: `sudo` re-exec on Linux, a UAC relaunch on Windows.
+    if service && service::needs_service_elevation(opts.uac) {
         let forward = forwarded_args(&opts);
         let target_dir = opts.state_dir.clone().unwrap_or_else(default_state_dir);
         let reason = format!(
@@ -64,7 +83,7 @@ pub fn run(opts: WizardOpts) -> Result<()> {
             target_dir.display(),
             opts.service_name
         );
-        return service::elevate_or_print("wizard", &forward, &reason);
+        return service::elevate_for_service("wizard", &forward, &reason);
     }
 
     let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
@@ -139,6 +158,11 @@ pub(crate) fn finalize_service_config(
 ) -> Result<()> {
     if cfg!(target_os = "linux") && service::is_root() {
         service::chown_state_dir(state_dir, service_name)?;
+        if changed {
+            service::restart_service(service_name)?;
+        }
+    } else if cfg!(windows) && service::is_admin() {
+        // Elevated (UAC relaunch / admin shell): restart for real.
         if changed {
             service::restart_service(service_name)?;
         }
@@ -349,6 +373,7 @@ mod tests {
             user: false,
             file_keystore: true,
             service_name: "mwsqld".into(),
+            uac: false,
         }
     }
 
@@ -376,6 +401,7 @@ mod tests {
             user: false,
             file_keystore: false,
             service_name: "mwsqld".into(),
+            uac: false,
         };
         let fwd: Vec<String> = forwarded_args(&o)
             .iter()

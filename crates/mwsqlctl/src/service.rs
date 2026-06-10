@@ -40,6 +40,108 @@ pub(crate) fn already_elevated() -> bool {
     std::env::var_os(ELEVATED_MARKER).is_some()
 }
 
+/// Windows elevation check. Shells out to PowerShell rather than pulling in a
+/// Win32 FFI dependency for one query; cached because it can't change within a
+/// process. The non-Windows stub mirrors `is_root`'s non-Linux stub.
+#[cfg(windows)]
+pub(crate) fn is_admin() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)",
+            ])
+            .output();
+        matches!(out, Ok(o) if o.status.success()
+            && String::from_utf8_lossy(&o.stdout).trim().eq_ignore_ascii_case("true"))
+    })
+}
+#[cfg(not(windows))]
+pub(crate) fn is_admin() -> bool {
+    false
+}
+
+/// Whether a service-mode command must elevate before it can install/configure.
+/// Linux uses the `sudo` re-exec env marker; Windows uses the `--uac` flag set
+/// on the relaunched child (UAC does not forward env vars).
+pub(crate) fn needs_service_elevation(uac_relaunched: bool) -> bool {
+    if cfg!(target_os = "linux") {
+        !is_root() && !already_elevated()
+    } else if cfg!(windows) {
+        !is_admin() && !uac_relaunched
+    } else {
+        false
+    }
+}
+
+/// Elevate `subcommand` and stop the current (unprivileged) process: `sudo`
+/// re-exec on Linux, a UAC `Start-Process -Verb RunAs` relaunch on Windows.
+/// Returns `Ok(())` meaning "handled — stop here"; the caller should `return`
+/// it. (On a successful Linux re-exec it never returns.)
+pub(crate) fn elevate_for_service(
+    subcommand: &str,
+    forward: &[OsString],
+    reason: &str,
+) -> Result<()> {
+    if cfg!(windows) {
+        relaunch_elevated_windows(subcommand, forward)
+    } else {
+        elevate_or_print(subcommand, forward, reason)
+    }
+}
+
+/// Relaunch self elevated via UAC. The elevated child runs in its own new
+/// console; we pass `--uac` so it knows not to re-elevate and to pause before
+/// closing (so the one-time token stays readable).
+#[cfg(windows)]
+fn relaunch_elevated_windows(subcommand: &str, forward: &[OsString]) -> Result<()> {
+    let me = std::env::current_exe().context("resolve current exe")?;
+    // PowerShell single-quoted array: '<sub>','<arg>',…,'--uac'.
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut parts: Vec<String> = vec![quote(subcommand)];
+    parts.extend(forward.iter().map(|a| quote(&a.to_string_lossy())));
+    parts.push(quote("--uac"));
+    let script = format!(
+        "Start-Process -FilePath {} -Verb RunAs -ArgumentList {}",
+        quote(&me.to_string_lossy()),
+        parts.join(",")
+    );
+    println!("Requesting administrator privileges (a UAC prompt will appear)…");
+    println!("Setup continues in a new elevated window.");
+    let status = run_powershell(&script).context("launch elevated process via PowerShell")?;
+    if !status.success() {
+        bail!(
+            "elevation was cancelled or failed. Re-run from an elevated PowerShell, \
+             or run the printed service script as Administrator."
+        );
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn relaunch_elevated_windows(_subcommand: &str, _forward: &[OsString]) -> Result<()> {
+    Ok(())
+}
+
+/// Run a PowerShell script via `-EncodedCommand` (base64 UTF-16LE). Avoids
+/// command-line quoting/injection entirely, and — unlike a temp `.ps1` — never
+/// writes a predictable-named script an attacker could pre-stage in the shared
+/// temp dir before it runs elevated.
+#[cfg(windows)]
+fn run_powershell(script: &str) -> std::io::Result<std::process::ExitStatus> {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+        .status()
+}
+
 // ---- service-name validation ------------------------------------------
 
 /// A systemd service / unix account name we can safely bake into `useradd`,
@@ -219,11 +321,52 @@ pub(crate) fn install_and_enable_service(
             "  export MW_STATE_DIR={} MW_FILE_KEYSTORE=1",
             state_dir.display()
         );
+    } else if cfg!(windows) && is_admin() {
+        // Elevated already (UAC relaunch or an admin shell): run the generated
+        // PowerShell registration for real instead of printing it.
+        register_windows_service(&art.artifact, service_name)?;
+        println!("\nService {service_name} installed and started.");
+        println!("Inspect:  sc.exe query {service_name}");
     } else {
         println!("\n# ---- {service_name} service unit ----");
         print!("{}", art.artifact);
         println!("\n# ---- operator steps (run elevated) ----\n{}", art.steps);
     }
+    Ok(())
+}
+
+/// Run the generated install script (single source of truth — the same text we
+/// otherwise print) and start the service. Idempotent-ish: a re-run where the
+/// service already exists surfaces the script's error.
+#[cfg(windows)]
+fn register_windows_service(script: &str, service_name: &str) -> Result<()> {
+    // Idempotent: if the service already exists, don't re-run `sc create` (which
+    // would fail) — just make sure it's started.
+    let exists = Command::new("sc.exe")
+        .args(["query", service_name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if exists {
+        println!("Service {service_name} already registered — ensuring it is started.");
+        let _ = Command::new("sc.exe")
+            .args(["start", service_name])
+            .status();
+        return Ok(());
+    }
+    // Run the generated install script in-memory (no temp file on disk).
+    let status = run_powershell(script).context("run service install script")?;
+    if !status.success() {
+        bail!(
+            "service install failed (is the {service_name} service already registered? \
+             `sc.exe delete {service_name}` to recreate)"
+        );
+    }
+    run_cmd("sc.exe", &["start", service_name])?;
+    Ok(())
+}
+#[cfg(not(windows))]
+fn register_windows_service(_script: &str, _service_name: &str) -> Result<()> {
     Ok(())
 }
 
@@ -233,6 +376,11 @@ pub(crate) fn install_and_enable_service(
 pub(crate) fn restart_service(name: &str) -> Result<()> {
     if cfg!(target_os = "linux") && is_root() {
         run_cmd("systemctl", &["restart", name])?;
+        println!("Restarted {name} to apply the new configuration.");
+    } else if cfg!(windows) && is_admin() {
+        // sc.exe has no atomic restart; stop (ignore "not running") then start.
+        let _ = Command::new("sc.exe").args(["stop", name]).status();
+        run_cmd("sc.exe", &["start", name])?;
         println!("Restarted {name} to apply the new configuration.");
     }
     Ok(())

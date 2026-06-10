@@ -30,9 +30,29 @@ pub struct InitOpts {
     pub service_name: String,
     /// mwsqld binary baked into the unit; defaults to a sibling of this exe.
     pub exec_path: Option<PathBuf>,
+    /// Set on the Windows UAC-relaunched child: don't re-elevate, and pause
+    /// before the (new) console closes so the one-time token stays readable.
+    pub uac: bool,
 }
 
 pub fn run(opts: InitOpts) -> Result<()> {
+    // The Windows elevated child runs in a throwaway console that vanishes on
+    // exit — pause on the way out (success or error) so its output, including
+    // the one-time token, stays readable. Only when there's a real console to
+    // read Enter from, so a piped/non-interactive `--uac` run never hangs.
+    let uac = cfg!(windows) && opts.uac;
+    let result = run_inner(opts);
+    if uac && std::io::stdin().is_terminal() {
+        if let Err(e) = &result {
+            eprintln!("\nError: {e:#}");
+        }
+        let _ = crate::prompt::read_line("\nDone. Press Enter to close this window:");
+        return Ok(());
+    }
+    result
+}
+
+fn run_inner(opts: InitOpts) -> Result<()> {
     let service = !opts.user;
 
     if service {
@@ -41,9 +61,10 @@ pub fn run(opts: InitOpts) -> Result<()> {
         service::validate_service_name(&opts.service_name)?;
     }
 
-    // Installing a service writes the root-owned state dir and registers a
-    // systemd unit → needs root. Elevate-first on Linux before anything else.
-    if service && cfg!(target_os = "linux") && !service::is_root() && !service::already_elevated() {
+    // Installing a service writes the root-owned/Admin-owned state dir and
+    // registers a unit → needs root (Linux) / admin (Windows). Elevate-first
+    // before anything else: `sudo` re-exec on Linux, a UAC relaunch on Windows.
+    if service && service::needs_service_elevation(opts.uac) {
         let forward = forwarded_args(&opts);
         let target_dir = opts.state_dir.clone().unwrap_or_else(default_state_dir);
         let reason = format!(
@@ -52,7 +73,7 @@ pub fn run(opts: InitOpts) -> Result<()> {
             svc = opts.service_name,
             dir = target_dir.display(),
         );
-        return service::elevate_or_print("init", &forward, &reason);
+        return service::elevate_for_service("init", &forward, &reason);
     }
 
     let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
@@ -149,6 +170,7 @@ mod tests {
             file_keystore: true,
             service_name: "mwsqld".into(),
             exec_path: Some(PathBuf::from("/usr/local/bin/mwsqld")),
+            uac: false,
         }
     }
 
@@ -178,6 +200,7 @@ mod tests {
             file_keystore: false,
             service_name: "mwsqld".into(),
             exec_path: None,
+            uac: false,
         };
         let fwd: Vec<String> = forwarded_args(&o)
             .iter()

@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long, global = true)]
     file_keystore: bool,
 
+    /// Internal: set on the Windows UAC-relaunched child so it does not
+    /// re-elevate and pauses before its console closes.
+    #[arg(long, global = true, hide = true)]
+    uac: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -270,6 +275,7 @@ fn main() -> Result<()> {
             user,
             file_keystore,
             service_name: w.service_name.clone(),
+            uac: cli.uac,
         });
     }
     if let Cmd::Init(a) = &cli.cmd {
@@ -279,6 +285,7 @@ fn main() -> Result<()> {
             file_keystore,
             service_name: a.service_name.clone(),
             exec_path: a.exec_path.clone(),
+            uac: cli.uac,
         });
     }
 
