@@ -139,15 +139,20 @@ fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
-async fn build_env_runtime(
+/// Resolve the credential, open the bastion forward (if any), and build the
+/// engine's backend pool. Shared by `Daemon::bind` (which then binds a
+/// listener) and [`test_envs`] (which then probes one live connection). The
+/// pool itself is lazy: this opens the SSH tunnel but NOT a backend connection
+/// — startup stays as forgiving as before. Any pushed [`LocalForward`] must
+/// outlive the returned backend (its pool dials 127.0.0.1:<local_port>).
+async fn establish_backend(
     name: &str,
     env: &Env,
     cfg: &Config,
-    listen_host: &str,
     bastions: &BastionRegistry,
     forwards: &mut Vec<LocalForward>,
     allow_tofu: bool,
-) -> Result<EnvRuntime> {
+) -> Result<(&'static dyn Engine, Box<dyn Backend>)> {
     let cred = cfg.credentials.get(&env.credential).ok_or_else(|| {
         anyhow!(
             "env {name} references unknown credential {}",
@@ -186,6 +191,20 @@ async fn build_env_runtime(
         .build_backend(opts, env.pool.max_size.max(1))
         .await
         .map_err(|e| anyhow!("env {name}: build backend ({:?}): {e}", env.engine))?;
+    Ok((engine, backend))
+}
+
+async fn build_env_runtime(
+    name: &str,
+    env: &Env,
+    cfg: &Config,
+    listen_host: &str,
+    bastions: &BastionRegistry,
+    forwards: &mut Vec<LocalForward>,
+    allow_tofu: bool,
+) -> Result<EnvRuntime> {
+    let (engine, backend) =
+        establish_backend(name, env, cfg, bastions, forwards, allow_tofu).await?;
     let listen_addr: SocketAddr = format!("{listen_host}:{}", env.listen_port)
         .parse()
         .map_err(|e| anyhow!("bad listen addr for env {name}: {e}"))?;
@@ -197,6 +216,72 @@ async fn build_env_runtime(
         client_auth: env.client_auth.clone(),
         listen_addr,
     })
+}
+
+/// Which envs `test_envs` probes.
+pub enum Probe {
+    One(String),
+    All,
+}
+
+/// Outcome of probing one env: `ok` plus a human-readable `reason` on failure.
+pub struct EnvProbeResult {
+    pub env: String,
+    pub ok: bool,
+    pub reason: String,
+}
+
+/// Probe backend connectivity for one env (or all). For each env this opens the
+/// bastion tunnel (if any) and forces a single real connect+auth against the
+/// backend, then tears it all down. Used by `mwsqld test`; never binds a
+/// listener and never mutates state. MsSql is reported as unsupported, not a
+/// hard error.
+pub async fn test_envs(cfg: &Config, which: Probe, allow_tofu: bool) -> Vec<EnvProbeResult> {
+    let names: Vec<String> = match which {
+        Probe::One(n) => vec![n],
+        Probe::All => cfg.envs.keys().cloned().collect(),
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        out.push(probe_one_env(cfg, &name, allow_tofu).await);
+    }
+    out
+}
+
+async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeResult {
+    let fail = |reason: String| EnvProbeResult {
+        env: name.to_string(),
+        ok: false,
+        reason,
+    };
+    let Some(env) = cfg.envs.get(name) else {
+        return fail(format!("no env named {name:?}"));
+    };
+    if env.engine == EngineKind::MsSql {
+        return fail("engine mssql not supported".to_string());
+    }
+    // Fresh registry/forwards per env; both must outlive the probe, so they are
+    // held in this scope until after the connect completes.
+    let bastions = BastionRegistry::new();
+    let mut forwards: Vec<LocalForward> = Vec::new();
+    let result: Result<()> = async {
+        let (engine, backend) =
+            establish_backend(name, env, cfg, &bastions, &mut forwards, allow_tofu).await?;
+        engine
+            .probe(backend.as_ref())
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => EnvProbeResult {
+            env: name.to_string(),
+            ok: true,
+            reason: String::new(),
+        },
+        Err(e) => fail(format!("{e:#}")),
+    }
 }
 
 async fn accept_loop(

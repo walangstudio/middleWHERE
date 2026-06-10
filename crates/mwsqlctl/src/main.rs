@@ -182,9 +182,23 @@ enum CredCmd {
 #[derive(Subcommand)]
 enum EnvCmd {
     Add(EnvAddArgs),
-    Rm { name: String },
-    RotateToken { name: String },
+    Rm {
+        name: String,
+    },
+    RotateToken {
+        name: String,
+    },
     List,
+    /// Probe an env's live connectivity (bastion + backend connect/auth) and
+    /// report. Validates an existing env after the fact; `env add` already
+    /// validates on creation.
+    Test {
+        /// Probe this env. Omit with --all to probe every env.
+        name: Option<String>,
+        /// Probe every configured env.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Args)]
@@ -210,6 +224,10 @@ struct EnvAddArgs {
     listen_port: Option<u16>,
     #[arg(long)]
     max_pool: Option<u32>,
+    /// Skip the post-add connectivity probe. By default `env add` validates the
+    /// new connection and exits non-zero if it can't reach the backend.
+    #[arg(long)]
+    no_validate: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -363,6 +381,7 @@ fn main() -> Result<()> {
             }
             Cmd::Env(EnvCmd::Add(a)) => {
                 let name = a.name.clone();
+                let no_validate = a.no_validate;
                 let out = ops::add_env(
                     t,
                     ops::EnvInput {
@@ -379,7 +398,26 @@ fn main() -> Result<()> {
                     },
                 )?;
                 eprintln!("env {name:?} added.");
-                mwsqlctl::print_token_block(&name, out.listen_port, out.token.expose());
+                // The token is one-time — always print it, even if validation
+                // then fails (the env is kept; the operator fixes and re-tests).
+                mwsqlctl::print_token_block(
+                    &name,
+                    out.listen_port,
+                    out.token.expose(),
+                    out.engine,
+                    out.database.as_deref(),
+                );
+                if !no_validate {
+                    use mwsqlctl::probe::Validation;
+                    match mwsqlctl::probe::validate(&state_dir, &ks, Some(&name)) {
+                        Validation::Ok => eprintln!("✓ connected."),
+                        Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
+                        Validation::Failed(reason) => {
+                            // Keep the env; exit non-zero so CI/scripts notice.
+                            bail!("env {name:?} added but could not connect: {reason}");
+                        }
+                    }
+                }
             }
             Cmd::Env(EnvCmd::Rm { name }) => {
                 envs::rm(&state_dir, &ks, &name)?;
@@ -402,6 +440,22 @@ fn main() -> Result<()> {
                         row.policy,
                         row.listen_port
                     );
+                }
+            }
+            Cmd::Env(EnvCmd::Test { name, all }) => {
+                use mwsqlctl::probe::Validation;
+                let target = match (&name, all) {
+                    (Some(_), false) => name.as_deref(),
+                    (None, true) => None,
+                    (None, false) => bail!("specify an env name or --all"),
+                    (Some(_), true) => bail!("specify an env name or --all, not both"),
+                };
+                match mwsqlctl::probe::validate(&state_dir, &ks, target) {
+                    Validation::Ok => {
+                        eprintln!("✓ {} connected.", name.as_deref().unwrap_or("all envs"))
+                    }
+                    Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
+                    Validation::Failed(reason) => bail!("connection failed: {reason}"),
                 }
             }
             Cmd::Policy(p) => {
@@ -457,7 +511,13 @@ fn main() -> Result<()> {
                     eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
                 }
                 eprintln!("Deliver the token below to that identity over a secure channel.");
-                mwsqlctl::print_token_block(&g.env, out.listen_port, out.token.expose());
+                mwsqlctl::print_token_block(
+                    &g.env,
+                    out.listen_port,
+                    out.token.expose(),
+                    out.engine,
+                    out.database.as_deref(),
+                );
             }
             Cmd::Import(i) => {
                 let report = mwsqlctl::import_poc::import(&state_dir, &ks, &i.from_dir)?;

@@ -49,6 +49,10 @@ pub struct EnvAddArgs<'a> {
 pub struct NewEnvOutput {
     pub token: SecretStr,
     pub listen_port: u16,
+    /// Engine + database, so the caller can render an engine-correct,
+    /// paste-ready connection URI without re-reading the config.
+    pub engine: EngineKind,
+    pub database: Option<String>,
 }
 
 pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: EnvAddArgs<'_>) -> Result<NewEnvOutput> {
@@ -106,6 +110,8 @@ pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: EnvAddArgs<'_>) -> Resul
         Ok(NewEnvOutput {
             token: token_for_return,
             listen_port,
+            engine: args.engine,
+            database: args.default_database.map(|s| s.to_string()),
         })
     })
 }
@@ -139,6 +145,8 @@ pub fn grant(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<NewEnv
         Ok(NewEnvOutput {
             token: token_for_return,
             listen_port: env.listen_port,
+            engine: env.engine,
+            database: env.default_database.clone(),
         })
     })
 }

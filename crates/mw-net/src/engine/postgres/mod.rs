@@ -62,6 +62,20 @@ impl Engine for PgEngine {
         Ok(Box::new(PgBackend(build_pg_pool(opts, max_size))))
     }
 
+    async fn probe(&self, backend: &dyn Backend) -> Result<(), EngineError> {
+        let be = backend
+            .as_any()
+            .downcast_ref::<PgBackend>()
+            .ok_or(EngineError::Unsupported)?;
+        // Forces `PgManager::create` (a real tokio-postgres startup + auth).
+        // The pooled `Client` and its spawned connection task drop on return.
+        let _client =
+            be.0.get()
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     async fn serve(
         &self,
         stream: &mut TcpStream,

@@ -30,6 +30,20 @@ versions are fixes only.
 - `MW_STATE_DIR`, `MW_FILE_KEYSTORE`, and `MW_USER` environment variables back
   the corresponding global flags on `mwsqld` / `mwsqlctl`, so a service operator
   exports them once instead of repeating `--state-dir … --file-keystore`.
+- **Connection validation on add.** Adding an environment now opens the bastion
+  tunnel (if any) and forces a real connect+auth against the backend, so a wrong
+  host / password / unreachable bastion is caught at setup, not at first query.
+  The wizard reports the failure and offers keep / edit & retry / discard; the
+  scripted `mwsqlctl env add` validates by default, keeps the env, and exits
+  non-zero on failure (`--no-validate` skips it). New `mwsqld test --env <name>
+  | --all [--json]` does the probe; new `mwsqlctl env test <env> | --all`
+  re-checks an existing env. The probe lives in the daemon (which already has the
+  SSH + DB stack); `mwsqlctl` shells out to it and stays networking-dependency-free.
+- **Paste-ready connection output.** `env add` / `grant` / the wizard now print a
+  DBeaver-style field list (host / port / database / user / password / SSL off)
+  and a ready-to-use engine URL (`postgresql://…?sslmode=disable`, `mysql://…`)
+  alongside the token, so a non-technical operator never has to translate the
+  terse one-liner into a client's connection dialog.
 
 ### Changed
 

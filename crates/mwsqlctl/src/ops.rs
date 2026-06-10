@@ -310,6 +310,10 @@ mod tests {
         .unwrap();
 
         assert!(!out.token.expose().is_empty());
+        // NewEnvOutput carries engine + database so callers can render an
+        // engine-correct connection URI without re-reading the config.
+        assert_eq!(out.engine, EngineKind::MySql);
+        assert_eq!(out.database, None);
         let envs = envs::list(tmp.path(), &ks).unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "stage");

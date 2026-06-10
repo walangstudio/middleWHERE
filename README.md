@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-184%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -120,10 +120,20 @@ the wizard while still elevated.
 
 The wizard adds bastions, credentials, and environments — passwords are prompted
 and masked, never on the command line — then restarts the service so the new
-loopback listeners bind. Run it again any time to add or change connections:
+loopback listeners bind. After you add an environment it **validates the
+connection** (opens the bastion tunnel, then connects and authenticates to the
+real database); if it can't reach the backend it tells you why and offers to keep
+it, edit and retry, or discard. Run it again any time to add or change
+connections:
 
 ```sh
 mwsqlctl wizard
+```
+
+Re-check a connection at any time:
+
+```sh
+mwsqlctl env test <env>      # or --all
 ```
 
 For a per-user deployment with no service and no elevation (handy for local
@@ -282,6 +292,11 @@ mwsqlctl --state-dir <state-dir> --file-keystore env add <local> \
   --database <app> --credential <local-cred> --listen-port <6033>
 ```
 
+`env add` validates the connection after writing it and exits non-zero if it
+can't reach the backend (the env is still saved, so a transient outage doesn't
+lose your input — fix it and run `mwsqlctl env test <env>`). Pass `--no-validate`
+to skip the probe, e.g. when provisioning an env before its database exists.
+
 Every env defaults to `read-only`. Pass `--policy read-write` at creation, or
 flip it later:
 
@@ -328,7 +343,8 @@ whoever needs that env; rotating it kills the old one:
 mwsqlctl --state-dir <state-dir> --file-keystore grant <staging-1>
 ```
 
-That prints the connection line and the token.
+That prints the token once, plus the DBeaver-style field list and a paste-ready
+connection URL (see [Running queries](#running-queries)).
 
 ### Running queries
 
@@ -338,7 +354,26 @@ Start the daemon (foreground, or as the service above):
 mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-Connect with any client. With `psql` against a Postgres env:
+Connect with any client. When you `env add` or `grant`, middleWHERE prints the
+exact fields to paste into a GUI client and a ready-to-use connection URL, so you
+never have to translate anything:
+
+```
+  DBeaver / any SQL client — enter these fields:
+    Host:      127.0.0.1
+    Port:      6433
+    Database:  app
+    Username:  staging-1
+    Password:  <token>
+    SSL:       off / disable
+
+  paste-ready URL (embeds the token — treat it like the password):
+    postgresql://staging-1:<token>@127.0.0.1:6433/app?sslmode=disable
+```
+
+The local port has no TLS (it only listens on loopback), so turn SSL **off** in
+the client and log in with the environment name as the username and the token as
+the password. With `psql` against a Postgres env:
 
 ```sh
 PGPASSWORD=<token> psql -h 127.0.0.1 -p <6433> -U <staging-1> -d <app> -c 'SELECT 1'

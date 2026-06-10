@@ -299,42 +299,100 @@ fn add_envs_loop(t: Target) -> Result<bool> {
             println!("  (no credentials yet — add one first; skipping envs)");
             break;
         }
-        let name = prompt_text("Env name:")?;
-        let backend_host = prompt_text("Backend DB host:")?;
-        let engine = match select_index("Engine:", &["mysql", "postgres"])? {
-            1 => EngineKind::Postgres,
-            _ => EngineKind::MySql,
-        };
-        let backend_port = prompt_optional_port("Backend port (blank = engine default):")?;
-        let bastion = pick_optional("Bastion (reuse or none):", bastion_names(t)?)?;
-        let credential = select_owned("Credential (reuse):", &creds)?;
-        let policy = match select_index("Policy:", &["read-only", "read-write"])? {
-            1 => Policy::ReadWrite,
-            _ => Policy::ReadOnly,
-        };
-        match ops::add_env(
-            t,
-            ops::EnvInput {
-                name: name.clone(),
-                backend_host,
-                backend_port,
-                engine,
-                database: None,
-                bastion,
-                credential,
-                policy,
-                listen_port: None,
-                max_pool: None,
-            },
-        ) {
-            Ok(out) => {
-                crate::print_token_block(&name, out.listen_port, out.token.expose());
-                added = true;
+        let bastions = bastion_names(t)?;
+        let mut pending = prompt_env_input(&creds, bastions.clone())?;
+        // Add, then validate the live connection. On a connect failure, ask the
+        // operator what to do (keep / edit & retry / discard).
+        loop {
+            let name = pending.name.clone();
+            let out = match ops::add_env(t, pending) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("  ! {e}");
+                    break;
+                }
+            };
+            let print_block = |o: &envs::NewEnvOutput| {
+                crate::print_token_block(
+                    &name,
+                    o.listen_port,
+                    o.token.expose(),
+                    o.engine,
+                    o.database.as_deref(),
+                );
+            };
+            match crate::probe::validate(t.state_dir, t.ks, Some(&name)) {
+                crate::probe::Validation::Ok => {
+                    println!("  ✓ connected");
+                    print_block(&out);
+                    added = true;
+                    break;
+                }
+                crate::probe::Validation::Skipped(note) => {
+                    println!("  (validation skipped: {note})");
+                    print_block(&out);
+                    added = true;
+                    break;
+                }
+                crate::probe::Validation::Failed(reason) => {
+                    println!("  ✗ could not connect: {reason}");
+                    match select_index("What now?", &["keep anyway", "edit & retry", "discard"])? {
+                        0 => {
+                            print_block(&out);
+                            println!(
+                                "  ! saved without a working connection — fix it and re-test:"
+                            );
+                            println!("      mwsqlctl env test {name}");
+                            added = true;
+                            break;
+                        }
+                        1 => {
+                            envs::rm(t.state_dir, t.ks, &name)?;
+                            pending = prompt_env_input(&creds, bastions.clone())?;
+                            continue;
+                        }
+                        _ => {
+                            envs::rm(t.state_dir, t.ks, &name)?;
+                            println!("  discarded {name}");
+                            break;
+                        }
+                    }
+                }
             }
-            Err(e) => eprintln!("  ! {e}"),
         }
     }
     Ok(added)
+}
+
+/// Prompt the env fields into an [`ops::EnvInput`]. Factored out so the
+/// validate-failed "edit & retry" path can re-collect them.
+fn prompt_env_input(creds: &[String], bastions: Vec<String>) -> Result<ops::EnvInput> {
+    let name = prompt_text("Env name:")?;
+    let backend_host = prompt_text("Backend DB host:")?;
+    let engine = match select_index("Engine:", &["mysql", "postgres"])? {
+        1 => EngineKind::Postgres,
+        _ => EngineKind::MySql,
+    };
+    let backend_port = prompt_optional_port("Backend port (blank = engine default):")?;
+    let database = prompt_optional_text("Default database (blank = none):")?;
+    let bastion = pick_optional("Bastion (reuse or none):", bastions)?;
+    let credential = select_owned("Credential (reuse):", creds)?;
+    let policy = match select_index("Policy:", &["read-only", "read-write"])? {
+        1 => Policy::ReadWrite,
+        _ => Policy::ReadOnly,
+    };
+    Ok(ops::EnvInput {
+        name,
+        backend_host,
+        backend_port,
+        engine,
+        database,
+        bastion,
+        credential,
+        policy,
+        listen_port: None,
+        max_pool: None,
+    })
 }
 
 fn bastion_names(t: Target) -> Result<Vec<String>> {

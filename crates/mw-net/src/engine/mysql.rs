@@ -69,6 +69,20 @@ impl Engine for MySqlEngine {
         Ok(Box::new(MySqlBackend(build_pool(opts, max_size))))
     }
 
+    async fn probe(&self, backend: &dyn Backend) -> Result<(), EngineError> {
+        let be = backend
+            .as_any()
+            .downcast_ref::<MySqlBackend>()
+            .ok_or(EngineError::Unsupported)?;
+        // Checking out one connection forces `BackendManager::create`, i.e. a
+        // real `mysql_async` dial + auth. Dropped immediately on success.
+        let _conn =
+            be.0.get()
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     async fn serve(
         &self,
         stream: &mut TcpStream,
