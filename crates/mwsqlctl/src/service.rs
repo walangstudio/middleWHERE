@@ -437,6 +437,79 @@ pub(crate) fn restart_service(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stop and remove the OS service — the inverse of [`install_and_enable_service`].
+/// Linux+root: `systemctl disable --now` then delete the unit and reload. Windows
+/// +admin: `sc.exe stop` then `sc.exe delete`. Idempotent: an already-absent
+/// service is reported, not an error. When not elevated (or on macOS, which never
+/// auto-installs), it prints the manual commands instead of failing — the caller
+/// has already elevated in the normal service path, so this branch is the
+/// best-effort fallback.
+pub(crate) fn uninstall_service(service_name: &str) -> Result<()> {
+    if cfg!(target_os = "linux") && is_root() {
+        // disable --now both stops and disables; tolerate "not loaded".
+        let _ = Command::new("systemctl")
+            .args(["disable", "--now", service_name])
+            .status();
+        let unit = PathBuf::from(format!("/etc/systemd/system/{service_name}.service"));
+        if unit.exists() {
+            std::fs::remove_file(&unit).with_context(|| format!("remove {}", unit.display()))?;
+        }
+        let _ = Command::new("systemctl").arg("daemon-reload").status();
+        println!("Service {service_name} stopped and removed.");
+    } else if cfg!(windows) && is_admin() {
+        // sc.exe has no atomic remove; stop first (ignore "not running"), then
+        // wait for the service process to actually exit. `sc stop` only signals
+        // a stop — the daemon keeps its handles on the state dir open until it
+        // exits, and the caller deletes that dir next, so a delete-then-remove
+        // race would otherwise leave the dir half-removed. Then delete.
+        let _ = Command::new("sc.exe").args(["stop", service_name]).status();
+        wait_for_service_stopped(service_name);
+        let deleted = Command::new("sc.exe")
+            .args(["delete", service_name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if deleted {
+            println!("Service {service_name} removed.");
+        } else {
+            println!("Service {service_name} was not registered (nothing to remove).");
+        }
+    } else {
+        println!("\n# ---- remove the service manually (run elevated) ----");
+        if cfg!(windows) {
+            println!("sc.exe stop {service_name}; sc.exe delete {service_name}");
+        } else if cfg!(target_os = "macos") {
+            println!("sudo launchctl unload -w /Library/LaunchDaemons/com.middlewhere.{service_name}.plist");
+            println!("sudo rm -f /Library/LaunchDaemons/com.middlewhere.{service_name}.plist");
+        } else {
+            println!("sudo systemctl disable --now {service_name}");
+            println!("sudo rm -f /etc/systemd/system/{service_name}.service");
+            println!("sudo systemctl daemon-reload");
+        }
+    }
+    Ok(())
+}
+
+/// Poll until the service reports STOPPED or no longer exists (bounded, ~7.5s).
+/// Used after `sc.exe stop` so the daemon has released its file handles on the
+/// state dir before we delete the service and remove that dir. Compiled on all
+/// platforms but only reached from the Windows branch of [`uninstall_service`].
+fn wait_for_service_stopped(service_name: &str) {
+    for _ in 0..30 {
+        match Command::new("sc.exe")
+            .args(["query", service_name])
+            .output()
+        {
+            // Non-zero exit means the service is already gone.
+            Ok(o) if !o.status.success() => return,
+            Ok(o) if String::from_utf8_lossy(&o.stdout).contains("STOPPED") => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(args)

@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-184%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-188%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -143,6 +143,16 @@ dev), use `--user` — you configure and run it yourself:
 mwsqlctl --user init       # seed a per-user config (OS keychain, no service)
 mwsqlctl --user wizard     # add bastions / credentials / environments
 mwsqld   --user run        # then run it
+```
+
+To tear it all down, `uninstall` is the inverse of `init` — it stops and removes
+the service and wipes the sealed config, master key, and audit log (self-elevates
+the same way). It is destructive, so it confirms first; pass `--yes` to skip the
+prompt in a script. Re-run `init` afterwards for a clean slate.
+
+```sh
+mwsqlctl uninstall            # service deployment (self-elevates, asks to confirm)
+mwsqlctl --user uninstall     # per-user deployment (no elevation)
 ```
 
 The rest of this section covers the manual commands the wizard runs, for when you

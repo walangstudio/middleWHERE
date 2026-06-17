@@ -59,6 +59,22 @@ impl KeystoreChoice {
             KeystoreChoice::File { path } => Ok(FileStore::new(path).store(key)?),
         }
     }
+    /// Remove the stored master key. Used by `uninstall`. A key that is already
+    /// gone is not an error, so teardown is idempotent. For the file backend this
+    /// deletes `master.key`; for the OS backend it removes the keychain entry that
+    /// removing the state dir would otherwise leave dangling.
+    pub fn delete(&self) -> Result<()> {
+        let r = match self {
+            KeystoreChoice::Os { service, account } => {
+                OsStore::new(service.clone(), account.clone()).delete()
+            }
+            KeystoreChoice::File { path } => FileStore::new(path).delete(),
+        };
+        match r {
+            Ok(()) | Err(crate::keyring::KeyringError::NotFound) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context("delete master key")),
+        }
+    }
 }
 
 /// System-wide state dir for a daemon running as its own service account.

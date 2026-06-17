@@ -18,6 +18,13 @@ versions are fixes only.
   offers **Configure connections now?** and runs the wizard inline while still
   elevated. `--user` seeds a per-user config (OS keychain, no service, no
   elevation) and leaves configuration to you.
+- **`mwsqlctl uninstall` removes a deployment — the inverse of `init`.** Service
+  mode self-elevates, stops and deletes the OS service, then wipes the sealed
+  config, master key (file keystore or OS keychain entry), and audit log;
+  `--user` removes the per-user deployment with no elevation. Destructive and
+  irreversible, so it confirms first and refuses to run unattended unless `--yes`
+  is given. Idempotent: an already-absent service or state dir is reported, not
+  an error.
 - **`mwsqlctl wizard` (alias `setup`) configures an already-installed
   deployment.** Guided, masked prompts for bastions / credentials / environments,
   then it restarts the service so the daemon binds the new loopback listeners

@@ -8,7 +8,7 @@ use mw_core::state::{default_state_dir, env_flag, resolve_cli_target};
 
 use mwsqlctl::installer::InstallParams;
 use mwsqlctl::ops::{self, Target};
-use mwsqlctl::{audit_tail, bastion, cred, envs, init, policy, wizard};
+use mwsqlctl::{audit_tail, bastion, cred, envs, init, policy, uninstall, wizard};
 
 #[derive(Parser)]
 #[command(name = "mwsqlctl", version, about = "middleWHERE admin CLI")]
@@ -45,6 +45,11 @@ enum Cmd {
     /// starts it, then offers to configure connections. Pass `--user` to seed a
     /// per-user config instead (no service, no elevation).
     Init(InitArgs),
+    /// Remove a deployment (the inverse of `init`): self-elevates, stops and
+    /// deletes the service, and wipes the sealed config, master key, and audit
+    /// log. Destructive and irreversible — confirms first unless `--yes`. Pass
+    /// `--user` to remove the per-user deployment (no service, no elevation).
+    Uninstall(UninstallArgs),
     /// Manage bastions.
     #[command(subcommand)]
     Bastion(BastionCmd),
@@ -91,6 +96,16 @@ struct WizardArgs {
     /// Service to restart after applying config (service mode).
     #[arg(long, default_value = "mwsqld")]
     service_name: String,
+}
+
+#[derive(Args)]
+struct UninstallArgs {
+    /// Service name to stop and remove (service mode).
+    #[arg(long, default_value = "mwsqld")]
+    service_name: String,
+    /// Skip the "are you sure?" prompt. Required for non-interactive runs.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -309,6 +324,16 @@ fn main() -> Result<()> {
             uac: cli.uac,
         });
     }
+    if let Cmd::Uninstall(a) = &cli.cmd {
+        return uninstall::run(uninstall::UninstallOpts {
+            state_dir: cli.state_dir.clone(),
+            user,
+            file_keystore,
+            service_name: a.service_name.clone(),
+            yes: a.yes,
+            uac: cli.uac,
+        });
+    }
 
     // Every remaining command reads/writes the sealed config except
     // install-service (which only renders an artifact from its args). On
@@ -321,7 +346,7 @@ fn main() -> Result<()> {
         let t = Target::new(&state_dir, &ks);
 
         match cli.cmd {
-            Cmd::Wizard(_) | Cmd::Init(_) => unreachable!("handled above"),
+            Cmd::Wizard(_) | Cmd::Init(_) | Cmd::Uninstall(_) => unreachable!("handled above"),
             Cmd::Bastion(BastionCmd::Add(a)) => {
                 let name = a.name.clone();
                 ops::add_bastion(
@@ -576,6 +601,28 @@ mod tests {
                 assert_eq!(db_user, "root");
             }
             _ => panic!("expected cred add"),
+        }
+    }
+
+    #[test]
+    fn uninstall_parses_yes_and_defaults_service_name() {
+        let cli = Cli::try_parse_from(["mwsqlctl", "uninstall", "--yes"]).unwrap();
+        match cli.cmd {
+            Cmd::Uninstall(a) => {
+                assert!(a.yes, "--yes must set yes");
+                assert_eq!(a.service_name, "mwsqld");
+            }
+            _ => panic!("expected uninstall"),
+        }
+        // Short form and a custom service name also parse.
+        let cli =
+            Cli::try_parse_from(["mwsqlctl", "uninstall", "-y", "--service-name", "mw2"]).unwrap();
+        match cli.cmd {
+            Cmd::Uninstall(a) => {
+                assert!(a.yes);
+                assert_eq!(a.service_name, "mw2");
+            }
+            _ => panic!("expected uninstall"),
         }
     }
 

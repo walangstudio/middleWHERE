@@ -19,6 +19,7 @@ pub mod probe;
 pub(crate) mod prompt;
 pub(crate) mod service;
 pub mod store;
+pub mod uninstall;
 pub mod wizard;
 
 use mw_core::config::EngineKind;
