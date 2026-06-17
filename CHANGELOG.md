@@ -89,6 +89,14 @@ versions are fixes only.
   service-mode `init` / `wizard` self-elevate via UAC instead of failing against
   the admin-locked state dir.
 
+### Security
+
+- Bumped `tokio-postgres` to 0.7.18 and `postgres-protocol` to 0.6.12 to pick up
+  RUSTSEC-2026-0178/0179/0180 — malicious/MITM-server denial-of-service fixes
+  (DataRow/hstore decode panics and unbounded SCRAM iteration). middleWHERE only
+  connects to operator-configured backends, so exposure is limited, but the
+  gateway tunnels to those backends and the fix is free.
+
 ## [0.2.2] - 2026-05-29
 
 ### Changed
