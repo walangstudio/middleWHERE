@@ -225,9 +225,12 @@ pub enum Probe {
 }
 
 /// Outcome of probing one env: `ok` plus a human-readable `reason` on failure.
+/// `supported` is false when the engine has no probe path yet (MsSql); such an
+/// env is reported but must never count as a connection failure.
 pub struct EnvProbeResult {
     pub env: String,
     pub ok: bool,
+    pub supported: bool,
     pub reason: String,
 }
 
@@ -252,13 +255,19 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
     let fail = |reason: String| EnvProbeResult {
         env: name.to_string(),
         ok: false,
+        supported: true,
         reason,
     };
     let Some(env) = cfg.envs.get(name) else {
         return fail(format!("no env named {name:?}"));
     };
     if env.engine == EngineKind::MsSql {
-        return fail("engine mssql not supported".to_string());
+        return EnvProbeResult {
+            env: name.to_string(),
+            ok: false,
+            supported: false,
+            reason: "engine mssql not supported yet".to_string(),
+        };
     }
     // Fresh registry/forwards per env; both must outlive the probe, so they are
     // held in this scope until after the connect completes.
@@ -278,6 +287,7 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
         Ok(()) => EnvProbeResult {
             env: name.to_string(),
             ok: true,
+            supported: true,
             reason: String::new(),
         },
         Err(e) => fail(format!("{e:#}")),
@@ -340,4 +350,46 @@ async fn handle_one(
         Err(_) => { /* accept already wrote the protocol's ERR frame */ }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mw_core::config::{ClientAuth, Env, PoolSettings};
+
+    fn mssql_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.envs.insert(
+            "warehouse".into(),
+            Env {
+                backend_host: "h".into(),
+                backend_port: 1433,
+                default_database: None,
+                bastion: None,
+                credential: "c".into(),
+                policy: Policy::ReadOnly,
+                client_auth: ClientAuth::NativePassword {
+                    double_sha1: [0; 20],
+                },
+                listen_port: 6033,
+                pool: PoolSettings::default(),
+                engine: EngineKind::MsSql,
+            },
+        );
+        cfg
+    }
+
+    #[tokio::test]
+    async fn mssql_env_is_unsupported_not_a_connect_failure() {
+        let cfg = mssql_config();
+        let results = test_envs(&cfg, Probe::One("warehouse".into()), false).await;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(!r.ok, "mssql env cannot report a live connection");
+        assert!(
+            !r.supported,
+            "mssql must be flagged unsupported, not failed"
+        );
+        assert!(r.reason.contains("not supported"), "{}", r.reason);
+    }
 }

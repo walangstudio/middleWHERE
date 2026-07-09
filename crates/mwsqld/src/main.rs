@@ -58,8 +58,9 @@ enum Cmd {
         /// Probe every configured env.
         #[arg(long)]
         all: bool,
-        /// Machine-readable output: one `{"ok":bool,"env":str,"reason":str}`
-        /// JSON line per env.
+        /// Machine-readable output: one
+        /// `{"ok":bool,"supported":bool,"env":str,"reason":str}` JSON line per
+        /// env. `supported` is false for engines with no probe path (mssql).
         #[arg(long)]
         json: bool,
         /// Accept an unpinned bastion host key (TOFU) during the probe. Without
@@ -96,10 +97,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // The Windows service path must run BEFORE any tokio runtime: the SCM
-    // dispatcher blocks and owns its own runtime internally.
+    // dispatcher blocks and owns its own runtime internally. Resolve the same
+    // target the binPath's `--state-dir`/`--file-keystore` flags select so the
+    // service reads what `init` seeded, not the compiled-in default.
     #[cfg(windows)]
     if let Cmd::Service = cli.cmd {
-        return mwsqld::winsvc::run();
+        let user = cli.user || env_flag("MW_USER");
+        let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+        let (state_dir, keystore) = resolve_cli_target(cli.state_dir.clone(), user, file_keystore);
+        return mwsqld::winsvc::run(state_dir, keystore);
     }
 
     let user = cli.user || env_flag("MW_USER");
@@ -149,16 +155,20 @@ fn main() -> Result<()> {
                 let results = mwsqld::test_envs(&cfg, which, allow_tofu).await;
                 let mut all_ok = true;
                 for r in &results {
-                    all_ok &= r.ok;
+                    // An unsupported engine is reported but never fails the run.
+                    all_ok &= r.ok || !r.supported;
                     if json {
                         println!(
-                            "{{\"ok\":{},\"env\":\"{}\",\"reason\":\"{}\"}}",
+                            "{{\"ok\":{},\"supported\":{},\"env\":\"{}\",\"reason\":\"{}\"}}",
                             r.ok,
+                            r.supported,
                             json_escape(&r.env),
                             json_escape(&r.reason)
                         );
                     } else if r.ok {
                         println!("OK   {}", r.env);
+                    } else if !r.supported {
+                        println!("SKIP {}  {}", r.env, r.reason);
                     } else {
                         println!("ERR  {}  {}", r.env, r.reason);
                     }

@@ -106,6 +106,10 @@ struct UninstallArgs {
     /// Skip the "are you sure?" prompt. Required for non-interactive runs.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Also delete the append-only audit log. Off by default: uninstall
+    /// preserves `<state_dir>/audit` for compliance / forensics.
+    #[arg(long)]
+    purge_audit: bool,
 }
 
 #[derive(Args)]
@@ -331,6 +335,7 @@ fn main() -> Result<()> {
             file_keystore,
             service_name: a.service_name.clone(),
             yes: a.yes,
+            purge_audit: a.purge_audit,
             uac: cli.uac,
         });
     }
@@ -341,7 +346,12 @@ fn main() -> Result<()> {
     // so wrap them: auto-elevate (relaunch in an admin console) when needed.
     let service = !user;
     let needs_config = !matches!(cli.cmd, Cmd::InstallService(_));
-    mwsqlctl::run_elevated_or(service, cli.uac, needs_config, move || {
+    // `bastion add --key-file` asks about a key passphrase via read_yes_no (a
+    // stdout/stderr prompt, not console-direct rpassword), which a redirected UAC
+    // child can't display — mark it interactive so it bails to an elevated
+    // terminal rather than relaunching into a hidden prompt.
+    let interactive = matches!(&cli.cmd, Cmd::Bastion(BastionCmd::Add(a)) if a.key_file.is_some());
+    mwsqlctl::run_elevated_or(service, cli.uac, needs_config, interactive, move || {
         let (state_dir, ks) = resolve_cli_target(cli.state_dir.clone(), user, file_keystore);
         let t = Target::new(&state_dir, &ks);
 
@@ -611,7 +621,13 @@ mod tests {
             Cmd::Uninstall(a) => {
                 assert!(a.yes, "--yes must set yes");
                 assert_eq!(a.service_name, "mwsqld");
+                assert!(!a.purge_audit, "audit is preserved unless --purge-audit");
             }
+            _ => panic!("expected uninstall"),
+        }
+        let cli = Cli::try_parse_from(["mwsqlctl", "uninstall", "-y", "--purge-audit"]).unwrap();
+        match cli.cmd {
+            Cmd::Uninstall(a) => assert!(a.purge_audit, "--purge-audit must set purge_audit"),
             _ => panic!("expected uninstall"),
         }
         // Short form and a custom service name also parse.

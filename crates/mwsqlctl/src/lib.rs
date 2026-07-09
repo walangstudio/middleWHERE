@@ -29,7 +29,12 @@ use mw_core::config::EngineKind;
 /// unnoticed. Used by `env add`, `grant`, and the wizard so the operator always
 /// sees the same prominent output. Includes a DBeaver-style field list and a
 /// paste-ready engine URI so a non-technical operator never has to translate a
-/// terse one-liner into a client's connection dialog.
+/// terse one-liner into a client's connection dialog. The whole banner goes to
+/// stderr; stdout carries exactly one line — the bare token — so
+/// `token=$(mwsqlctl grant …)` captures only the secret. On Windows from a
+/// non-elevated shell this triggers a one-time UAC prompt and then mirrors the
+/// bare token back to the (redirected) stdout, so the capture still works — it
+/// just needs stdin to be a terminal.
 pub fn print_token_block(
     env: &str,
     port: u16,
@@ -38,29 +43,30 @@ pub fn print_token_block(
     database: Option<&str>,
 ) {
     let bar = "=".repeat(70);
-    println!("\n{bar}");
-    println!("  CLIENT TOKEN  —  SAVE NOW (shown only once)");
-    println!("{bar}");
-    println!("  env:     {env}");
-    println!("  token:   {token}");
-    println!("  connect: mwsql login {env} --port {port}");
-    println!();
-    println!("  DBeaver / any SQL client — enter these fields:");
-    println!("    Host:      127.0.0.1");
-    println!("    Port:      {port}");
-    println!(
+    eprintln!("\n{bar}");
+    eprintln!("  CLIENT TOKEN  —  SAVE NOW (shown only once)");
+    eprintln!("{bar}");
+    eprintln!("  env:     {env}");
+    eprintln!("  token:   {token}");
+    eprintln!("  connect: mwsql login {env} --port {port}");
+    eprintln!();
+    eprintln!("  DBeaver / any SQL client — enter these fields:");
+    eprintln!("    Host:      127.0.0.1");
+    eprintln!("    Port:      {port}");
+    eprintln!(
         "    Database:  {}",
         database.unwrap_or("(none — pick in client)")
     );
-    println!("    Username:  {env}");
-    println!("    Password:  {token}");
-    println!("    SSL:       off / disable");
+    eprintln!("    Username:  {env}");
+    eprintln!("    Password:  {token}");
+    eprintln!("    SSL:       off / disable");
     if let Some(uri) = engine_uri(engine, env, token, port, database) {
-        println!();
-        println!("  paste-ready URL (embeds the token — treat it like the password):");
-        println!("    {uri}");
+        eprintln!();
+        eprintln!("  paste-ready URL (embeds the token — treat it like the password):");
+        eprintln!("    {uri}");
     }
-    println!("{bar}\n");
+    eprintln!("{bar}\n");
+    println!("{token}");
 }
 
 /// A paste-ready client connection URI for the local proxy listener, or `None`
@@ -109,9 +115,10 @@ pub fn run_elevated_or<F: FnOnce() -> anyhow::Result<()>>(
     service: bool,
     uac: bool,
     needs_config: bool,
+    interactive: bool,
     run: F,
 ) -> anyhow::Result<()> {
-    crate::service::run_elevated_or(service, uac, needs_config, run)
+    crate::service::run_elevated_or(service, uac, needs_config, interactive, run)
 }
 
 #[cfg(test)]

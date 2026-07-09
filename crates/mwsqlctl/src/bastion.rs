@@ -55,6 +55,24 @@ pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: BastionAddArgs<'_>) -> R
     })
 }
 
+/// Replace a bastion's pinned host keys with a single fingerprint. Used by the
+/// wizard to pin an unpinned bastion in place, without re-entering its secret.
+pub fn set_fingerprint(
+    state_dir: &Path,
+    ks: &KeystoreChoice,
+    name: &str,
+    fingerprint: HostKeyFingerprint,
+) -> Result<()> {
+    with_config(state_dir, ks, |cfg| {
+        let b = cfg
+            .bastions
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("bastion {name:?} not found"))?;
+        b.pinned_host_keys = vec![fingerprint];
+        Ok(())
+    })
+}
+
 pub fn rm(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
         let users: Vec<&str> = cfg

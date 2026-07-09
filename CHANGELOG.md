@@ -5,7 +5,7 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
-## [0.3.0] - 2026-06-10
+## [0.3.0] - 2026-07-09
 
 ### Added
 
@@ -20,11 +20,12 @@ versions are fixes only.
   elevation) and leaves configuration to you.
 - **`mwsqlctl uninstall` removes a deployment — the inverse of `init`.** Service
   mode self-elevates, stops and deletes the OS service, then wipes the sealed
-  config, master key (file keystore or OS keychain entry), and audit log;
-  `--user` removes the per-user deployment with no elevation. Destructive and
-  irreversible, so it confirms first and refuses to run unattended unless `--yes`
-  is given. Idempotent: an already-absent service or state dir is reported, not
-  an error.
+  config and master key (file keystore or OS keychain entry); `--user` removes
+  the per-user deployment with no elevation. The append-only audit log is
+  **preserved by default** (`--purge-audit` removes it too). Destructive and
+  irreversible, so it confirms first — before elevating, so the prompt is never
+  hidden in a UAC child — and refuses to run unattended unless `--yes` is given.
+  Idempotent: an already-absent service or state dir is reported, not an error.
 - **`mwsqlctl wizard` (alias `setup`) configures an already-installed
   deployment.** Guided, masked prompts for bastions / credentials / environments,
   then it restarts the service so the daemon binds the new loopback listeners
@@ -64,7 +65,11 @@ versions are fixes only.
   (`/var/lib/middlewhere`, etc.) and the **file** keystore, because the common
   deployment is a managed service. Pass `--user` for the per-user dir + OS
   keychain (the previous default). The shared resolution lives in
-  `mw_core::state::resolve_cli_target`.
+  `mw_core::state::resolve_cli_target`. An existing v0.2.x per-user deployment
+  is still honored: when no explicit target is given and the system dir is
+  unseeded, resolution falls back to the legacy per-user dir (its keystore
+  detected from `master.key` presence) with a one-line deprecation warning, so
+  upgrades don't orphan existing envs and credentials.
 
 ### Removed
 
@@ -84,10 +89,43 @@ versions are fixes only.
   conflict.
 - The one-time client token is printed as an **unmissable block** (env name,
   token, port, connection details) by `env add`, `grant`, and the wizard, so it
-  can't be scrolled past — previously a single easily-missed line. On Windows the
-  Read/inspect commands (`env list`, `cred list`, `grant`, `audit-tail`) and
-  service-mode `init` / `wizard` self-elevate via UAC instead of failing against
-  the admin-locked state dir.
+  can't be scrolled past. The block goes to **stderr**; stdout still carries
+  exactly one line — the bare token — so `token=$(mwsqlctl grant dev)` keeps
+  working (the 0.2.x scripting contract). On Windows the capture works from an
+  interactive terminal even without pre-elevating: `grant` relaunches under UAC
+  (one prompt) and mirrors the bare token back to the redirected stdout. Only a
+  fully headless call (stdin not a terminal) can't auto-elevate — run those from
+  an already-elevated context.
+- On Windows the read/inspect and config commands self-elevate via UAC instead
+  of failing against the admin-locked state dir. The relaunch **waits** for the
+  elevated child, mirrors its output back into the calling terminal, and
+  propagates its exit code (UAC cancel and a child that fails to launch both
+  surface as non-zero, never a false success). The elevated command is delivered
+  as an encoded script so argument values survive intact, the token round-trips
+  without corruption, and the child's output temp files are created with a
+  random name and fail-if-exists semantics so a same-user process can't pre-plant
+  them. With stdin or stdout redirected the relaunch refuses and asks for an
+  elevated terminal instead of silently detaching — so `grant > token.txt` can't
+  produce an empty file and piped `--password-stdin` can't hang. Interactive
+  flows (`wizard`, `bastion add --key-file`) ask for an elevated terminal rather
+  than prompting invisibly inside the UAC child.
+- The Windows service registered by `init --state-dir <custom>` now reads that
+  state dir — `mwsqld` previously ignored the baked-in `--state-dir` and loaded
+  the default location, leaving custom-dir installs with a service that saw
+  none of the configured envs.
+- macOS service-mode `init` / `wizard` / `uninstall` self-elevate via `sudo`
+  like Linux — previously they never elevated and died with a raw
+  "Permission denied" creating the system state dir.
+- `env add --engine mssql` no longer exits non-zero on a successful add:
+  engines the probe can't test yet report **validation skipped** (exit 0), and
+  `env test` marks them SKIP without failing an `--all` run.
+- The wizard no longer produces an unusable env when the bastion host-key
+  fingerprint is left blank: it warns that connections will be refused until a
+  key is pinned (with a `ssh-keyscan` hint), and the edit-&-retry loop can pin
+  a fingerprint in place. Probes and generated service units still never use
+  TOFU.
+- The Windows README install snippet verifies the archive's SHA-256 against
+  `SHA256SUMS` (parity with the removed `install.ps1` and the Linux snippet).
 
 ### Security
 

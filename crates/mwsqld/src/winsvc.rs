@@ -10,7 +10,9 @@
 //! `mwsqlctl::installer` for the rationale).
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,14 +22,25 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
+use crate::KeystoreChoice;
+
 const SERVICE_NAME: &str = "mwsqld";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 define_windows_service!(ffi_service_main, service_main);
 
+/// The state dir + keystore the service must read, parsed from the `service`
+/// subcommand's flags in `main` and stashed here before the dispatcher starts.
+/// The SCM's ServiceMain callback does not receive the process argv, so the
+/// resolved target has to reach `run_service` out-of-band.
+static SERVICE_TARGET: OnceLock<(PathBuf, KeystoreChoice)> = OnceLock::new();
+
 /// Entry point for the hidden `service` subcommand. Blocks until SCM stops
-/// the service.
-pub fn run() -> Result<()> {
+/// the service. `state_dir`/`ks` come from the same `--state-dir`/`--file-keystore`
+/// flags baked into the service binPath, so the daemon reads exactly what `init`
+/// seeded (not the compiled-in default).
+pub fn run(state_dir: PathBuf, ks: KeystoreChoice) -> Result<()> {
+    let _ = SERVICE_TARGET.set((state_dir, ks));
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
     Ok(())
 }
@@ -77,8 +90,13 @@ fn run_service() -> Result<()> {
         1,
     )?;
 
-    let state_dir = crate::default_state_dir();
-    let ks = crate::KeystoreChoice::default_file(&state_dir);
+    // `run` sets this before starting the dispatcher, so the callback always sees
+    // it. Panicking here is correct: a silent default would re-encode the
+    // wrong-state-dir bug this plumbing exists to fix.
+    let (state_dir, ks) = SERVICE_TARGET
+        .get()
+        .cloned()
+        .expect("SERVICE_TARGET set before dispatcher start");
 
     // Own the global subscriber/audit guard for the service lifetime.
     let _audit = crate::install_audit(&state_dir)?;

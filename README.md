@@ -90,7 +90,8 @@ $ver = 'v0.3.0'; $target = 'x86_64-pc-windows-msvc'
 $asset = "middlewhere-$ver-$target.zip"
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/$asset" -OutFile $asset
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/SHA256SUMS" -OutFile SHA256SUMS
-# verify, then extract:
+$expected = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($asset))).Line.Split(' ')[0]
+if ((Get-FileHash $asset -Algorithm SHA256).Hash -ne $expected) { throw "Checksum mismatch for $asset" }
 Expand-Archive $asset -DestinationPath C:\middlewhere -Force
 ```
 

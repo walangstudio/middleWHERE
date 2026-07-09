@@ -39,19 +39,7 @@ pub struct WizardOpts {
 }
 
 pub fn run(opts: WizardOpts) -> Result<()> {
-    // Pause the throwaway elevated console so its output stays readable, but
-    // only with a real console to read Enter from (a piped `--uac` run won't
-    // hang). See init.rs for the rationale.
-    let uac = cfg!(windows) && opts.uac;
-    let result = run_inner(opts);
-    if uac && std::io::stdin().is_terminal() {
-        if let Err(e) = &result {
-            eprintln!("\nError: {e:#}");
-        }
-        let _ = crate::prompt::read_line("\nDone. Press Enter to close this window:");
-        return Ok(());
-    }
-    result
+    run_inner(opts)
 }
 
 fn run_inner(opts: WizardOpts) -> Result<()> {
@@ -75,6 +63,18 @@ fn run_inner(opts: WizardOpts) -> Result<()> {
     // mode needs root (Linux) / admin (Windows). Elevate-first before any
     // prompt: `sudo` re-exec on Linux, a UAC relaunch on Windows.
     if service && service::needs_service_elevation(opts.uac) {
+        // Windows can't auto-elevate the wizard: a UAC child's stdout is
+        // redirected to a temp file, so its many interactive prompts would be
+        // invisible and it would block unseen. Send the operator to an elevated
+        // terminal instead. On unix, sudo keeps the TTY, so the re-exec below
+        // prompts normally.
+        if cfg!(windows) {
+            bail!(
+                "administrator privileges are required. Re-run `mwsqlctl wizard` from \
+                 an elevated terminal (Run as administrator), or pass --user to \
+                 configure a per-user deployment."
+            );
+        }
         let forward = forwarded_args(&opts);
         let target_dir = opts.state_dir.clone().unwrap_or_else(default_state_dir);
         let reason = format!(
@@ -250,7 +250,10 @@ fn add_bastions_loop(t: Target) -> Result<bool> {
             "Pinned host-key fingerprint <algo>:<sha256_b64> (blank to skip):",
         )? {
             Some(fp) => vec![fp],
-            None => vec![],
+            None => {
+                println!("{}", unpinned_bastion_warning(&host));
+                vec![]
+            }
         };
         // add_bastion prompts the password / passphrase in-process (masked).
         match ops::add_bastion(
@@ -349,6 +352,7 @@ fn add_envs_loop(t: Target) -> Result<bool> {
                         1 => {
                             envs::rm(t.state_dir, t.ks, &name)?;
                             pending = prompt_env_input(&creds, bastions.clone())?;
+                            ensure_bastion_pinned(t, pending.bastion.as_deref())?;
                             continue;
                         }
                         _ => {
@@ -419,6 +423,41 @@ fn pick_optional(msg: &str, names: Vec<String>) -> Result<Option<String>> {
     Ok(if pick == "(none)" { None } else { Some(pick) })
 }
 
+/// Warning shown when a bastion is left without a pinned host key. The daemon
+/// refuses every connection through an unpinned bastion (and so do the probes
+/// and service units), so the env can never validate until one is pinned.
+fn unpinned_bastion_warning(host: &str) -> String {
+    format!(
+        "  ! no host-key fingerprint pinned. Connections through this bastion WILL be\n\
+         \x20   refused until one is. Obtain it with:\n\
+         \x20     ssh-keyscan {host} | ssh-keygen -lf -\n\
+         \x20   then pin the SHA256 value as <algo>:<sha256_b64> (e.g. ssh-ed25519:AAAA…)."
+    )
+}
+
+/// After a failed env validation, if the chosen bastion has no pinned host key
+/// the connection can never succeed. Offer to pin one so the retry can work —
+/// keeps the wizard's "edit & retry" loop recoverable.
+fn ensure_bastion_pinned(t: Target, bastion: Option<&str>) -> Result<()> {
+    let Some(name) = bastion else { return Ok(()) };
+    let Some(row) = bastion::list(t.state_dir, t.ks)?
+        .into_iter()
+        .find(|b| b.name == name)
+    else {
+        return Ok(());
+    };
+    if row.pinned_fingerprints > 0 {
+        return Ok(());
+    }
+    println!("{}", unpinned_bastion_warning(&row.host));
+    if let Some(fp) = prompt_optional_text("  Pin it now as <algo>:<sha256_b64> (blank to skip):")?
+    {
+        bastion::set_fingerprint(t.state_dir, t.ks, name, ops::parse_fingerprint(&fp)?)?;
+        println!("  pinned {name}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +505,20 @@ mod tests {
         assert_eq!(
             fwd,
             vec!["--service-name".to_string(), "mwsqld".to_string()]
+        );
+    }
+
+    #[test]
+    fn unpinned_warning_states_refusal_and_how_to_obtain() {
+        let w = unpinned_bastion_warning("db.example.com");
+        assert!(w.contains("refused"), "must say connections are refused");
+        assert!(
+            w.contains("ssh-keyscan db.example.com"),
+            "must hint how to obtain the fingerprint for the host"
+        );
+        assert!(
+            w.contains("<algo>:<sha256_b64>"),
+            "must state the expected pin format"
         );
     }
 }
