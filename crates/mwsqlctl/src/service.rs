@@ -346,15 +346,23 @@ pub(crate) fn relaunch_self_elevated_unix() -> Result<()> {
 /// in service mode that isn't already privileged (`needs_elevation` folds in the
 /// per-OS not-root/not-admin + already-elevated checks). Pure so the (now
 /// cross-platform) decision is unit-testable without spawning sudo/UAC.
-fn should_elevate_config(service: bool, needs_config: bool, needs_elevation: bool) -> bool {
-    service && needs_config && needs_elevation
+fn should_elevate_config(
+    service: bool,
+    needs_config: bool,
+    target_needs_root: bool,
+    needs_elevation: bool,
+) -> bool {
+    service && needs_config && target_needs_root && needs_elevation
 }
 
 /// Wrap a config-touching command: in service mode, relaunch elevated if needed —
 /// Windows via UAC (the child re-runs verbatim and its output + exit code are
 /// mirrored back here), unix via a `sudo` re-exec — so `env add`/`cred add`/`grant`
 /// against the root-owned system dir work the same on all three platforms
-/// (`--user` never elevates; an already-root/elevated process doesn't re-elevate).
+/// (`--user` never elevates; an already-root/elevated process doesn't re-elevate;
+/// `target_needs_root` is false for a per-user or v0.2.x legacy-fallback target,
+/// which is user-writable and must run in-process so the child doesn't re-resolve
+/// in a root context that can't reach the user's config or OS keychain).
 /// Otherwise run it directly. `interactive` marks a command that prompts via
 /// stdout/stderr (not console-direct `rpassword`): on Windows those can't run in a
 /// redirected UAC child, so we bail to an elevated terminal instead of relaunching
@@ -364,10 +372,16 @@ pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
     service: bool,
     uac: bool,
     needs_config: bool,
+    target_needs_root: bool,
     interactive: bool,
     run: F,
 ) -> Result<()> {
-    if should_elevate_config(service, needs_config, needs_service_elevation(uac)) {
+    if should_elevate_config(
+        service,
+        needs_config,
+        target_needs_root,
+        needs_service_elevation(uac),
+    ) {
         #[cfg(windows)]
         {
             if interactive {
@@ -949,24 +963,32 @@ mod tests {
 
     #[test]
     fn config_elevation_decision() {
-        // R-F3: service + config-touching + not-yet-privileged → elevate (now on
-        // unix too, via sudo). The per-OS not-root/not-admin + already-elevated
-        // checks are folded into the `needs_elevation` argument.
+        // R-F3: service + config-touching + system-dir target + not-yet-privileged
+        // → elevate (now on unix too, via sudo). The per-OS not-root/not-admin +
+        // already-elevated checks are folded into the `needs_elevation` argument.
+        // Arg order: (service, needs_config, target_needs_root, needs_elevation).
         assert!(
-            should_elevate_config(true, true, true),
-            "service + needs config + not privileged must elevate"
+            should_elevate_config(true, true, true, true),
+            "service + needs config + system dir + not privileged must elevate"
         );
         assert!(
-            !should_elevate_config(false, true, true),
+            !should_elevate_config(false, true, true, true),
             "--user (service=false) must never elevate"
         );
         assert!(
-            !should_elevate_config(true, true, false),
+            !should_elevate_config(true, true, true, false),
             "already root/elevated must not re-elevate"
         );
         assert!(
-            !should_elevate_config(true, false, true),
+            !should_elevate_config(true, false, true, true),
             "install-service (needs_config=false) renders an artifact, no elevation"
+        );
+        // D fix: a per-user / v0.2.x legacy-fallback target (not the system dir)
+        // is user-writable, so it must run in-process — never sudo/UAC into a root
+        // context that can't see the user's config or OS keychain.
+        assert!(
+            !should_elevate_config(true, true, false, true),
+            "non-system (per-user/legacy) target must not elevate"
         );
     }
 

@@ -173,8 +173,13 @@ fn main() -> Result<()> {
                     // Zero envs probed (e.g. `--all` on a freshly-init'd,
                     // env-less config). An empty set is NOT "all connected":
                     // say so plainly and exit 0 without asserting any
-                    // connectivity was verified.
-                    if !json {
+                    // connectivity was verified. In JSON mode emit an explicit
+                    // marker so a caller (mwsqlctl's probe::validate) can tell
+                    // "zero envs" apart from "all envs passed" — both otherwise
+                    // print nothing and exit 0.
+                    if json {
+                        println!("{{\"envs\":0}}");
+                    } else {
                         println!("no environments configured");
                     }
                     return Ok(());

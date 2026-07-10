@@ -115,10 +115,18 @@ pub fn run_elevated_or<F: FnOnce() -> anyhow::Result<()>>(
     service: bool,
     uac: bool,
     needs_config: bool,
+    target_needs_root: bool,
     interactive: bool,
     run: F,
 ) -> anyhow::Result<()> {
-    crate::service::run_elevated_or(service, uac, needs_config, interactive, run)
+    crate::service::run_elevated_or(
+        service,
+        uac,
+        needs_config,
+        target_needs_root,
+        interactive,
+        run,
+    )
 }
 
 #[cfg(test)]

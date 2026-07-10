@@ -25,6 +25,10 @@ pub struct ProbeOutcome {
     pub ok: bool,
     pub reason: String,
     pub unsupported: Option<String>,
+    /// The daemon reported zero configured envs (`--all` on an env-less config):
+    /// an empty set is not "all connected", so the caller must not read it as a
+    /// pass. Distinguished by the daemon's `{"envs":0}` marker line.
+    pub empty: bool,
 }
 
 /// Build the argv for `mwsqld test`. Pure so it can be unit-tested without
@@ -74,7 +78,14 @@ pub fn run(daemon: &Path, argv: &[OsString]) -> Result<ProbeOutcome> {
         ok,
         reason,
         unsupported,
+        empty: has_empty_marker(&stdout),
     })
+}
+
+/// The daemon's zero-envs marker (`{"envs":0}`), emitted by `mwsqld test --all`
+/// when no envs are configured so this side can tell it apart from a clean pass.
+fn has_empty_marker(stdout: &str) -> bool {
+    stdout.lines().any(|l| l.trim() == "{\"envs\":0}")
 }
 
 /// Outcome of a validation attempt. `Skipped` is a soft pass: the probe could
@@ -105,6 +116,7 @@ pub fn validate(state_dir: &Path, ks: &KeystoreChoice, env: Option<&str>) -> Val
     let file_keystore = matches!(ks, KeystoreChoice::File { .. });
     let argv = build_probe_argv(env, state_dir, file_keystore);
     match run(&daemon, &argv) {
+        Ok(o) if o.empty => Validation::Skipped("no environments configured".to_string()),
         Ok(o) if o.ok => match o.unsupported {
             Some(note) => Validation::Skipped(note),
             None => Validation::Ok,
@@ -263,6 +275,19 @@ mod tests {
         assert!(!argv.iter().any(|a| a == "--env"));
         assert!(argv.contains(&"--user".to_string()));
         assert!(!argv.contains(&"--file-keystore".to_string()));
+    }
+
+    #[test]
+    fn zero_envs_marker_detected_but_not_a_connection_line() {
+        // The daemon's `{"envs":0}` marker means no envs were probed — must read
+        // as empty (→ Skipped), never as a failure or a pass.
+        assert!(has_empty_marker("{\"envs\":0}\n"));
+        assert!(!has_empty_marker(
+            "{\"ok\":true,\"supported\":true,\"env\":\"a\",\"reason\":\"\"}\n"
+        ));
+        assert!(!has_empty_marker(""));
+        // Not a genuine failure line, so it never surfaces as one.
+        assert_eq!(first_failure_reason("{\"envs\":0}\n"), None);
     }
 
     #[test]
