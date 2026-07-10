@@ -198,9 +198,12 @@ fn existing_config_action(t: Target) -> Result<Existing> {
 }
 
 fn show_current(t: Target) -> Result<()> {
-    let bastions = bastion::list(t.state_dir, t.ks)?;
-    let creds = cred::list(t.state_dir, t.ks)?;
-    let envs = envs::list(t.state_dir, t.ks)?;
+    // Unseal the config once (one OS-keychain unlock in --user mode) and build
+    // all three lists from it, rather than unsealing per list.
+    let cfg = mw_core::state::load_config(t.state_dir, t.ks)?;
+    let bastions = bastion::rows(&cfg);
+    let creds = cred::rows(&cfg);
+    let envs = envs::rows(&cfg);
     println!("  bastions ({}):", bastions.len());
     for b in &bastions {
         println!(
@@ -296,13 +299,15 @@ fn add_credentials_loop(t: Target) -> Result<bool> {
 
 fn add_envs_loop(t: Target) -> Result<bool> {
     let mut added = false;
+    // The cred/bastion name lists don't change inside this loop (only envs are
+    // added here), so unseal once up front instead of per iteration.
+    let creds = cred_names(t)?;
+    let bastions = bastion_names(t)?;
     while confirm("Add an environment (a client listener)?", true)? {
-        let creds = cred_names(t)?;
         if creds.is_empty() {
             println!("  (no credentials yet — add one first; skipping envs)");
             break;
         }
-        let bastions = bastion_names(t)?;
         let mut pending = prompt_env_input(&creds, bastions.clone())?;
         // Add, then validate the live connection. On a connect failure, ask the
         // operator what to do (keep / edit & retry / discard).

@@ -31,6 +31,13 @@ impl Backend for PgBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn reap_idle(&self, idle_timeout: std::time::Duration) -> usize {
+        self.0
+            .retain(|_, m| crate::idle::should_retain(m.last_used(), idle_timeout))
+            .removed
+            .len()
+    }
 }
 
 #[async_trait::async_trait]

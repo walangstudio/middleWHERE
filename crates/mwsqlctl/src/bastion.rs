@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 
-use mw_core::config::{Bastion, BastionAuth, HostKeyFingerprint};
+use mw_core::config::{Bastion, BastionAuth, Config, HostKeyFingerprint};
 use mw_core::secret::{SecretBytes, SecretStr};
 use mw_core::state::KeystoreChoice;
 
@@ -106,9 +106,14 @@ pub struct BastionRow {
 }
 
 pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<BastionRow>> {
-    let cfg = mw_core::state::load_config(state_dir, ks)?;
-    Ok(cfg
-        .bastions
+    Ok(rows(&mw_core::state::load_config(state_dir, ks)?))
+}
+
+/// Build the bastion rows from an already-unsealed config, so a caller that
+/// needs several listings at once (the wizard's "show current") unseals — and
+/// unlocks the OS keychain in `--user` mode — a single time.
+pub fn rows(cfg: &Config) -> Vec<BastionRow> {
+    cfg.bastions
         .iter()
         .map(|(name, b)| BastionRow {
             name: name.clone(),
@@ -121,5 +126,5 @@ pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<BastionRow>> {
             },
             pinned_fingerprints: b.pinned_host_keys.len(),
         })
-        .collect())
+        .collect()
 }

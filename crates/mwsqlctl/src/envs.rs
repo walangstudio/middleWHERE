@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 
-use mw_core::config::{ClientAuth, EngineKind, Env, Policy, PoolSettings};
+use mw_core::config::{ClientAuth, Config, EngineKind, Env, Policy, PoolSettings};
 use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
 use mw_core::token::{double_sha1, generate_token, sha256};
@@ -163,9 +163,13 @@ pub struct EnvRow {
 }
 
 pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<EnvRow>> {
-    let cfg = mw_core::state::load_config(state_dir, ks)?;
-    Ok(cfg
-        .envs
+    Ok(rows(&mw_core::state::load_config(state_dir, ks)?))
+}
+
+/// Build the env rows from an already-unsealed config. See
+/// [`crate::bastion::rows`] — lets the wizard unseal once for all three lists.
+pub fn rows(cfg: &Config) -> Vec<EnvRow> {
+    cfg.envs
         .iter()
         .map(|(name, e)| EnvRow {
             name: name.clone(),
@@ -176,7 +180,7 @@ pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<EnvRow>> {
             listen_port: e.listen_port,
             engine: engine_label(e.engine),
         })
-        .collect())
+        .collect()
 }
 
 pub fn engine_label(e: EngineKind) -> &'static str {

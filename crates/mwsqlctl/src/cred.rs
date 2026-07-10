@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 
-use mw_core::config::Credential;
+use mw_core::config::{Config, Credential};
 use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
 
@@ -80,13 +80,17 @@ pub struct CredRow {
 }
 
 pub fn list(state_dir: &Path, ks: &KeystoreChoice) -> Result<Vec<CredRow>> {
-    let cfg = mw_core::state::load_config(state_dir, ks)?;
-    Ok(cfg
-        .credentials
+    Ok(rows(&mw_core::state::load_config(state_dir, ks)?))
+}
+
+/// Build the credential rows from an already-unsealed config. See
+/// [`crate::bastion::rows`] — lets the wizard unseal once for all three lists.
+pub fn rows(cfg: &Config) -> Vec<CredRow> {
+    cfg.credentials
         .iter()
         .map(|(name, c)| CredRow {
             name: name.clone(),
             backend_user: c.backend_user.clone(),
         })
-        .collect())
+        .collect()
 }

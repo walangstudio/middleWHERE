@@ -46,6 +46,13 @@ enum Cmd {
         /// Without this, a bastion with no pinned host key is REFUSED.
         #[arg(long)]
         allow_tofu: bool,
+        /// Close a backend (server) connection after this many seconds of no
+        /// activity, freeing the server-side connection; activity resets the
+        /// timer. 0 disables reaping. When set, overrides every env's
+        /// configured pool idle timeout; unset, each env uses its own
+        /// (default 300).
+        #[arg(long, value_name = "SECS")]
+        idle_timeout_secs: Option<u32>,
     },
     /// Probe backend connectivity for one env (or all): open the bastion tunnel
     /// if any, force one real connect+auth, report, and exit. Reads the sealed
@@ -123,13 +130,22 @@ fn main() -> Result<()> {
             Cmd::Run {
                 listen_host,
                 allow_tofu,
+                idle_timeout_secs,
             } => {
                 // Process owns the global subscriber + audit writer guard for
                 // its whole lifetime. Not done inside Daemon::bind on purpose.
                 let _audit = mwsqld::install_audit(&state_dir)?;
-                let cfg = load_config(&state_dir, &keystore)?;
+                let mut cfg = load_config(&state_dir, &keystore)?;
                 if cfg.envs.is_empty() {
                     eprintln!("warning: no envs configured. Use mwsqlctl to add some.");
+                }
+                // The flag overrides every env's configured idle timeout. Only
+                // this in-memory copy is touched; the sealed config on disk is
+                // never rewritten.
+                if let Some(secs) = idle_timeout_secs {
+                    for env in cfg.envs.values_mut() {
+                        env.pool.idle_timeout_secs = secs;
+                    }
                 }
                 let daemon = Daemon::bind(state_dir, &cfg, &listen_host, allow_tofu).await?;
                 let (tx, rx) = tokio::sync::broadcast::channel(1);
@@ -153,6 +169,16 @@ fn main() -> Result<()> {
                 };
                 let cfg = load_config(&state_dir, &keystore)?;
                 let results = mwsqld::test_envs(&cfg, which, allow_tofu).await;
+                if results.is_empty() {
+                    // Zero envs probed (e.g. `--all` on a freshly-init'd,
+                    // env-less config). An empty set is NOT "all connected":
+                    // say so plainly and exit 0 without asserting any
+                    // connectivity was verified.
+                    if !json {
+                        println!("no environments configured");
+                    }
+                    return Ok(());
+                }
                 let mut all_ok = true;
                 for r in &results {
                     // An unsupported engine is reported but never fails the run.

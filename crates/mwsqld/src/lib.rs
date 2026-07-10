@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpListener;
@@ -17,6 +18,7 @@ use tracing::{error, info, warn};
 
 use mw_core::config::{ClientAuth, Config, EngineKind, Env, Policy};
 use mw_net::engine::{engine_for, Backend, BackendOpts, Engine};
+use mw_net::idle::reaper_interval;
 use mw_net::ssh::{start_local_forward, BastionRegistry, LocalForward};
 
 pub use mw_core::state::{
@@ -34,6 +36,9 @@ pub struct EnvRuntime {
     pub policy: Policy,
     pub client_auth: ClientAuth,
     pub listen_addr: SocketAddr,
+    /// Close this env's backend connections after this much inactivity. Zero
+    /// disables idle reaping for the env.
+    pub idle_timeout: Duration,
 }
 
 /// Install the process-global tracing + audit subscriber. This belongs in
@@ -121,6 +126,22 @@ impl Daemon {
             let mut sub = shutdown.resubscribe();
             accept_set.spawn(async move {
                 accept_loop(&env_name, listener, envs, &mut sub).await;
+            });
+        }
+        // Reap idle backend connections. One sweep task serves every env; its
+        // cadence tracks the tightest configured timeout. Skipped entirely when
+        // no env has a non-zero timeout (idle reaping fully disabled).
+        if let Some(min_timeout) = envs
+            .values()
+            .map(|e| e.idle_timeout)
+            .filter(|d| !d.is_zero())
+            .min()
+        {
+            let reap_envs = envs.clone();
+            let interval = reaper_interval(min_timeout);
+            let mut sub = shutdown.resubscribe();
+            accept_set.spawn(async move {
+                reap_loop(reap_envs, interval, &mut sub).await;
             });
         }
         let _ = shutdown.recv().await;
@@ -215,6 +236,7 @@ async fn build_env_runtime(
         policy: env.policy.clone(),
         client_auth: env.client_auth.clone(),
         listen_addr,
+        idle_timeout: Duration::from_secs(env.pool.idle_timeout_secs as u64),
     })
 }
 
@@ -291,6 +313,42 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
             reason: String::new(),
         },
         Err(e) => fail(format!("{e:#}")),
+    }
+}
+
+/// Periodically close backend connections that have gone idle past their env's
+/// timeout, freeing the server-side connection. Zero-timeout envs are skipped.
+/// Runs until shutdown; the sweep itself never touches an in-flight query (only
+/// connections sitting idle in the pool are candidates).
+async fn reap_loop(
+    envs: Arc<HashMap<String, EnvRuntime>>,
+    interval: Duration,
+    shutdown: &mut broadcast::Receiver<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => break,
+            _ = ticker.tick() => {
+                for rt in envs.values() {
+                    if rt.idle_timeout.is_zero() {
+                        continue;
+                    }
+                    let closed = rt.backend.reap_idle(rt.idle_timeout);
+                    if closed > 0 {
+                        info!(
+                            env = %rt.name,
+                            closed,
+                            timeout_secs = rt.idle_timeout.as_secs(),
+                            "closed idle backend connections"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -377,6 +435,17 @@ mod tests {
             },
         );
         cfg
+    }
+
+    #[tokio::test]
+    async fn probing_zero_envs_yields_no_results() {
+        // `mwsqld test --all` on a freshly-init'd, env-less config probes
+        // nothing. The empty result set must NOT be reported as "all
+        // connected"; the CLI treats it as an informational no-op instead.
+        let cfg = Config::default();
+        assert!(cfg.envs.is_empty());
+        let results = test_envs(&cfg, Probe::All, false).await;
+        assert!(results.is_empty(), "no env => no probe result");
     }
 
     #[tokio::test]

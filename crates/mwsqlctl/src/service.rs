@@ -319,17 +319,47 @@ pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
     args.push("--uac".to_string());
     relaunch_elevated_and_wait(&args)
 }
-#[cfg(not(windows))]
-pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
-    Ok(())
+
+/// Unix counterpart of [`relaunch_self_elevated_windows`]: re-exec the *exact*
+/// current command under `sudo` (which replaces this process). `sudo` preserves
+/// the controlling TTY — so interactive prompts still work — and the stdin pipe,
+/// so a `--password-stdin` secret still reaches the elevated child; `sudo`'s own
+/// auth reads `/dev/tty`. So a flagless `env add`/`cred add`/`grant` on
+/// Linux/macOS transparently elevates (like UAC on Windows) instead of dying with
+/// a raw "Permission denied" on the root-owned state dir. Never returns on
+/// success (exec). `ELEVATED_MARKER` stops the child re-elevating.
+#[cfg(unix)]
+pub(crate) fn relaunch_self_elevated_unix() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let me = std::env::current_exe().context("resolve current exe")?;
+    let mut argv: Vec<OsString> = vec!["--".into(), me.as_os_str().to_owned()];
+    argv.extend(std::env::args_os().skip(1));
+    println!("Re-running under sudo to reach the root-owned state dir…");
+    let err = Command::new("sudo")
+        .args(&argv)
+        .env(ELEVATED_MARKER, "1")
+        .exec();
+    Err(anyhow::Error::new(err).context("exec sudo (is sudo installed and on PATH?)"))
 }
 
-/// Wrap a config-touching command: on Windows service mode, relaunch elevated if
-/// needed (the child re-runs verbatim under UAC and its output + exit code are
-/// mirrored back here); otherwise run it directly. `interactive` marks a command
-/// that prompts via stdout/stderr (not the console-direct `rpassword`): those
-/// can't run in a redirected UAC child, so we bail to an elevated terminal
-/// instead of relaunching into an invisible, hung prompt.
+/// Whether [`run_elevated_or`] must re-exec elevated: a config-touching command
+/// in service mode that isn't already privileged (`needs_elevation` folds in the
+/// per-OS not-root/not-admin + already-elevated checks). Pure so the (now
+/// cross-platform) decision is unit-testable without spawning sudo/UAC.
+fn should_elevate_config(service: bool, needs_config: bool, needs_elevation: bool) -> bool {
+    service && needs_config && needs_elevation
+}
+
+/// Wrap a config-touching command: in service mode, relaunch elevated if needed —
+/// Windows via UAC (the child re-runs verbatim and its output + exit code are
+/// mirrored back here), unix via a `sudo` re-exec — so `env add`/`cred add`/`grant`
+/// against the root-owned system dir work the same on all three platforms
+/// (`--user` never elevates; an already-root/elevated process doesn't re-elevate).
+/// Otherwise run it directly. `interactive` marks a command that prompts via
+/// stdout/stderr (not console-direct `rpassword`): on Windows those can't run in a
+/// redirected UAC child, so we bail to an elevated terminal instead of relaunching
+/// into an invisible, hung prompt; on unix `sudo` keeps the TTY, so they prompt
+/// normally after the re-exec.
 pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
     service: bool,
     uac: bool,
@@ -337,15 +367,23 @@ pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
     interactive: bool,
     run: F,
 ) -> Result<()> {
-    if service && cfg!(windows) && needs_config && needs_service_elevation(uac) {
-        if interactive {
-            bail!(
-                "administrator privileges are required, and this command prompts \
-                 interactively. Re-run it from an elevated terminal (Run as \
-                 administrator), or pass --user for a per-user setup."
-            );
+    if should_elevate_config(service, needs_config, needs_service_elevation(uac)) {
+        #[cfg(windows)]
+        {
+            if interactive {
+                bail!(
+                    "administrator privileges are required, and this command prompts \
+                     interactively. Re-run it from an elevated terminal (Run as \
+                     administrator), or pass --user for a per-user setup."
+                );
+            }
+            return relaunch_self_elevated_windows();
         }
-        return relaunch_self_elevated_windows();
+        #[cfg(unix)]
+        {
+            let _ = interactive; // sudo keeps the TTY, so prompts still work.
+            return relaunch_self_elevated_unix();
+        }
     }
     run()
 }
@@ -416,10 +454,17 @@ pub(crate) fn elevate_or_print(subcommand: &str, forward: &[OsString], reason: &
     }
 
     // Can't prompt for the sudo confirmation without a terminal — print the
-    // exact command and stop, rather than failing half-way.
+    // exact command, then fail (non-zero). Returning Ok here would report success
+    // having seeded/installed NOTHING, so a CI/Ansible/Docker run sees `init`
+    // "succeed" and only trips on the next command against an unconfigured state
+    // dir. An operation that did nothing must not report success.
     if !std::io::stdin().is_terminal() {
         print_manual(&me, subcommand, forward);
-        return Ok(());
+        bail!(
+            "cannot elevate for `{subcommand}`: root is required but stdin is not a \
+             terminal to confirm the sudo re-exec. Nothing was changed — run the \
+             printed command under sudo."
+        );
     }
 
     println!("{reason}");
@@ -598,8 +643,11 @@ pub(crate) fn restart_service(name: &str) -> Result<()> {
         run_cmd("systemctl", &["restart", name])?;
         println!("Restarted {name} to apply the new configuration.");
     } else if cfg!(windows) && is_admin() {
-        // sc.exe has no atomic restart; stop (ignore "not running") then start.
+        // sc.exe has no atomic restart; stop (ignore "not running"), wait for the
+        // service to actually exit, then start — `sc stop` only signals a stop, so
+        // starting immediately races the pending stop ("service is stopping").
         let _ = Command::new("sc.exe").args(["stop", name]).status();
+        wait_for_service_stopped(name);
         run_cmd("sc.exe", &["start", name])?;
         println!("Restarted {name} to apply the new configuration.");
     }
@@ -659,6 +707,9 @@ pub(crate) fn uninstall_service(service_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Locale-independent service-state code from `sc query`: 1 = STOPPED.
+const SERVICE_STATE_STOPPED: u32 = 1;
+
 /// Poll until the service reports STOPPED or no longer exists (bounded, ~7.5s).
 /// Used after `sc.exe stop` so the daemon has released its file handles on the
 /// state dir before we delete the service and remove that dir. Compiled on all
@@ -671,12 +722,32 @@ fn wait_for_service_stopped(service_name: &str) {
         {
             // Non-zero exit means the service is already gone.
             Ok(o) if !o.status.success() => return,
-            Ok(o) if String::from_utf8_lossy(&o.stdout).contains("STOPPED") => return,
+            Ok(o)
+                if parse_sc_state(&String::from_utf8_lossy(&o.stdout))
+                    == Some(SERVICE_STATE_STOPPED) =>
+            {
+                return
+            }
             Ok(_) => {}
             Err(_) => return,
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+}
+
+/// Parse the numeric service-state code from `sc query` stdout. The state line
+/// reads `STATE : <N>  <WORD>`; `N` is a stable code (1 = STOPPED, 4 = RUNNING)
+/// while `<WORD>` is *localized* on non-English Windows — so match the number,
+/// not the word (the old `contains("STOPPED")` never fired on a localized box and
+/// burned the full poll timeout). Returns None when no state line is present.
+fn parse_sc_state(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        if !label.trim().eq_ignore_ascii_case("STATE") {
+            return None;
+        }
+        value.split_whitespace().next()?.parse::<u32>().ok()
+    })
 }
 
 pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
@@ -857,5 +928,62 @@ mod tests {
             s.contains(&ELEVATION_CANCELLED.to_string()),
             "cancel sentinel present"
         );
+    }
+
+    #[test]
+    fn non_interactive_elevate_returns_err_not_ok() {
+        // R-F2: with no terminal to confirm the sudo re-exec, elevate must FAIL
+        // (non-zero) rather than report success having seeded/installed nothing —
+        // otherwise a CI/Ansible/Docker `init` "succeeds" then trips on the next
+        // command against an unconfigured state dir. `cargo test` runs with a
+        // non-terminal stdin, so this hits the no-tty branch; skip if a runner
+        // happens to attach a TTY (that branch needs none of this).
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        assert!(
+            elevate_or_print("init", &[], "needs root").is_err(),
+            "non-interactive elevate must return Err, not a no-op Ok"
+        );
+    }
+
+    #[test]
+    fn config_elevation_decision() {
+        // R-F3: service + config-touching + not-yet-privileged → elevate (now on
+        // unix too, via sudo). The per-OS not-root/not-admin + already-elevated
+        // checks are folded into the `needs_elevation` argument.
+        assert!(
+            should_elevate_config(true, true, true),
+            "service + needs config + not privileged must elevate"
+        );
+        assert!(
+            !should_elevate_config(false, true, true),
+            "--user (service=false) must never elevate"
+        );
+        assert!(
+            !should_elevate_config(true, true, false),
+            "already root/elevated must not re-elevate"
+        );
+        assert!(
+            !should_elevate_config(true, false, true),
+            "install-service (needs_config=false) renders an artifact, no elevation"
+        );
+    }
+
+    #[test]
+    fn parse_sc_state_reads_numeric_code_regardless_of_locale() {
+        // R-F5: match the numeric STATE code, not the localized word.
+        let running = "SERVICE_NAME: mwsqld\n    TYPE               : 10  WIN32_OWN_PROCESS\n    STATE              : 4  RUNNING\n";
+        let stopped = "    STATE              : 1  STOPPED\n";
+        // Same code, German word — still parses as stopped (the whole point).
+        let stopped_localized = "    STATE              : 1  BEENDET\n";
+        assert_eq!(parse_sc_state(running), Some(4));
+        assert_eq!(parse_sc_state(stopped), Some(SERVICE_STATE_STOPPED));
+        assert_eq!(
+            parse_sc_state(stopped_localized),
+            Some(SERVICE_STATE_STOPPED),
+            "a localized state word must still parse as stopped by its code"
+        );
+        assert_eq!(parse_sc_state("no state line here"), None);
     }
 }

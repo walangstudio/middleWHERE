@@ -52,6 +52,12 @@ versions are fixes only.
   and a ready-to-use engine URL (`postgresql://…?sslmode=disable`, `mysql://…`)
   alongside the token, so a non-technical operator never has to translate the
   terse one-liner into a client's connection dialog.
+- **Idle backend-connection timeout.** A pooled backend connection with no
+  activity for `idle_timeout_secs` (per-env config, default **300s**) is closed
+  and its server-side connection released, so the gateway does not hold idle
+  connections open. A periodic reaper sweeps only idle pooled connections — an
+  in-flight query is never interrupted, and any use resets the timer. `mwsqld
+  run --idle-timeout-secs <N>` overrides every env (0 disables reaping).
 
 ### Changed
 
@@ -126,6 +132,27 @@ versions are fixes only.
   TOFU.
 - The Windows README install snippet verifies the archive's SHA-256 against
   `SHA256SUMS` (parity with the removed `install.ps1` and the Linux snippet).
+- **Config commands auto-elevate on Linux/macOS too, not just Windows.** With the
+  service-first default, a flagless `env add` / `cred add` / `grant` targets the
+  root-owned system dir; it now `sudo` re-execs (elevate-first, secrets only
+  entered in the elevated process) instead of dying with a bare "Permission
+  denied". `--user` and an already-elevated process still run without elevating.
+- Non-interactive `init` (and `uninstall --yes`) that cannot elevate now exit
+  **non-zero** after printing the manual `sudo` command, instead of returning
+  success without doing anything — so provisioning scripts detect the no-op.
+- `uninstall` classifies a system deployment correctly when `HOME` / `XDG_STATE_HOME`
+  are unset (systemd unit, cron, container): it no longer misreads the system dir
+  as per-user and so no longer risks deleting the master key while orphaning the
+  registered service.
+- Windows `uninstall` detects a stopped service by the numeric `sc` state code,
+  not the English word "STOPPED", so it works on localized Windows instead of
+  burning the stop-wait timeout.
+- `mwsqld test --all` on a deployment with zero configured environments reports
+  "no environments configured" instead of falsely succeeding as if connectivity
+  were verified.
+- The setup wizard unseals the sealed config once per screen instead of three
+  times, so on a `--user` / OS-keychain deployment (notably macOS) it no longer
+  triggers repeated keychain prompts for a single action.
 
 ### Security
 

@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use mw_core::state::{default_user_state_dir, resolve_cli_target, KeystoreChoice};
+use mw_core::state::{
+    default_state_dir, default_user_state_dir, resolve_cli_target, KeystoreChoice,
+};
 
 use crate::prompt::confirm;
 use crate::service;
@@ -189,7 +191,23 @@ fn remove_state_dir(dir: &Path, purge_audit: bool) -> Result<Removal> {
 /// hand the delete to an admin child that can't reach this user's keychain,
 /// orphaning the master key.
 fn is_system_service(user: bool, state_dir: &Path, ks: &KeystoreChoice) -> bool {
-    !user && !matches!(ks, KeystoreChoice::Os { .. }) && *state_dir != default_user_state_dir()
+    !user
+        && !matches!(ks, KeystoreChoice::Os { .. })
+        && is_system_state_dir(state_dir, &default_state_dir(), &default_user_state_dir())
+}
+
+/// Pure core of [`is_system_service`]'s dir test, split out so the env-fragile
+/// no-HOME case is unit-testable without touching real paths. A file-keystore
+/// deployment is per-user only when its dir is a *genuine* per-user dir — one
+/// distinct from the system dir. With HOME/XDG unset `default_user_state_dir()`
+/// collapses onto the system dir, so a flagless deployment at the system dir is
+/// still the system service (elevate + stop the unit), never per-user. A custom
+/// `--state-dir` (neither default) is a system deployment too: `init` registered
+/// a unit pointing at it, and it is root/Admin-owned. Classifying positively on
+/// the system dir this way (not by inequality with the fragile per-user dir)
+/// keeps the no-HOME case correct.
+fn is_system_state_dir(state_dir: &Path, system_dir: &Path, user_dir: &Path) -> bool {
+    !(user_dir != system_dir && state_dir == user_dir)
 }
 
 /// Non-secret flags to forward across the sudo / UAC re-exec. Never `--user`
@@ -264,6 +282,38 @@ mod tests {
         assert!(
             is_system_service(false, sys, &file),
             "flagless + file keystore + non-per-user dir is the system service"
+        );
+    }
+
+    #[test]
+    fn system_dir_classification_survives_no_home_collapse() {
+        // R-F0: the core of the fix. Classify by the system dir positively, not
+        // by inequality with the env-fragile per-user dir.
+        let system = Path::new("/var/lib/middlewhere");
+        let user = Path::new("/home/u/.local/state/middlewhere");
+        // Genuine per-user dir (HOME resolved, distinct) → per-user, no elevation.
+        assert!(
+            !is_system_state_dir(user, system, user),
+            "a real per-user dir is not a system service"
+        );
+        // The system default dir → system service.
+        assert!(
+            is_system_state_dir(system, system, user),
+            "the system dir is a system service"
+        );
+        // A custom --state-dir (neither default) → system service: init installed
+        // a unit for it and it is root-owned, so uninstall must elevate + stop it.
+        assert!(
+            is_system_state_dir(Path::new("/srv/mw"), system, user),
+            "a custom state dir is a system service"
+        );
+        // The ambiguous case: HOME/XDG unset, so default_user_state_dir()
+        // collapsed onto the system dir. The system-dir deployment must STILL be
+        // a system service — the old `!= default_user_state_dir()` compare
+        // misread it as per-user and skipped both elevation and the unit removal.
+        assert!(
+            is_system_state_dir(system, system, system),
+            "no-HOME collapse: the system dir must still be a system service"
         );
     }
 

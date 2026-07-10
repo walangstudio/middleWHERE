@@ -320,6 +320,17 @@ mod tests {
         assert_eq!(envs[0].bastion.as_deref(), Some("jump"));
         // default backend port followed the engine.
         assert_eq!(envs[0].backend, "db:3306");
+
+        // Single-unseal path (what the wizard's "show current" uses): all three
+        // lists built from one loaded config match the per-list unseals.
+        let cfg = mw_core::state::load_config(tmp.path(), &ks).unwrap();
+        let (br, cr, er) = (bastion::rows(&cfg), cred::rows(&cfg), envs::rows(&cfg));
+        assert_eq!(br.len(), 1);
+        assert_eq!(br[0].name, "jump");
+        assert_eq!(cr.len(), 1);
+        assert_eq!(cr[0].name, "ro");
+        assert_eq!(er.len(), 1);
+        assert_eq!(er[0].name, "stage");
     }
 
     #[test]
