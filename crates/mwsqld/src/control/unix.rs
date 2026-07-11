@@ -7,6 +7,12 @@
 //! credentials (the filesystem ACL is a first gate, not the only one). If the
 //! admins group does not exist yet the socket is tightened to owner-only rather
 //! than left open — fail safe.
+//!
+//! The shared runtime dir (`/run/middlewhere` on Linux, `/var/run/middlewhere`
+//! on macOS) is created owner-only by the service manager, so its group must be
+//! reopened to `middlewhere-admins` at `0710` too — otherwise a non-service
+//! admin is "other" on the dir (perms 0) and gets EACCES before ever reaching
+//! the socket. Same fail-safe posture: on any error the dir is left owner-only.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -27,7 +33,14 @@ pub(crate) async fn serve_loop(
     daemon: Arc<Daemon>,
     shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<()> {
-    let path = socket_path(&daemon.state_dir, SERVICE_NAME);
+    let (path, runtime_dir) = resolve_socket(&daemon.state_dir, SERVICE_NAME);
+    // When the socket lives in the shared runtime dir, reopen that dir's group
+    // traversal to the admins group BEFORE binding, so a non-service admin can
+    // reach the socket. The state-dir fallback needs no such step (it is
+    // owner-only by design and holds the sealed config).
+    if let Some(dir) = &runtime_dir {
+        secure_runtime_dir(dir);
+    }
     let listener = bind_listener(&path)?;
     info!(socket = %path.display(), "control channel listening");
 
@@ -63,16 +76,48 @@ pub(crate) async fn serve_loop(
     Ok(())
 }
 
-/// Prefer the runtime dir the installer provisions; fall back to the state dir
-/// (which the daemon already owns) so the control channel works even before the
-/// installer lands the `/run` dir.
-fn socket_path(state_dir: &Path, svc: &str) -> PathBuf {
-    let run = Path::new("/run/middlewhere");
-    if run.is_dir() && dir_is_writable(run) {
-        run.join(format!("{svc}.sock"))
-    } else {
-        state_dir.join("control.sock")
+/// Platform runtime dir the installer provisions: systemd `RuntimeDirectory`
+/// lands at `/run/middlewhere` on Linux, and Phase-7's macOS setup creates
+/// `/var/run/middlewhere` (stock macOS has no `/run`). `None` on a unix without
+/// a conventional runtime dir. Pure over the OS name so every branch is testable.
+fn runtime_dir_for(os: &str) -> Option<PathBuf> {
+    match os {
+        "linux" => Some(PathBuf::from("/run/middlewhere")),
+        "macos" => Some(PathBuf::from("/var/run/middlewhere")),
+        _ => None,
     }
+}
+
+fn runtime_dir_candidate() -> Option<PathBuf> {
+    runtime_dir_for(std::env::consts::OS)
+}
+
+/// Pick the socket path and, when it lives in the shared runtime dir, that dir
+/// (so the caller can secure its group traversal). The `<state_dir>/control.sock`
+/// fallback returns `None` for the parent on purpose: the state dir is already
+/// `0700` owner-only and holds `config.sealed` — it must NEVER be widened to
+/// `0710`. Pure, so both branches are unit-tested.
+fn choose_socket(
+    runtime: Option<&Path>,
+    runtime_usable: bool,
+    state_dir: &Path,
+    svc: &str,
+) -> (PathBuf, Option<PathBuf>) {
+    match runtime {
+        Some(dir) if runtime_usable => (dir.join(format!("{svc}.sock")), Some(dir.to_path_buf())),
+        _ => (state_dir.join("control.sock"), None),
+    }
+}
+
+/// Resolve the socket path against the live filesystem (runtime dir existence +
+/// writability), returning the parent runtime dir to secure when it is used.
+fn resolve_socket(state_dir: &Path, svc: &str) -> (PathBuf, Option<PathBuf>) {
+    let candidate = runtime_dir_candidate();
+    let usable = candidate
+        .as_deref()
+        .map(|d| d.is_dir() && dir_is_writable(d))
+        .unwrap_or(false);
+    choose_socket(candidate.as_deref(), usable, state_dir, svc)
 }
 
 fn dir_is_writable(dir: &Path) -> bool {
@@ -134,9 +179,61 @@ fn apply_socket_perms(path: &Path) {
     }
 }
 
+/// Make the shared runtime dir traversable by `middlewhere-admins`: chgrp it to
+/// the admins gid and chmod `0710` (owner rwx, group `--x` traverse-only, other
+/// none). The service manager creates the dir owner-only, so a non-service
+/// admins member is "other" and gets EACCES traversing it — the socket's own
+/// `0660` group perms are then unreachable. This reopens traversal to admins
+/// ONLY; non-admins stay denied at the dir.
+///
+/// No root needed: the daemon's euid owns the dir (systemd `RuntimeDirectory` /
+/// the macOS setup) AND the service user is itself a member of the admins group,
+/// so a non-root chgrp to that group is permitted.
+///
+/// FAIL-SAFE: any error (group unresolvable, not a real directory, chgrp/chmod
+/// fails) leaves the dir owner-only — never widened. An lstat guard + `lchown`
+/// mean a symlink/reparse swapped in at the dir path is never followed.
+fn secure_runtime_dir(dir: &Path) {
+    // lstat (NOT stat): never chgrp/chmod through a symlink/reparse at the dir.
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => {
+            warn!(
+                dir = %dir.display(),
+                "runtime dir path is not a directory; leaving it owner-only"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(err = %e, dir = %dir.display(), "cannot stat runtime dir; leaving it owner-only");
+            return;
+        }
+    }
+    let Some(g) = resolve_group(ADMIN_GROUP) else {
+        warn!(
+            group = ADMIN_GROUP, dir = %dir.display(),
+            "group not found; runtime dir left owner-only until it exists"
+        );
+        return;
+    };
+    let Some(cdir) = cpath(dir) else { return };
+    // `lchown` (not chown): if the final component were swapped for a symlink
+    // after the lstat, lchown changes the link, not its target. `uid_t::MAX` ==
+    // leave the owner unchanged.
+    if unsafe { libc::lchown(cdir.as_ptr(), libc::uid_t::MAX, g.gid) } != 0 {
+        warn!(
+            err = %std::io::Error::last_os_error(), dir = %dir.display(),
+            "chgrp runtime dir to {ADMIN_GROUP} failed; leaving it owner-only"
+        );
+        return;
+    }
+    // 0710: admins traverse (--x), nobody else. Never group/world readable.
+    set_mode(dir, 0o710);
+}
+
 fn set_mode(path: &Path, mode: u32) {
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        warn!(err = %e, mode = format!("{mode:o}"), "chmod control socket failed");
+        warn!(err = %e, path = %path.display(), mode = format!("{mode:o}"), "chmod failed");
     }
 }
 
@@ -309,4 +406,53 @@ unsafe fn cstr_to_string(p: *const libc::c_char) -> Option<String> {
         return None;
     }
     Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_dir_per_os() {
+        assert_eq!(
+            runtime_dir_for("linux"),
+            Some(PathBuf::from("/run/middlewhere"))
+        );
+        assert_eq!(
+            runtime_dir_for("macos"),
+            Some(PathBuf::from("/var/run/middlewhere"))
+        );
+        // No conventional runtime dir elsewhere -> state-dir fallback only.
+        assert_eq!(runtime_dir_for("freebsd"), None);
+        assert_eq!(runtime_dir_for("windows"), None);
+    }
+
+    #[test]
+    fn usable_runtime_dir_is_preferred_and_flagged_for_securing() {
+        let rt = PathBuf::from("/run/middlewhere");
+        let sd = Path::new("/var/lib/middlewhere");
+        let (path, parent) = choose_socket(Some(&rt), true, sd, "mwsqld");
+        assert_eq!(path, PathBuf::from("/run/middlewhere/mwsqld.sock"));
+        // The parent is returned so the caller reopens its group traversal.
+        assert_eq!(parent.as_deref(), Some(rt.as_path()));
+    }
+
+    #[test]
+    fn unusable_runtime_dir_falls_back_without_widening_parent() {
+        let rt = PathBuf::from("/run/middlewhere");
+        let sd = Path::new("/var/lib/middlewhere");
+        // Present but not writable/usable -> state-dir socket, and NO parent to
+        // widen (the 0700 state dir must never become 0710).
+        let (path, parent) = choose_socket(Some(&rt), false, sd, "mwsqld");
+        assert_eq!(path, PathBuf::from("/var/lib/middlewhere/control.sock"));
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn no_runtime_dir_falls_back_without_widening_parent() {
+        let sd = Path::new("/var/lib/middlewhere");
+        let (path, parent) = choose_socket(None, false, sd, "mwsqld");
+        assert_eq!(path, PathBuf::from("/var/lib/middlewhere/control.sock"));
+        assert!(parent.is_none());
+    }
 }

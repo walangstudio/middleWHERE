@@ -8,6 +8,11 @@ $acct  = "NT SERVICE\$svc"
 
 New-Item -ItemType Directory -Force -Path $state | Out-Null
 
+# Admin group whose members drive the control pipe without elevation. The
+# daemon builds the pipe DACL granting this group at startup.
+New-LocalGroup -Name 'middlewhere-admins' -Description 'middleWHERE admins' -ErrorAction SilentlyContinue | Out-Null
+Add-LocalGroupMember -Group 'middlewhere-admins' -Member $env:USERNAME -ErrorAction SilentlyContinue
+
 # Create the service bound to a virtual service account.
 sc.exe create $svc binPath= "`"$exe`" service --state-dir `"$state`" --file-keystore" obj= $acct start= auto
 sc.exe description $svc "middleWHERE secure SQL gateway daemon"

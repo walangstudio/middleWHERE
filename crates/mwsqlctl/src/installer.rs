@@ -16,6 +16,11 @@
 //! different OS principal and cannot read a 0400 file in a 0700 directory it
 //! does not own.
 
+/// The privileged OS group whose members may reach the daemon's control
+/// socket/pipe without elevation. Baked into every generated unit and created
+/// by the installer; mirrors mwsqld's `control::ADMIN_GROUP`.
+pub const ADMIN_GROUP: &str = "middlewhere-admins";
+
 pub struct InstallParams {
     pub service_name: String,
     pub exec_path: String,
@@ -57,6 +62,11 @@ RestartSec=5
 DynamicUser=yes
 StateDirectory={svc}
 StateDirectoryMode=0700
+# Runtime dir for the group-reachable control socket; the admins group is a
+# supplementary group so the (dynamic) service can chgrp the socket to it.
+RuntimeDirectory=middlewhere
+RuntimeDirectoryMode=0710
+SupplementaryGroups={admin_group}
 UMask=0077
 
 # --- sandbox ---
@@ -89,6 +99,7 @@ WantedBy=multi-user.target
         svc = p.service_name,
         exe = p.exec_path,
         state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
@@ -115,6 +126,11 @@ RestartSec=5
 User={svc}
 Group={svc}
 ReadWritePaths={state}
+# Runtime dir for the group-reachable control socket; the admins group is a
+# supplementary group so the service can chgrp the socket to it.
+RuntimeDirectory=middlewhere
+RuntimeDirectoryMode=0710
+SupplementaryGroups={admin_group}
 UMask=0077
 
 # --- sandbox ---
@@ -147,6 +163,7 @@ WantedBy=multi-user.target
         svc = p.service_name,
         exe = p.exec_path,
         state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
@@ -156,17 +173,20 @@ WantedBy=multi-user.target
 pub fn linux_operator_steps_fixed_user(p: &InstallParams) -> String {
     format!(
         r#"# Linux (systemd) — run as root:
+sudo groupadd --system {admin_group} 2>/dev/null || true
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin {svc} 2>/dev/null || true
 sudo {exe} --state-dir {state} --file-keystore init   # if not yet initialized
 sudo chown -R {svc}:{svc} {state}
 sudo install -m0644 {svc}.service /etc/systemd/system/{svc}.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now {svc}
+sudo usermod -aG {admin_group} $(whoami)   # your login user; re-login to apply
 journalctl -u {svc} -f
 "#,
         svc = p.service_name,
         exe = p.exec_path,
-        state = p.state_dir
+        state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
@@ -225,6 +245,11 @@ $acct  = "NT SERVICE\$svc"
 
 New-Item -ItemType Directory -Force -Path $state | Out-Null
 
+# Admin group whose members drive the control pipe without elevation. The
+# daemon builds the pipe DACL granting this group at startup.
+New-LocalGroup -Name '{admin_group}' -Description 'middleWHERE admins' -ErrorAction SilentlyContinue | Out-Null
+Add-LocalGroupMember -Group '{admin_group}' -Member $env:USERNAME -ErrorAction SilentlyContinue
+
 # Create the service bound to a virtual service account.
 sc.exe create $svc binPath= "`"$exe`" service --state-dir `"$state`" --file-keystore" obj= $acct start= auto
 sc.exe description $svc "middleWHERE secure SQL gateway daemon"
@@ -243,12 +268,14 @@ Write-Host "account context, or pre-seed the sealed config, before starting."
         svc = p.service_name,
         exe = p.exec_path,
         state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
 pub fn linux_operator_steps(p: &InstallParams) -> String {
     format!(
         r#"# Linux (systemd) — run as root:
+sudo groupadd --system {admin_group} 2>/dev/null || true
 sudo install -m0644 mwsqld.service /etc/systemd/system/{svc}.service
 sudo systemctl daemon-reload
 # Initialize the sealed config AS the service identity. With DynamicUser the
@@ -258,11 +285,13 @@ sudo systemctl daemon-reload
 sudo systemctl start {svc}
 sudo {exe} --state-dir {state} --file-keystore  init   # if not yet initialized
 sudo systemctl enable --now {svc}
+sudo usermod -aG {admin_group} $(whoami)   # your login user; re-login to apply
 journalctl -u {svc} -f
 "#,
         svc = p.service_name,
         exe = p.exec_path,
-        state = p.state_dir
+        state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
@@ -277,14 +306,25 @@ sudo dscl . -create /Users/_middlewhere RealName "middleWHERE daemon"
 sudo dscl . -create /Users/_middlewhere UniqueID $NEWID
 sudo dscl . -create /Users/_middlewhere PrimaryGroupID 1
 sudo dscl . -create /Users/_middlewhere NFSHomeDirectory /var/empty
+# Admin group whose members reach the control socket without sudo (one time):
+GMAXID=$(dscl . -list /Groups PrimaryGroupID | awk '{{print $2}}' | sort -n | tail -1)
+GNEWID=$((GMAXID+1))
+sudo dscl . -create /Groups/{admin_group}
+sudo dscl . -create /Groups/{admin_group} PrimaryGroupID $GNEWID
+sudo dscl . -append /Groups/{admin_group} GroupMembership $(whoami)   # re-login to apply
 sudo mkdir -p {state}
 sudo chown -R _middlewhere {state}
 sudo chmod 700 {state}
+# Runtime dir for the control socket (launchd has no RuntimeDirectory):
+sudo mkdir -p /var/run/middlewhere
+sudo chown _middlewhere:{admin_group} /var/run/middlewhere
+sudo chmod 0710 /var/run/middlewhere
 sudo install -m0644 com.middlewhere.{svc}.plist /Library/LaunchDaemons/com.middlewhere.{svc}.plist
 sudo launchctl load -w /Library/LaunchDaemons/com.middlewhere.{svc}.plist
 "#,
         svc = p.service_name,
-        state = p.state_dir
+        state = p.state_dir,
+        admin_group = ADMIN_GROUP,
     )
 }
 
@@ -308,6 +348,9 @@ mod tests {
             "SystemCallFilter=@system-service",
             "StateDirectory=mwsqld",
             "StateDirectoryMode=0700",
+            "RuntimeDirectory=middlewhere",
+            "RuntimeDirectoryMode=0710",
+            "SupplementaryGroups=middlewhere-admins",
             "UMask=0077",
             "ExecStart=/usr/local/bin/mwsqld run --state-dir /var/lib/middlewhere --file-keystore",
             "WantedBy=multi-user.target",
@@ -328,6 +371,18 @@ mod tests {
             u.contains("ReadWritePaths=/var/lib/middlewhere"),
             "missing ReadWritePaths\n{u}"
         );
+        // Same group-reachable runtime dir + admins supplementary group as the
+        // dynamic unit, so the socket lands in /run/middlewhere either way.
+        for needle in [
+            "RuntimeDirectory=middlewhere",
+            "RuntimeDirectoryMode=0710",
+            "SupplementaryGroups=middlewhere-admins",
+        ] {
+            assert!(
+                u.contains(needle),
+                "fixed-user unit missing {needle:?}\n{u}"
+            );
+        }
         assert!(
             !u.contains("DynamicUser"),
             "fixed-user unit must not use DynamicUser\n{u}"
@@ -381,6 +436,42 @@ mod tests {
         assert!(s.contains("useradd --system"));
         assert!(s.contains("chown -R mwsqld:mwsqld /var/lib/middlewhere"));
         assert!(s.contains("systemctl enable --now mwsqld"));
+        // The admins group must exist before the unit (SupplementaryGroups)
+        // starts, and the operator is added so they reach the socket sans sudo.
+        assert!(s.contains("groupadd --system middlewhere-admins"));
+        assert!(s.contains("usermod -aG middlewhere-admins"));
+    }
+
+    #[test]
+    fn dynamic_steps_create_admins_group() {
+        // The DynamicUser unit also lists SupplementaryGroups=middlewhere-admins,
+        // so the group must be created before `systemctl start`.
+        let s = linux_operator_steps(&params());
+        assert!(s.contains("groupadd --system middlewhere-admins"));
+        assert!(s.contains("usermod -aG middlewhere-admins"));
+    }
+
+    #[test]
+    fn macos_steps_create_group_and_runtime_dir() {
+        let s = macos_account_steps(&params());
+        assert!(s.contains("dscl . -create /Groups/middlewhere-admins"));
+        assert!(s.contains("GroupMembership"));
+        // launchd has no RuntimeDirectory, so the operator makes the socket dir
+        // group-owned by the admins group and 0710 (owner + group-traverse).
+        assert!(s.contains("mkdir -p /var/run/middlewhere"));
+        assert!(s.contains("chown _middlewhere:middlewhere-admins /var/run/middlewhere"));
+        assert!(s.contains("chmod 0710 /var/run/middlewhere"));
+    }
+
+    #[test]
+    fn admin_group_constant_is_stable_and_baked_in() {
+        // The daemon (mwsqld control::ADMIN_GROUP) and the CLI hint both key on
+        // this exact name; a rename here without the daemon is a silent break.
+        assert_eq!(ADMIN_GROUP, "middlewhere-admins");
+        assert!(systemd_unit(&params()).contains(ADMIN_GROUP));
+        assert!(systemd_unit_fixed_user(&params()).contains(ADMIN_GROUP));
+        assert!(windows_install_ps1(&params()).contains(ADMIN_GROUP));
+        assert!(macos_account_steps(&params()).contains(ADMIN_GROUP));
     }
 
     #[test]
@@ -409,6 +500,11 @@ mod tests {
         assert!(ps.contains("icacls"));
         assert!(ps.contains("/inheritance:r"));
         assert!(ps.contains(r"BUILTIN\Administrators"));
+        // The daemon builds the pipe DACL for this group; the installer must
+        // create it and add the operator (idempotent via SilentlyContinue).
+        assert!(ps.contains("New-LocalGroup -Name 'middlewhere-admins'"));
+        assert!(ps.contains("Add-LocalGroupMember -Group 'middlewhere-admins'"));
+        assert!(ps.contains("-ErrorAction SilentlyContinue"));
     }
 
     #[test]

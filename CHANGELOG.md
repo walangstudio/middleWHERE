@@ -5,6 +5,50 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.4.0] - 2026-07-11
+
+### Changed
+
+- **Config commands no longer elevate — the running daemon applies them.**
+  `env`/`cred`/`bastion`/`policy`/`grant`/`import` and the wizard now send the
+  change to the running `mwsqld` over a local control channel; the daemon (which
+  already owns the master key and the sealed config) validates, re-seals, and
+  applies it **live** to just the affected env — no `sudo`/UAC, no service
+  restart, no root-owned config files. This replaces the 0.3.0 auto-elevation of
+  config commands, which a security review found could target the wrong
+  deployment (data loss), rotate a token the running service never saw (a
+  revocation no-op), or leave `config.sealed` root-owned so the service user
+  could not read it (crash loop). `init`/`uninstall` still elevate — they
+  install/remove the OS service.
+
+### Added
+
+- **Local control channel on the daemon.** A Unix socket
+  (`/run/middlewhere/<svc>.sock`, `/var/run/…` on macOS) or Windows named pipe
+  (`\\.\pipe\middlewhere-<svc>-control`), authorized by **kernel
+  peer-credentials** — `SO_PEERCRED` (Linux) / `getpeereid` (macOS) /
+  `ImpersonateNamedPipeClient` + `CheckTokenMembership` (Windows). Access is
+  granted to `root`/`Administrators` or members of the new **`middlewhere-admins`**
+  group (created and joined at `init`); every other caller is denied at the door.
+  The channel is loopback + local-peer only by design.
+- **Live per-env config apply (no restart).** Adding an env binds its listener;
+  removing one stops just that listener; a token/policy swap takes effect for new
+  connections while existing sessions keep serving; a credential/bastion change
+  rebuilds only that env's backend pool. Other envs' active sessions are never
+  disturbed.
+- **Admin-action audit.** Every config mutation and every denied control request
+  is written to the same audit log as query decisions, with the peer's OS
+  identity (uid/gid/user or SID).
+- **`mwsqlctl --offline`** edits the sealed config directly (requires an already
+  elevated process) as a recovery path when the service is not running.
+
+### Notes
+
+- v1 scope: loopback + local-peer only (no remote control); a single
+  `middlewhere-admins` group (no read-only vs read-write admin roles); a
+  credential rotation drops the old backend pool immediately (in-flight sessions
+  on it reconnect). These are deliberate deferrals.
+
 ## [0.3.0] - 2026-07-09
 
 ### Added

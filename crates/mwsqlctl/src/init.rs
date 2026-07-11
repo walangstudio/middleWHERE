@@ -87,6 +87,14 @@ fn run_inner(opts: InitOpts) -> Result<()> {
 
     if cfg!(target_os = "linux") && service::is_root() {
         service::ensure_service_user(&opts.service_name)?;
+        service::ensure_admins_group()?;
+        // $SUDO_USER is the human who ran `sudo mwsqlctl init`; add them to the
+        // admins group so they reach the control socket without sudo. Raw root
+        // (no SUDO_USER) falls back to a printed manual command.
+        let operator = std::env::var("SUDO_USER")
+            .ok()
+            .filter(|u| !u.is_empty() && u != "root");
+        service::add_operator_to_admins(operator.as_deref())?;
     }
 
     seed_if_needed(t, &state_dir)?;

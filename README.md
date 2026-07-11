@@ -76,7 +76,7 @@ so the extract location does not matter).
 Linux / macOS:
 
 ```sh
-ver=v0.3.0; target=x86_64-unknown-linux-gnu      # or aarch64-…, x86_64-apple-darwin, aarch64-apple-darwin
+ver=v0.4.0; target=x86_64-unknown-linux-gnu      # or aarch64-…, x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/middlewhere-${ver}-${target}.tar.gz"
 curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS         # macOS: shasum -a 256 -c SHA256SUMS
@@ -86,7 +86,7 @@ tar -xzf "middlewhere-${ver}-${target}.tar.gz" -C /opt/middlewhere   # or any di
 Windows (PowerShell):
 
 ```powershell
-$ver = 'v0.3.0'; $target = 'x86_64-pc-windows-msvc'
+$ver = 'v0.4.0'; $target = 'x86_64-pc-windows-msvc'
 $asset = "middlewhere-$ver-$target.zip"
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/$asset" -OutFile $asset
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/SHA256SUMS" -OutFile SHA256SUMS

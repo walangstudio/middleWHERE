@@ -473,6 +473,78 @@ pub(crate) fn chown_state_dir(_dir: &Path, _name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- admins group + operator membership (linux) ------------------------
+
+/// Create the `middlewhere-admins` system group idempotently. The daemon
+/// group-owns its control socket to this group and both systemd units list it
+/// under `SupplementaryGroups=`, so it must exist before the unit starts.
+/// Mirrors [`ensure_service_user`]: getent-guarded, and a lost `groupadd` race
+/// (exit 9 = "group already in use") is treated as success.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_admins_group() -> Result<()> {
+    let group = crate::installer::ADMIN_GROUP;
+    let exists = Command::new("getent")
+        .arg("group")
+        .arg(group)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if exists {
+        return Ok(());
+    }
+    let status = Command::new("groupadd")
+        .args(["--system", group])
+        .status()
+        .context("run groupadd")?;
+    // exit 9 == "group name already in use": lost a race with getent (or a
+    // concurrent init). Idempotent, not an error.
+    if !status.success() && status.code() != Some(9) {
+        bail!("groupadd {group} failed (exit {:?})", status.code());
+    }
+    println!("Created system group {group}");
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ensure_admins_group() -> Result<()> {
+    Ok(())
+}
+
+/// Add the human operator (`$SUDO_USER` — whoever ran `sudo mwsqlctl init`) to
+/// `middlewhere-admins` so they can drive the control channel without sudo. Run
+/// as raw root (`operator` is `None`) it prints the manual command instead.
+/// Either way the operator must re-login for the new group to take effect.
+#[cfg(target_os = "linux")]
+pub(crate) fn add_operator_to_admins(operator: Option<&str>) -> Result<()> {
+    let group = crate::installer::ADMIN_GROUP;
+    match operator {
+        Some(user) => {
+            let status = Command::new("usermod")
+                .args(["-aG", group, user])
+                .status()
+                .context("run usermod")?;
+            if !status.success() {
+                bail!(
+                    "usermod -aG {group} {user} failed (exit {:?})",
+                    status.code()
+                );
+            }
+            println!("Added {user} to {group} — log out and back in for it to take effect.");
+        }
+        None => {
+            println!(
+                "\nRan as root with no SUDO_USER, so no login account was added to \
+                 {group}.\nTo reach the control channel without sudo, run then re-login:\n  \
+                 sudo usermod -aG {group} <your-user>"
+            );
+        }
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn add_operator_to_admins(_operator: Option<&str>) -> Result<()> {
+    Ok(())
+}
+
 // ---- service install + lifecycle ---------------------------------------
 
 /// Write the hardened (fixed-user) unit and `enable --now` on Linux when root;
