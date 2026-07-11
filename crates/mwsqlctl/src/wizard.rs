@@ -208,10 +208,6 @@ pub fn run(opts: WizardOpts) -> Result<()> {
 }
 
 fn run_inner(opts: WizardOpts) -> Result<()> {
-    // Share the one mode decision with the command router so they can't drift.
-    // The wizard has no --offline, so it's Channel iff service mode (not --user).
-    let service = control_client::decide_mode(opts.user, false) == control_client::Mode::Channel;
-
     // Interactive-only. Fail before doing anything when there's no terminal.
     if !std::io::stdin().is_terminal() {
         bail!(
@@ -219,11 +215,21 @@ fn run_inner(opts: WizardOpts) -> Result<()> {
              or configure with the individual `mwsqlctl` commands."
         );
     }
+
+    let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
+    // Share the one mode decision with the command router so they can't drift.
+    // The wizard has no --offline; channel iff flagless + system-dir target.
+    let service = control_client::decide_mode(
+        opts.user,
+        false,
+        opts.state_dir.is_some(),
+        state_dir == mw_core::state::default_state_dir(),
+    ) == control_client::Mode::Channel;
+
     if service {
         service::validate_service_name(&opts.service_name)?;
     }
 
-    let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
     let backend = if service {
         Backend::Channel(&state_dir)
     } else {

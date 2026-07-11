@@ -378,13 +378,17 @@ fn main() -> Result<()> {
              the running service."
         );
     }
-    // Service mode talks to the running daemon over the control channel; `--user`
-    // and `--offline` edit a config file directly. The socket/pipe path is
-    // state-dir-independent, so the daemon (authoritative for whatever config it
-    // loaded) serves the request regardless of `--state-dir`; if none is running,
-    // the control client returns Unreachable and the router prints the hint.
-    let use_channel =
-        control_client::decide_mode(user, cli.offline) == control_client::Mode::Channel;
+    // Only a flagless command targeting the system service dir talks to the
+    // running daemon over the control channel. An explicit `--state-dir`, a
+    // legacy per-user resolution, `--user`, or `--offline` edit a config file
+    // directly — the channel always mutates the daemon's own loaded config, so
+    // routing an explicit `--state-dir` there would silently hit the wrong one.
+    let use_channel = control_client::decide_mode(
+        user,
+        cli.offline,
+        cli.state_dir.is_some(),
+        target_needs_root,
+    ) == control_client::Mode::Channel;
     let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {
@@ -535,13 +539,18 @@ fn main() -> Result<()> {
             eprintln!("env {:?} removed", name);
         }
         Cmd::Env(EnvCmd::RotateToken { name }) => {
-            let token = if use_channel {
-                expect_token(&state_dir, Request::Grant { env: name.clone() })?.token
+            // rotate-token IS grant; take the full DTO from both paths so the
+            // daemon's persisted-but-not-live note reaches the operator.
+            let out: NewEnvOutputDto = if use_channel {
+                expect_token(&state_dir, Request::Grant { env: name.clone() })?
             } else {
-                envs::rotate_token(&state_dir, &ks, &name)?
+                ops::grant(t, &name)?.into()
             };
             eprintln!("env {:?} token rotated. New token (save now):", name);
-            println!("{}", token.expose());
+            println!("{}", out.token.expose());
+            if let Some(note) = &out.note {
+                eprintln!("⚠ {note}");
+            }
         }
         Cmd::Env(EnvCmd::List) => {
             if use_channel {
