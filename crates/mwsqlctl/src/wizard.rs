@@ -2,40 +2,207 @@
 //!
 //! The wizard configures an **already-installed** deployment: it adds bastions,
 //! credentials, and envs (secrets prompted in-process, never on argv or disk in
-//! cleartext) and restarts the service so the daemon binds the new listeners.
-//! Installing the service itself (the system account, the unit, `enable --now`)
-//! is `mwsqlctl init`'s job — run that first.
+//! cleartext). Installing the service itself (the system account, the unit,
+//! `enable --now`) is `mwsqlctl init`'s job — run that first.
 //!
-//! In service mode the wizard self-elevates *before any prompt* (see
-//! [`crate::service`]) so every secret is written by the one root process that
-//! owns the state dir. `--user` configures the per-user deployment with no
-//! elevation.
+//! In service mode the wizard talks to the running daemon over the control
+//! channel: it needs no elevation, and each change is applied live by the
+//! privileged daemon (no file write + restart). `--user` configures the
+//! per-user deployment directly against the sealed config file.
 
-use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use mw_core::config::{EngineKind, Policy};
-use mw_core::state::{default_state_dir, resolve_cli_target};
+use mw_core::config::{EngineKind, HostKeyFingerprint, Policy};
+use mw_core::control::{CredInputDto, Request, Response};
+use mw_core::secret::SecretStr;
+use mw_core::state::resolve_cli_target;
 
 use crate::ops::{self, Target};
 use crate::prompt::{
     confirm, prompt_optional_port, prompt_optional_text, prompt_port, prompt_text, select_index,
     select_owned,
 };
-use crate::{bastion, cred, envs, service};
+use crate::{bastion, control_client, cred, envs, service};
 
-/// The raw flags the wizard resolves its mode and elevation from.
+/// The raw flags the wizard resolves its mode from.
 pub struct WizardOpts {
     pub state_dir: Option<PathBuf>,
     pub user: bool,
     pub file_keystore: bool,
-    /// Which service to restart after applying config (service mode only).
+    /// Which service this configures (cosmetic in channel mode — the control
+    /// socket is keyed on the fixed daemon name).
     pub service_name: String,
-    /// Set on the Windows UAC-relaunched child (see [`crate::init::InitOpts`]).
-    pub uac: bool,
+}
+
+/// Where the wizard applies config: the running daemon over the control channel
+/// (service mode), or the sealed config file in-process (`--user`).
+enum Backend<'a> {
+    Direct(Target<'a>),
+    Channel(&'a Path),
+}
+
+impl Backend<'_> {
+    fn bastion_infos(&self) -> Result<Vec<control_client::BastionInfo>> {
+        match self {
+            Backend::Direct(t) => Ok(bastion::list(t.state_dir, t.ks)?
+                .into_iter()
+                .map(|b| control_client::BastionInfo {
+                    name: b.name,
+                    host: b.host,
+                    pinned: b.pinned_fingerprints,
+                })
+                .collect()),
+            Backend::Channel(sd) => Ok(control_client::rows(sd, &Request::ListBastions)?
+                .iter()
+                .filter_map(|r| control_client::parse_bastion_row(r))
+                .collect()),
+        }
+    }
+
+    fn cred_names(&self) -> Result<Vec<String>> {
+        match self {
+            Backend::Direct(t) => Ok(cred::list(t.state_dir, t.ks)?
+                .into_iter()
+                .map(|c| c.name)
+                .collect()),
+            Backend::Channel(sd) => Ok(control_client::rows(sd, &Request::ListCreds)?
+                .iter()
+                .filter_map(|r| control_client::parse_cred_name(r))
+                .collect()),
+        }
+    }
+
+    fn add_bastion(&self, input: ops::BastionInput) -> Result<()> {
+        match self {
+            Backend::Direct(t) => ops::add_bastion(*t, input),
+            Backend::Channel(sd) => {
+                let auth = ops::resolve_bastion_auth(&input)?;
+                let dto = control_client::bastion_dto(&input, auth)?;
+                control_client::checked_call(sd, &Request::AddBastion(dto)).map(|_| ())
+            }
+        }
+    }
+
+    fn add_credential(&self, name: &str, user: &str) -> Result<()> {
+        match self {
+            Backend::Direct(t) => ops::add_credential(*t, name, user, false),
+            Backend::Channel(sd) => {
+                let pw = ops::read_secret("backend password: ", false)?;
+                control_client::checked_call(
+                    sd,
+                    &Request::AddCred(CredInputDto {
+                        name: name.to_string(),
+                        backend_user: user.to_string(),
+                        password: SecretStr::new(pw),
+                    }),
+                )
+                .map(|_| ())
+            }
+        }
+    }
+
+    fn add_env(&self, input: ops::EnvInput) -> Result<envs::NewEnvOutput> {
+        match self {
+            Backend::Direct(t) => ops::add_env(*t, input),
+            Backend::Channel(sd) => {
+                let dto = control_client::env_dto(&input);
+                match control_client::checked_call(sd, &Request::AddEnv(dto))? {
+                    Response::Token(d) => Ok(envs::NewEnvOutput {
+                        token: d.token,
+                        listen_port: d.listen_port,
+                        engine: d.engine,
+                        database: d.database,
+                    }),
+                    other => bail!("unexpected response from the service: {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn rm_env(&self, name: &str) -> Result<()> {
+        match self {
+            Backend::Direct(t) => envs::rm(t.state_dir, t.ks, name),
+            Backend::Channel(sd) => control_client::checked_call(
+                sd,
+                &Request::RmEnv {
+                    name: name.to_string(),
+                },
+            )
+            .map(|_| ()),
+        }
+    }
+
+    fn set_fingerprint(&self, name: &str, fp: HostKeyFingerprint) -> Result<()> {
+        match self {
+            Backend::Direct(t) => bastion::set_fingerprint(t.state_dir, t.ks, name, fp),
+            Backend::Channel(sd) => control_client::checked_call(
+                sd,
+                &Request::SetFingerprint {
+                    bastion: name.to_string(),
+                    fingerprint: fp,
+                },
+            )
+            .map(|_| ()),
+        }
+    }
+
+    fn validate(&self, env: &str) -> crate::probe::Validation {
+        use crate::probe::Validation;
+        match self {
+            Backend::Direct(t) => crate::probe::validate(t.state_dir, t.ks, Some(env)),
+            Backend::Channel(sd) => {
+                match control_client::checked_call(
+                    sd,
+                    &Request::Probe {
+                        env: Some(env.to_string()),
+                        all: false,
+                    },
+                ) {
+                    Ok(Response::ProbeResults(rs)) => match rs.into_iter().next() {
+                        Some(r) if r.ok => Validation::Ok,
+                        Some(r) if !r.supported => Validation::Skipped(r.reason),
+                        Some(r) => Validation::Failed(if r.reason.is_empty() {
+                            "connection failed".to_string()
+                        } else {
+                            r.reason
+                        }),
+                        None => Validation::Skipped("no environments configured".to_string()),
+                    },
+                    Ok(_) => {
+                        Validation::Skipped("unexpected response from the service".to_string())
+                    }
+                    Err(e) => Validation::Skipped(format!("probe could not run: {e}")),
+                }
+            }
+        }
+    }
+
+    fn show_current(&self) -> Result<()> {
+        match self {
+            Backend::Direct(t) => show_current_direct(*t),
+            Backend::Channel(sd) => {
+                let bastions = control_client::rows(sd, &Request::ListBastions)?;
+                let creds = control_client::rows(sd, &Request::ListCreds)?;
+                let envs = control_client::rows(sd, &Request::ListEnvs)?;
+                println!("  bastions ({}):", bastions.len());
+                for b in &bastions {
+                    println!("    {b}");
+                }
+                println!("  credentials ({}):", creds.len());
+                for c in &creds {
+                    println!("    {c}");
+                }
+                println!("  envs ({}):", envs.len());
+                for e in &envs {
+                    println!("    {e}");
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 pub fn run(opts: WizardOpts) -> Result<()> {
@@ -45,9 +212,7 @@ pub fn run(opts: WizardOpts) -> Result<()> {
 fn run_inner(opts: WizardOpts) -> Result<()> {
     let service = !opts.user;
 
-    // Interactive-only. Fail BEFORE elevating when there's no terminal to
-    // prompt on. (sudo preserves the TTY, so the re-exec'd process still
-    // passes this.)
+    // Interactive-only. Fail before doing anything when there's no terminal.
     if !std::io::stdin().is_terminal() {
         bail!(
             "the wizard is interactive and needs a terminal. Run it in a TTY, \
@@ -55,66 +220,48 @@ fn run_inner(opts: WizardOpts) -> Result<()> {
         );
     }
     if service {
-        // Baked into `systemctl restart <name>`; validate before we elevate.
         service::validate_service_name(&opts.service_name)?;
     }
 
-    // Configuring writes to the root-owned/Admin-owned state dir, so service
-    // mode needs root (Linux) / admin (Windows). Elevate-first before any
-    // prompt: `sudo` re-exec on Linux, a UAC relaunch on Windows.
-    if service && service::needs_service_elevation(opts.uac) {
-        // Windows can't auto-elevate the wizard: a UAC child's stdout is
-        // redirected to a temp file, so its many interactive prompts would be
-        // invisible and it would block unseen. Send the operator to an elevated
-        // terminal instead. On unix, sudo keeps the TTY, so the re-exec below
-        // prompts normally.
-        if cfg!(windows) {
-            bail!(
-                "administrator privileges are required. Re-run `mwsqlctl wizard` from \
-                 an elevated terminal (Run as administrator), or pass --user to \
-                 configure a per-user deployment."
-            );
-        }
-        let forward = forwarded_args(&opts);
-        let target_dir = opts.state_dir.clone().unwrap_or_else(default_state_dir);
-        let reason = format!(
-            "Configuring needs root: it writes secrets into the root-owned config\n\
-             at {} and restarts {}.",
-            target_dir.display(),
-            opts.service_name
-        );
-        return service::elevate_for_service("wizard", &forward, &reason);
-    }
-
     let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
-    let t = Target::new(&state_dir, &ks);
+    let backend = if service {
+        Backend::Channel(&state_dir)
+    } else {
+        Backend::Direct(Target::new(&state_dir, &ks))
+    };
 
-    // The wizard configures; it does not install. An uninitialized state dir
-    // means `init` hasn't run yet.
-    if !ops::is_initialized(&state_dir) {
-        if service {
-            bail!(
-                "no config at {} — run `mwsqlctl init` first to install the service",
-                state_dir.display()
-            );
+    // Confirm the deployment is usable before prompting. Direct mode checks the
+    // sealed config exists; channel mode probes the daemon — a running daemon has
+    // already loaded its config, so reachability doubles as the initialized check.
+    match &backend {
+        Backend::Direct(t) => {
+            if !ops::is_initialized(t.state_dir) {
+                bail!(
+                    "no config at {} — run `mwsqlctl --user init` first",
+                    state_dir.display()
+                );
+            }
         }
-        bail!(
-            "no config at {} — run `mwsqlctl --user init` first",
-            state_dir.display()
-        );
+        Backend::Channel(sd) => {
+            control_client::checked_call(sd, &Request::ListEnvs)
+                .context("configuring needs the running service (run `mwsqlctl init` first)")?;
+        }
     }
 
     intro(service, &state_dir);
 
     // Re-run menu: this is always an existing config (init seeded it).
-    if existing_config_action(t)? == Existing::Quit {
+    if existing_config_action(&backend)? == Existing::Quit {
         return Ok(());
     }
 
-    let changed = run_config(t)?;
+    let changed = run_config_backend(&backend)?;
 
     if service {
-        finalize_service_config(&opts.service_name, &state_dir, changed)?;
+        // The daemon applied each change live; nothing to chown or restart.
+        if changed {
+            println!("\nChanges applied to the running service.");
+        }
     } else {
         println!("\nDone. Run it (no elevation needed):");
         println!("  mwsqld --user run");
@@ -132,25 +279,10 @@ fn intro(service: bool, state_dir: &Path) {
     }
 }
 
-/// The non-secret flags to forward across the re-exec. Never `--user` (service
-/// mode), never a secret.
-fn forwarded_args(opts: &WizardOpts) -> Vec<OsString> {
-    let mut v: Vec<OsString> = Vec::new();
-    if let Some(sd) = &opts.state_dir {
-        v.push("--state-dir".into());
-        v.push(sd.as_os_str().to_owned());
-    }
-    if opts.file_keystore {
-        v.push("--file-keystore".into());
-    }
-    v.push("--service-name".into());
-    v.push(opts.service_name.clone().into());
-    v
-}
-
 /// After config is written as root in service mode: hand the new files back to
-/// the service account and restart so the daemon binds the new listeners.
-/// Shared with `init`'s "configure now" path.
+/// the service account and restart so the daemon binds the new listeners. Only
+/// used by `init`'s already-elevated "configure now" path — the standalone
+/// wizard applies changes live over the control channel and never lands here.
 pub(crate) fn finalize_service_config(
     service_name: &str,
     state_dir: &Path,
@@ -187,17 +319,17 @@ enum Existing {
     Quit,
 }
 
-fn existing_config_action(t: Target) -> Result<Existing> {
+fn existing_config_action(backend: &Backend) -> Result<Existing> {
     loop {
         match select_index("What now?", &["Add more", "Show current", "Quit"])? {
-            1 => show_current(t)?,
+            1 => backend.show_current()?,
             2 => return Ok(Existing::Quit),
             _ => return Ok(Existing::AddMore),
         }
     }
 }
 
-fn show_current(t: Target) -> Result<()> {
+fn show_current_direct(t: Target) -> Result<()> {
     // Unseal the config once (one OS-keychain unlock in --user mode) and build
     // all three lists from it, rather than unsealing per list.
     let cfg = mw_core::state::load_config(t.state_dir, t.ks)?;
@@ -227,18 +359,22 @@ fn show_current(t: Target) -> Result<()> {
 
 // ---- add loops ---------------------------------------------------------
 
-/// The interactive add-bastions/credentials/envs flow. Assumes the config is
-/// already initialized. Returns whether anything was added (so the caller knows
-/// whether a service restart is warranted). Called both by the standalone
-/// `wizard` and inline by `init`'s "configure now" prompt (already elevated).
+/// The interactive add-bastions/credentials/envs flow. Assumes the deployment is
+/// already initialized. Returns whether anything was added. Called both by the
+/// standalone `wizard` (over whichever backend) and inline by `init`'s
+/// "configure now" prompt (direct, already elevated).
 pub(crate) fn run_config(t: Target) -> Result<bool> {
-    let b = add_bastions_loop(t)?;
-    let c = add_credentials_loop(t)?;
-    let e = add_envs_loop(t)?;
-    Ok(b || c || e)
+    run_config_backend(&Backend::Direct(t))
 }
 
-fn add_bastions_loop(t: Target) -> Result<bool> {
+fn run_config_backend(b: &Backend) -> Result<bool> {
+    let bastions = add_bastions_loop(b)?;
+    let creds = add_credentials_loop(b)?;
+    let envs = add_envs_loop(b)?;
+    Ok(bastions || creds || envs)
+}
+
+fn add_bastions_loop(b: &Backend) -> Result<bool> {
     let mut added = false;
     while confirm("Add a bastion?", true)? {
         let name = prompt_text("Bastion name:")?;
@@ -259,18 +395,15 @@ fn add_bastions_loop(t: Target) -> Result<bool> {
             }
         };
         // add_bastion prompts the password / passphrase in-process (masked).
-        match ops::add_bastion(
-            t,
-            ops::BastionInput {
-                name: name.clone(),
-                host,
-                port,
-                ssh_user,
-                key_file,
-                password_stdin: false,
-                fingerprints,
-            },
-        ) {
+        match b.add_bastion(ops::BastionInput {
+            name: name.clone(),
+            host,
+            port,
+            ssh_user,
+            key_file,
+            password_stdin: false,
+            fingerprints,
+        }) {
             Ok(()) => {
                 println!("  added bastion {name}");
                 added = true;
@@ -281,12 +414,12 @@ fn add_bastions_loop(t: Target) -> Result<bool> {
     Ok(added)
 }
 
-fn add_credentials_loop(t: Target) -> Result<bool> {
+fn add_credentials_loop(b: &Backend) -> Result<bool> {
     let mut added = false;
     while confirm("Add a credential?", true)? {
         let name = prompt_text("Credential name:")?;
         let user = prompt_text("Backend DB user:")?;
-        match ops::add_credential(t, &name, &user, false) {
+        match b.add_credential(&name, &user) {
             Ok(()) => {
                 println!("  added credential {name}");
                 added = true;
@@ -297,12 +430,12 @@ fn add_credentials_loop(t: Target) -> Result<bool> {
     Ok(added)
 }
 
-fn add_envs_loop(t: Target) -> Result<bool> {
+fn add_envs_loop(b: &Backend) -> Result<bool> {
     let mut added = false;
     // The cred/bastion name lists don't change inside this loop (only envs are
-    // added here), so unseal once up front instead of per iteration.
-    let creds = cred_names(t)?;
-    let bastions = bastion_names(t)?;
+    // added here), so fetch once up front instead of per iteration.
+    let creds = b.cred_names()?;
+    let bastions: Vec<String> = b.bastion_infos()?.into_iter().map(|i| i.name).collect();
     while confirm("Add an environment (a client listener)?", true)? {
         if creds.is_empty() {
             println!("  (no credentials yet — add one first; skipping envs)");
@@ -313,7 +446,7 @@ fn add_envs_loop(t: Target) -> Result<bool> {
         // operator what to do (keep / edit & retry / discard).
         loop {
             let name = pending.name.clone();
-            let out = match ops::add_env(t, pending) {
+            let out = match b.add_env(pending) {
                 Ok(out) => out,
                 Err(e) => {
                     eprintln!("  ! {e}");
@@ -329,7 +462,7 @@ fn add_envs_loop(t: Target) -> Result<bool> {
                     o.database.as_deref(),
                 );
             };
-            match crate::probe::validate(t.state_dir, t.ks, Some(&name)) {
+            match b.validate(&name) {
                 crate::probe::Validation::Ok => {
                     println!("  ✓ connected");
                     print_block(&out);
@@ -355,13 +488,13 @@ fn add_envs_loop(t: Target) -> Result<bool> {
                             break;
                         }
                         1 => {
-                            envs::rm(t.state_dir, t.ks, &name)?;
+                            b.rm_env(&name)?;
                             pending = prompt_env_input(&creds, bastions.clone())?;
-                            ensure_bastion_pinned(t, pending.bastion.as_deref())?;
+                            ensure_bastion_pinned(b, pending.bastion.as_deref())?;
                             continue;
                         }
                         _ => {
-                            envs::rm(t.state_dir, t.ks, &name)?;
+                            b.rm_env(&name)?;
                             println!("  discarded {name}");
                             break;
                         }
@@ -404,20 +537,6 @@ fn prompt_env_input(creds: &[String], bastions: Vec<String>) -> Result<ops::EnvI
     })
 }
 
-fn bastion_names(t: Target) -> Result<Vec<String>> {
-    Ok(bastion::list(t.state_dir, t.ks)?
-        .into_iter()
-        .map(|b| b.name)
-        .collect())
-}
-
-fn cred_names(t: Target) -> Result<Vec<String>> {
-    Ok(cred::list(t.state_dir, t.ks)?
-        .into_iter()
-        .map(|c| c.name)
-        .collect())
-}
-
 fn pick_optional(msg: &str, names: Vec<String>) -> Result<Option<String>> {
     if names.is_empty() {
         return Ok(None);
@@ -443,21 +562,18 @@ fn unpinned_bastion_warning(host: &str) -> String {
 /// After a failed env validation, if the chosen bastion has no pinned host key
 /// the connection can never succeed. Offer to pin one so the retry can work —
 /// keeps the wizard's "edit & retry" loop recoverable.
-fn ensure_bastion_pinned(t: Target, bastion: Option<&str>) -> Result<()> {
+fn ensure_bastion_pinned(b: &Backend, bastion: Option<&str>) -> Result<()> {
     let Some(name) = bastion else { return Ok(()) };
-    let Some(row) = bastion::list(t.state_dir, t.ks)?
-        .into_iter()
-        .find(|b| b.name == name)
-    else {
+    let Some(info) = b.bastion_infos()?.into_iter().find(|i| i.name == name) else {
         return Ok(());
     };
-    if row.pinned_fingerprints > 0 {
+    if info.pinned > 0 {
         return Ok(());
     }
-    println!("{}", unpinned_bastion_warning(&row.host));
+    println!("{}", unpinned_bastion_warning(&info.host));
     if let Some(fp) = prompt_optional_text("  Pin it now as <algo>:<sha256_b64> (blank to skip):")?
     {
-        bastion::set_fingerprint(t.state_dir, t.ks, name, ops::parse_fingerprint(&fp)?)?;
+        b.set_fingerprint(name, ops::parse_fingerprint(&fp)?)?;
         println!("  pinned {name}");
     }
     Ok(())
@@ -466,52 +582,6 @@ fn ensure_bastion_pinned(t: Target, bastion: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn opts() -> WizardOpts {
-        WizardOpts {
-            state_dir: Some(PathBuf::from("/var/lib/middlewhere")),
-            user: false,
-            file_keystore: true,
-            service_name: "mwsqld".into(),
-            uac: false,
-        }
-    }
-
-    #[test]
-    fn forwarded_args_never_include_user_and_carry_service_flags() {
-        let fwd: Vec<String> = forwarded_args(&opts())
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !fwd.iter().any(|a| a == "--user"),
-            "must not forward --user"
-        );
-        assert!(fwd.contains(&"--state-dir".to_string()));
-        assert!(fwd.contains(&"/var/lib/middlewhere".to_string()));
-        assert!(fwd.contains(&"--file-keystore".to_string()));
-        assert!(fwd.contains(&"--service-name".to_string()));
-        assert!(fwd.contains(&"mwsqld".to_string()));
-    }
-
-    #[test]
-    fn forwarded_args_minimal_when_no_overrides() {
-        let o = WizardOpts {
-            state_dir: None,
-            user: false,
-            file_keystore: false,
-            service_name: "mwsqld".into(),
-            uac: false,
-        };
-        let fwd: Vec<String> = forwarded_args(&o)
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            fwd,
-            vec!["--service-name".to_string(), "mwsqld".to_string()]
-        );
-    }
 
     #[test]
     fn unpinned_warning_states_refusal_and_how_to_obtain() {

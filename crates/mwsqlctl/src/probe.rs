@@ -99,9 +99,9 @@ pub enum Validation {
 
 /// Validate one env (or all if `env` is `None`): locate the `mwsqld` sibling
 /// binary and run `mwsqld test` against the same state dir + keystore the ctl
-/// resolved. Service mode reads root-owned config, so the caller must already be
-/// elevated (the wizard self-elevates; standalone `env test` is wrapped by
-/// `run_elevated_or`).
+/// resolved. This direct probe reads the config file itself, so it only serves
+/// the `--user`/`--offline` paths; service mode probes through the daemon's
+/// `Probe` control request instead.
 pub fn validate(state_dir: &Path, ks: &KeystoreChoice, env: Option<&str>) -> Validation {
     let daemon = match ops::default_daemon_path() {
         Ok(d) if d.exists() => d,

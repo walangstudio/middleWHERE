@@ -57,22 +57,30 @@ pub struct BastionInput {
     pub fingerprints: Vec<String>,
 }
 
-pub fn add_bastion(t: Target, input: BastionInput) -> Result<()> {
-    let auth = if let Some(path) = &input.key_file {
+/// Resolve a bastion's auth secret in-process: read the PEM key file (prompting
+/// for a passphrase) or prompt for the SSH password. Shared by the offline
+/// [`add_bastion`] and the online control-channel path so both prompt
+/// identically before the secret is sealed / sent.
+pub fn resolve_bastion_auth(input: &BastionInput) -> Result<bastion::BastionAuthInput> {
+    if let Some(path) = &input.key_file {
         let pem = std::fs::read(path).with_context(|| format!("read key {}", path.display()))?;
         let passphrase = if read_yes_no("key has a passphrase? [y/N]: ")? {
             Some(SecretStr::new(read_secret("key passphrase: ", false)?))
         } else {
             None
         };
-        bastion::BastionAuthInput::Key {
+        Ok(bastion::BastionAuthInput::Key {
             pem: SecretBytes::new(pem),
             passphrase,
-        }
+        })
     } else {
         let pw = read_secret("bastion password: ", input.password_stdin)?;
-        bastion::BastionAuthInput::Password(SecretStr::new(pw))
-    };
+        Ok(bastion::BastionAuthInput::Password(SecretStr::new(pw)))
+    }
+}
+
+pub fn add_bastion(t: Target, input: BastionInput) -> Result<()> {
+    let auth = resolve_bastion_auth(&input)?;
     let fingerprint = input
         .fingerprints
         .first()

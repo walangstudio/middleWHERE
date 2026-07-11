@@ -1,13 +1,14 @@
 //! `mwsqlctl` library. All real work lives here so tests can drive each
 //! mutation without spawning a subprocess. The bin is a thin clap wrapper.
 //!
-//! Concurrency: every public function in this crate is synchronous and
-//! reads + writes the sealed config once. Long-term, the same surface will
-//! gain an "online" counterpart that talks to a running daemon over IPC
-//! (Phase 6b in the plan); today, offline-only.
+//! Two ways to reach the sealed config: the synchronous `ops`/`envs`/… modules
+//! read + write the config file in-process (per-user, or the privileged
+//! `--offline` path); [`control_client`] speaks to a running daemon over the
+//! local control channel so service-mode config commands need no elevation.
 
 pub mod audit_tail;
 pub mod bastion;
+pub mod control_client;
 pub mod cred;
 pub mod envs;
 pub mod import_poc;
@@ -107,26 +108,12 @@ fn pct(s: &str) -> String {
     o
 }
 
-/// Run a config-touching `mwsqlctl` command, auto-elevating on Windows service
-/// mode so it does not just fail against the admin-locked state dir. The bin
-/// wraps its command dispatch (everything except the self-elevating `init` /
-/// `wizard`) in this.
-pub fn run_elevated_or<F: FnOnce() -> anyhow::Result<()>>(
-    service: bool,
-    uac: bool,
-    needs_config: bool,
-    target_needs_root: bool,
-    interactive: bool,
-    run: F,
-) -> anyhow::Result<()> {
-    crate::service::run_elevated_or(
-        service,
-        uac,
-        needs_config,
-        target_needs_root,
-        interactive,
-        run,
-    )
+/// Whether this process is already privileged (root on unix, Administrator on
+/// Windows). The `--offline` config path edits the root/service-owned sealed
+/// config directly, so it requires this — the CLI no longer auto-elevates for
+/// config commands.
+pub fn is_privileged() -> bool {
+    crate::service::is_root() || crate::service::is_admin()
 }
 
 #[cfg(test)]

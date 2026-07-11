@@ -309,99 +309,6 @@ fn relaunch_elevated_windows(_subcommand: &str, _forward: &[OsString]) -> Result
     Ok(())
 }
 
-/// Relaunch the *exact* current command elevated (verbatim argv + `--uac`). Used
-/// by the config commands (`env list`, `grant`, …) that would otherwise just
-/// fail reading the admin-locked state dir. Output and exit code come back to
-/// this terminal — see [`relaunch_elevated_and_wait`].
-#[cfg(windows)]
-pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    args.push("--uac".to_string());
-    relaunch_elevated_and_wait(&args)
-}
-
-/// Unix counterpart of [`relaunch_self_elevated_windows`]: re-exec the *exact*
-/// current command under `sudo` (which replaces this process). `sudo` preserves
-/// the controlling TTY — so interactive prompts still work — and the stdin pipe,
-/// so a `--password-stdin` secret still reaches the elevated child; `sudo`'s own
-/// auth reads `/dev/tty`. So a flagless `env add`/`cred add`/`grant` on
-/// Linux/macOS transparently elevates (like UAC on Windows) instead of dying with
-/// a raw "Permission denied" on the root-owned state dir. Never returns on
-/// success (exec). `ELEVATED_MARKER` stops the child re-elevating.
-#[cfg(unix)]
-pub(crate) fn relaunch_self_elevated_unix() -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let me = std::env::current_exe().context("resolve current exe")?;
-    let mut argv: Vec<OsString> = vec!["--".into(), me.as_os_str().to_owned()];
-    argv.extend(std::env::args_os().skip(1));
-    println!("Re-running under sudo to reach the root-owned state dir…");
-    let err = Command::new("sudo")
-        .args(&argv)
-        .env(ELEVATED_MARKER, "1")
-        .exec();
-    Err(anyhow::Error::new(err).context("exec sudo (is sudo installed and on PATH?)"))
-}
-
-/// Whether [`run_elevated_or`] must re-exec elevated: a config-touching command
-/// in service mode that isn't already privileged (`needs_elevation` folds in the
-/// per-OS not-root/not-admin + already-elevated checks). Pure so the (now
-/// cross-platform) decision is unit-testable without spawning sudo/UAC.
-fn should_elevate_config(
-    service: bool,
-    needs_config: bool,
-    target_needs_root: bool,
-    needs_elevation: bool,
-) -> bool {
-    service && needs_config && target_needs_root && needs_elevation
-}
-
-/// Wrap a config-touching command: in service mode, relaunch elevated if needed —
-/// Windows via UAC (the child re-runs verbatim and its output + exit code are
-/// mirrored back here), unix via a `sudo` re-exec — so `env add`/`cred add`/`grant`
-/// against the root-owned system dir work the same on all three platforms
-/// (`--user` never elevates; an already-root/elevated process doesn't re-elevate;
-/// `target_needs_root` is false for a per-user or v0.2.x legacy-fallback target,
-/// which is user-writable and must run in-process so the child doesn't re-resolve
-/// in a root context that can't reach the user's config or OS keychain).
-/// Otherwise run it directly. `interactive` marks a command that prompts via
-/// stdout/stderr (not console-direct `rpassword`): on Windows those can't run in a
-/// redirected UAC child, so we bail to an elevated terminal instead of relaunching
-/// into an invisible, hung prompt; on unix `sudo` keeps the TTY, so they prompt
-/// normally after the re-exec.
-pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
-    service: bool,
-    uac: bool,
-    needs_config: bool,
-    target_needs_root: bool,
-    interactive: bool,
-    run: F,
-) -> Result<()> {
-    if should_elevate_config(
-        service,
-        needs_config,
-        target_needs_root,
-        needs_service_elevation(uac),
-    ) {
-        #[cfg(windows)]
-        {
-            if interactive {
-                bail!(
-                    "administrator privileges are required, and this command prompts \
-                     interactively. Re-run it from an elevated terminal (Run as \
-                     administrator), or pass --user for a per-user setup."
-                );
-            }
-            return relaunch_self_elevated_windows();
-        }
-        #[cfg(unix)]
-        {
-            let _ = interactive; // sudo keeps the TTY, so prompts still work.
-            return relaunch_self_elevated_unix();
-        }
-    }
-    run()
-}
-
 /// Run a PowerShell script via `-EncodedCommand` (base64 UTF-16LE). Avoids
 /// command-line quoting/injection entirely, and — unlike a temp `.ps1` — never
 /// writes a predictable-named script an attacker could pre-stage in the shared
@@ -958,37 +865,6 @@ mod tests {
         assert!(
             elevate_or_print("init", &[], "needs root").is_err(),
             "non-interactive elevate must return Err, not a no-op Ok"
-        );
-    }
-
-    #[test]
-    fn config_elevation_decision() {
-        // R-F3: service + config-touching + system-dir target + not-yet-privileged
-        // → elevate (now on unix too, via sudo). The per-OS not-root/not-admin +
-        // already-elevated checks are folded into the `needs_elevation` argument.
-        // Arg order: (service, needs_config, target_needs_root, needs_elevation).
-        assert!(
-            should_elevate_config(true, true, true, true),
-            "service + needs config + system dir + not privileged must elevate"
-        );
-        assert!(
-            !should_elevate_config(false, true, true, true),
-            "--user (service=false) must never elevate"
-        );
-        assert!(
-            !should_elevate_config(true, true, true, false),
-            "already root/elevated must not re-elevate"
-        );
-        assert!(
-            !should_elevate_config(true, false, true, true),
-            "install-service (needs_config=false) renders an artifact, no elevation"
-        );
-        // D fix: a per-user / v0.2.x legacy-fallback target (not the system dir)
-        // is user-writable, so it must run in-process — never sudo/UAC into a root
-        // context that can't see the user's config or OS keychain.
-        assert!(
-            !should_elevate_config(true, true, false, true),
-            "non-system (per-user/legacy) target must not elevate"
         );
     }
 

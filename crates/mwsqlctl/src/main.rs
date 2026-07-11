@@ -1,14 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use mw_core::config::{EngineKind, Policy};
+use mw_core::control::{CredInputDto, NewEnvOutputDto, Request, Response};
+use mw_core::secret::SecretStr;
 use mw_core::state::{default_state_dir, env_flag, resolve_cli_target};
 
 use mwsqlctl::installer::InstallParams;
 use mwsqlctl::ops::{self, Target};
-use mwsqlctl::{audit_tail, bastion, cred, envs, init, policy, uninstall, wizard};
+use mwsqlctl::{audit_tail, bastion, control_client, cred, envs, init, policy, uninstall, wizard};
 
 #[derive(Parser)]
 #[command(name = "mwsqlctl", version, about = "middleWHERE admin CLI")]
@@ -33,6 +35,13 @@ struct Cli {
     /// re-elevate and pauses before its console closes.
     #[arg(long, global = true, hide = true)]
     uac: bool,
+
+    /// Edit the sealed config file directly instead of asking the running
+    /// service. Against the system deployment this needs an already-elevated
+    /// process (root / Administrator); the default talks to the service and
+    /// needs no elevation. `--user` deployments are always direct.
+    #[arg(long, global = true)]
+    offline: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -73,9 +82,9 @@ enum Cmd {
     /// Import an existing `.env` + `secrets/` deployment into the sealed config.
     Import(ImportArgs),
     /// Configure connections (bastions, credentials, envs) on an
-    /// already-installed deployment, then restart the service. Run `init`
-    /// first. Service mode self-elevates; `--user` configures the per-user
-    /// deployment.
+    /// already-installed deployment. Run `init` first. Service mode talks to the
+    /// running service over its control channel (no elevation, changes applied
+    /// live); `--user` configures the per-user deployment directly.
     #[command(alias = "setup")]
     Wizard(WizardArgs),
 }
@@ -315,7 +324,6 @@ fn main() -> Result<()> {
             user,
             file_keystore,
             service_name: w.service_name.clone(),
-            uac: cli.uac,
         });
     }
     if let Cmd::Init(a) = &cli.cmd {
@@ -339,257 +347,420 @@ fn main() -> Result<()> {
             uac: cli.uac,
         });
     }
+    // install-service only renders an artifact from its args (it never reads the
+    // sealed config), so it's dispatched directly, no mode/privilege gate.
+    if let Cmd::InstallService(a) = &cli.cmd {
+        return run_install_service(a, cli.state_dir.clone());
+    }
 
-    // Every remaining command reads/writes the sealed config except
-    // install-service (which only renders an artifact from its args). On
-    // Windows service mode those would fail against the admin-locked state dir,
-    // so wrap them: auto-elevate (relaunch in an admin console) when needed.
-    let service = !user;
-    let needs_config = !matches!(cli.cmd, Cmd::InstallService(_));
-    // `bastion add --key-file` asks about a key passphrase via read_yes_no (a
-    // stdout/stderr prompt, not console-direct rpassword), which a redirected UAC
-    // child can't display — mark it interactive so it bails to an elevated
-    // terminal rather than relaunching into a hidden prompt.
-    let interactive = matches!(&cli.cmd, Cmd::Bastion(BastionCmd::Add(a)) if a.key_file.is_some());
-    // Resolve the target up front so elevation is decided from WHERE we will
-    // actually read/write. Only the root-owned system dir needs elevation; a
-    // per-user or v0.2.x legacy-fallback deployment is user-writable and must run
-    // in-process — sudo/UAC would re-resolve in a root context that can't see the
-    // invoking user's config or OS keychain. default_state_dir() is env-independent,
-    // so the elevated child re-resolves to the same system dir.
+    // Every remaining command reads/writes the sealed config. In service mode we
+    // ask the running daemon over the control channel (no elevation); `--user`
+    // and `--offline` edit the config file in-process. `--offline` against the
+    // root/service-owned system dir needs an already-privileged process — the CLI
+    // no longer auto-elevates for config.
     let (state_dir, ks) = resolve_cli_target(cli.state_dir.clone(), user, file_keystore);
-    let target_needs_root = state_dir == mw_core::state::default_state_dir();
-    mwsqlctl::run_elevated_or(
-        service,
-        cli.uac,
-        needs_config,
+    let target_needs_root = state_dir == default_state_dir();
+    if !control_client::offline_privilege_ok(
+        cli.offline,
         target_needs_root,
-        interactive,
-        move || {
-            let t = Target::new(&state_dir, &ks);
+        mwsqlctl::is_privileged(),
+    ) {
+        if cfg!(windows) {
+            bail!(
+                "--offline edits the root/service-owned sealed config directly, which \
+                 needs Administrator. Re-run `mwsqlctl --offline …` from an elevated \
+                 terminal, or drop --offline to use the running service."
+            );
+        }
+        bail!(
+            "--offline edits the root/service-owned sealed config directly, which needs \
+             root. Re-run under `sudo mwsqlctl --offline …`, or drop --offline to use \
+             the running service."
+        );
+    }
+    let use_channel =
+        control_client::decide_mode(user, cli.offline) == control_client::Mode::Channel;
+    let t = Target::new(&state_dir, &ks);
 
-            match cli.cmd {
-                Cmd::Wizard(_) | Cmd::Init(_) | Cmd::Uninstall(_) => unreachable!("handled above"),
-                Cmd::Bastion(BastionCmd::Add(a)) => {
-                    let name = a.name.clone();
-                    ops::add_bastion(
-                        t,
-                        ops::BastionInput {
-                            name: a.name,
-                            host: a.host,
-                            port: a.port,
-                            ssh_user: a.ssh_user,
-                            key_file: a.key_file,
-                            password_stdin: a.password_stdin,
-                            fingerprints: a.fingerprints,
-                        },
-                    )?;
-                    eprintln!("bastion {name:?} added");
+    match cli.cmd {
+        Cmd::Wizard(_) | Cmd::Init(_) | Cmd::Uninstall(_) | Cmd::InstallService(_) => {
+            unreachable!("handled above")
+        }
+        Cmd::Bastion(BastionCmd::Add(a)) => {
+            let name = a.name.clone();
+            let input = ops::BastionInput {
+                name: a.name,
+                host: a.host,
+                port: a.port,
+                ssh_user: a.ssh_user,
+                key_file: a.key_file,
+                password_stdin: a.password_stdin,
+                fingerprints: a.fingerprints,
+            };
+            if use_channel {
+                // Resolve the secret locally, then send only the sealed DTO.
+                let auth = ops::resolve_bastion_auth(&input)?;
+                let dto = control_client::bastion_dto(&input, auth)?;
+                expect_ok(&state_dir, Request::AddBastion(dto))?;
+            } else {
+                ops::add_bastion(t, input)?;
+            }
+            eprintln!("bastion {name:?} added");
+        }
+        Cmd::Bastion(BastionCmd::Rm { name }) => {
+            if use_channel {
+                expect_ok(&state_dir, Request::RmBastion { name: name.clone() })?;
+            } else {
+                bastion::rm(&state_dir, &ks, &name)?;
+            }
+            eprintln!("bastion {:?} removed", name);
+        }
+        Cmd::Bastion(BastionCmd::List) => {
+            if use_channel {
+                for row in control_client::rows(&state_dir, &Request::ListBastions)? {
+                    println!("{row}");
                 }
-                Cmd::Bastion(BastionCmd::Rm { name }) => {
-                    bastion::rm(&state_dir, &ks, &name)?;
-                    eprintln!("bastion {:?} removed", name);
-                }
-                Cmd::Bastion(BastionCmd::List) => {
-                    for row in bastion::list(&state_dir, &ks)? {
-                        println!(
-                            "{}\t{}:{}\tuser={}\tauth={}\tfingerprints={}",
-                            row.name,
-                            row.host,
-                            row.port,
-                            row.ssh_user,
-                            row.auth_kind,
-                            row.pinned_fingerprints
-                        );
-                    }
-                }
-                Cmd::Cred(CredCmd::Add {
-                    name,
-                    db_user,
-                    password_stdin,
-                }) => {
-                    ops::add_credential(t, &name, &db_user, password_stdin)?;
-                    eprintln!("credential {name:?} added");
-                }
-                Cmd::Cred(CredCmd::Rotate {
-                    name,
-                    password_stdin,
-                }) => {
-                    ops::rotate_credential(t, &name, password_stdin)?;
-                    eprintln!("credential {name:?} rotated");
-                }
-                Cmd::Cred(CredCmd::Rm { name }) => {
-                    cred::rm(&state_dir, &ks, &name)?;
-                    eprintln!("credential {:?} removed", name);
-                }
-                Cmd::Cred(CredCmd::List) => {
-                    for row in cred::list(&state_dir, &ks)? {
-                        println!("{}\tuser={}", row.name, row.backend_user);
-                    }
-                }
-                Cmd::Env(EnvCmd::Add(a)) => {
-                    let name = a.name.clone();
-                    let no_validate = a.no_validate;
-                    let out = ops::add_env(
-                        t,
-                        ops::EnvInput {
-                            name: a.name,
-                            backend_host: a.backend_host,
-                            backend_port: a.backend_port,
-                            engine: a.engine.into(),
-                            database: a.database,
-                            bastion: a.bastion,
-                            credential: a.credential,
-                            policy: a.policy.into(),
-                            listen_port: a.listen_port,
-                            max_pool: a.max_pool,
-                        },
-                    )?;
-                    eprintln!("env {name:?} added.");
-                    // The token is one-time — always print it, even if validation
-                    // then fails (the env is kept; the operator fixes and re-tests).
-                    mwsqlctl::print_token_block(
-                        &name,
-                        out.listen_port,
-                        out.token.expose(),
-                        out.engine,
-                        out.database.as_deref(),
+            } else {
+                for row in bastion::list(&state_dir, &ks)? {
+                    println!(
+                        "{}\t{}:{}\tuser={}\tauth={}\tfingerprints={}",
+                        row.name,
+                        row.host,
+                        row.port,
+                        row.ssh_user,
+                        row.auth_kind,
+                        row.pinned_fingerprints
                     );
-                    if !no_validate {
-                        use mwsqlctl::probe::Validation;
-                        match mwsqlctl::probe::validate(&state_dir, &ks, Some(&name)) {
-                            Validation::Ok => eprintln!("✓ connected."),
-                            Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
-                            Validation::Failed(reason) => {
-                                // Keep the env; exit non-zero so CI/scripts notice.
-                                bail!("env {name:?} added but could not connect: {reason}");
-                            }
-                        }
-                    }
-                }
-                Cmd::Env(EnvCmd::Rm { name }) => {
-                    envs::rm(&state_dir, &ks, &name)?;
-                    eprintln!("env {:?} removed", name);
-                }
-                Cmd::Env(EnvCmd::RotateToken { name }) => {
-                    let token = envs::rotate_token(&state_dir, &ks, &name)?;
-                    eprintln!("env {:?} token rotated. New token (save now):", name);
-                    println!("{}", token.expose());
-                }
-                Cmd::Env(EnvCmd::List) => {
-                    for row in envs::list(&state_dir, &ks)? {
-                        println!(
-                            "{}\t{}\tengine={}\tbastion={}\tcred={}\tpolicy={}\tport={}",
-                            row.name,
-                            row.backend,
-                            row.engine,
-                            row.bastion.as_deref().unwrap_or("-"),
-                            row.credential,
-                            row.policy,
-                            row.listen_port
-                        );
-                    }
-                }
-                Cmd::Env(EnvCmd::Test { name, all }) => {
-                    use mwsqlctl::probe::Validation;
-                    let target = match (&name, all) {
-                        (Some(_), false) => name.as_deref(),
-                        (None, true) => None,
-                        (None, false) => bail!("specify an env name or --all"),
-                        (Some(_), true) => bail!("specify an env name or --all, not both"),
-                    };
-                    match mwsqlctl::probe::validate(&state_dir, &ks, target) {
-                        Validation::Ok => {
-                            eprintln!("✓ {} connected.", name.as_deref().unwrap_or("all envs"))
-                        }
-                        Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
-                        Validation::Failed(reason) => bail!("connection failed: {reason}"),
-                    }
-                }
-                Cmd::Policy(p) => {
-                    let target = match (p.read_only, p.read_write) {
-                        (true, false) => policy::PolicyTarget::ReadOnly,
-                        (false, true) => policy::PolicyTarget::ReadWrite,
-                        _ => bail!("specify exactly one of --read-only / --read-write"),
-                    };
-                    policy::set(&state_dir, &ks, &p.env, target, p.i_know_what_im_doing)?;
-                    eprintln!("env {:?} policy updated", p.env);
-                }
-                Cmd::AuditTail(a) => {
-                    for line in audit_tail::tail(&state_dir, a.n)? {
-                        println!("{line}");
-                    }
-                }
-                Cmd::InstallService(a) => {
-                    // A generated service unit runs as a dedicated account, so it
-                    // always targets the system state dir regardless of --user. An
-                    // explicit --state-dir still wins. This command keeps the
-                    // DynamicUser unit; the wizard generates the fixed-user variant.
-                    let svc_state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
-                    let exec_path = match a.exec_path {
-                        Some(p) => p,
-                        None => ops::default_daemon_path()?,
-                    };
-                    let params = InstallParams::new(
-                        &a.service_name,
-                        exec_path.to_string_lossy().to_string(),
-                        svc_state_dir.to_string_lossy().to_string(),
-                    );
-                    let art = ops::build_service_artifact(&params, false)?;
-                    if let Some(path) = a.write {
-                        ops::write_service_artifact(&path, &art.artifact, a.force)?;
-                        eprintln!("wrote {}", path.display());
-                        eprintln!(
-                            "\nNext steps (run with the privileges they require):\n{}",
-                            art.steps
-                        );
-                    } else {
-                        print!("{}", art.artifact);
-                        eprintln!("\n# ---- operator steps ----\n{}", art.steps);
-                    }
-                }
-                Cmd::Grant(g) => {
-                    let out = ops::grant(t, &g.env)?;
-                    if let Some(to) = &g.to {
-                        eprintln!(
-                            "granted env {:?} to {to} (token rotated; any prior token is now dead)",
-                            g.env
-                        );
-                    } else {
-                        eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
-                    }
-                    eprintln!("Deliver the token below to that identity over a secure channel.");
-                    mwsqlctl::print_token_block(
-                        &g.env,
-                        out.listen_port,
-                        out.token.expose(),
-                        out.engine,
-                        out.database.as_deref(),
-                    );
-                }
-                Cmd::Import(i) => {
-                    let report = mwsqlctl::import_poc::import(&state_dir, &ks, &i.from_dir)?;
-                    eprintln!(
-                        "imported {} bastion(s), {} credential(s), {} env(s):",
-                        report.bastions.len(),
-                        report.credentials.len(),
-                        report.envs.len()
-                    );
-                    for (name, port) in &report.envs {
-                        eprintln!("  env {name} -> 127.0.0.1:{port}");
-                    }
-                    if !report.warnings.is_empty() {
-                        eprintln!("\nwarnings:");
-                        for w in &report.warnings {
-                            eprintln!("  ! {w}");
-                        }
-                    }
-                    eprintln!("\n{}", mwsqlctl::import_poc::decommission_checklist());
                 }
             }
-            Ok(())
-        },
-    )
+        }
+        Cmd::Cred(CredCmd::Add {
+            name,
+            db_user,
+            password_stdin,
+        }) => {
+            if use_channel {
+                let pw = ops::read_secret("backend password: ", password_stdin)?;
+                expect_ok(
+                    &state_dir,
+                    Request::AddCred(CredInputDto {
+                        name: name.clone(),
+                        backend_user: db_user,
+                        password: SecretStr::new(pw),
+                    }),
+                )?;
+            } else {
+                ops::add_credential(t, &name, &db_user, password_stdin)?;
+            }
+            eprintln!("credential {name:?} added");
+        }
+        Cmd::Cred(CredCmd::Rotate {
+            name,
+            password_stdin,
+        }) => {
+            if use_channel {
+                let pw = ops::read_secret("new backend password: ", password_stdin)?;
+                expect_ok(
+                    &state_dir,
+                    Request::RotateCred {
+                        name: name.clone(),
+                        password: SecretStr::new(pw),
+                    },
+                )?;
+            } else {
+                ops::rotate_credential(t, &name, password_stdin)?;
+            }
+            eprintln!("credential {name:?} rotated");
+        }
+        Cmd::Cred(CredCmd::Rm { name }) => {
+            if use_channel {
+                expect_ok(&state_dir, Request::RmCred { name: name.clone() })?;
+            } else {
+                cred::rm(&state_dir, &ks, &name)?;
+            }
+            eprintln!("credential {:?} removed", name);
+        }
+        Cmd::Cred(CredCmd::List) => {
+            if use_channel {
+                for row in control_client::rows(&state_dir, &Request::ListCreds)? {
+                    println!("{row}");
+                }
+            } else {
+                for row in cred::list(&state_dir, &ks)? {
+                    println!("{}\tuser={}", row.name, row.backend_user);
+                }
+            }
+        }
+        Cmd::Env(EnvCmd::Add(a)) => {
+            let name = a.name.clone();
+            let no_validate = a.no_validate;
+            let input = ops::EnvInput {
+                name: a.name,
+                backend_host: a.backend_host,
+                backend_port: a.backend_port,
+                engine: a.engine.into(),
+                database: a.database,
+                bastion: a.bastion,
+                credential: a.credential,
+                policy: a.policy.into(),
+                listen_port: a.listen_port,
+                max_pool: a.max_pool,
+            };
+            let out: NewEnvOutputDto = if use_channel {
+                let dto = control_client::env_dto(&input);
+                expect_token(&state_dir, Request::AddEnv(dto))?
+            } else {
+                ops::add_env(t, input)?.into()
+            };
+            eprintln!("env {name:?} added.");
+            // The token is one-time — always print it, even if validation then
+            // fails (the env is kept; the operator fixes and re-tests).
+            mwsqlctl::print_token_block(
+                &name,
+                out.listen_port,
+                out.token.expose(),
+                out.engine,
+                out.database.as_deref(),
+            );
+            if !no_validate {
+                validate_after_add(use_channel, &state_dir, &ks, &name)?;
+            }
+        }
+        Cmd::Env(EnvCmd::Rm { name }) => {
+            if use_channel {
+                expect_ok(&state_dir, Request::RmEnv { name: name.clone() })?;
+            } else {
+                envs::rm(&state_dir, &ks, &name)?;
+            }
+            eprintln!("env {:?} removed", name);
+        }
+        Cmd::Env(EnvCmd::RotateToken { name }) => {
+            let token = if use_channel {
+                expect_token(&state_dir, Request::Grant { env: name.clone() })?.token
+            } else {
+                envs::rotate_token(&state_dir, &ks, &name)?
+            };
+            eprintln!("env {:?} token rotated. New token (save now):", name);
+            println!("{}", token.expose());
+        }
+        Cmd::Env(EnvCmd::List) => {
+            if use_channel {
+                for row in control_client::rows(&state_dir, &Request::ListEnvs)? {
+                    println!("{row}");
+                }
+            } else {
+                for row in envs::list(&state_dir, &ks)? {
+                    println!(
+                        "{}\t{}\tengine={}\tbastion={}\tcred={}\tpolicy={}\tport={}",
+                        row.name,
+                        row.backend,
+                        row.engine,
+                        row.bastion.as_deref().unwrap_or("-"),
+                        row.credential,
+                        row.policy,
+                        row.listen_port
+                    );
+                }
+            }
+        }
+        Cmd::Env(EnvCmd::Test { name, all }) => {
+            let target = match (&name, all) {
+                (Some(_), false) => name.as_deref(),
+                (None, true) => None,
+                (None, false) => bail!("specify an env name or --all"),
+                (Some(_), true) => bail!("specify an env name or --all, not both"),
+            };
+            if use_channel {
+                match control_client::checked_call(
+                    &state_dir,
+                    &Request::Probe {
+                        env: target.map(|s| s.to_string()),
+                        all,
+                    },
+                )? {
+                    Response::ProbeResults(rs) => control_client::render_probe_results(&rs)?,
+                    other => bail!("unexpected response from the service: {other:?}"),
+                }
+            } else {
+                use mwsqlctl::probe::Validation;
+                match mwsqlctl::probe::validate(&state_dir, &ks, target) {
+                    Validation::Ok => {
+                        eprintln!("✓ {} connected.", name.as_deref().unwrap_or("all envs"))
+                    }
+                    Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
+                    Validation::Failed(reason) => bail!("connection failed: {reason}"),
+                }
+            }
+        }
+        Cmd::Policy(p) => {
+            let target = control_client::policy_target(p.read_only, p.read_write)?;
+            if use_channel {
+                expect_ok(
+                    &state_dir,
+                    Request::SetPolicy {
+                        env: p.env.clone(),
+                        target,
+                        confirm_unsafe: p.i_know_what_im_doing,
+                    },
+                )?;
+            } else {
+                policy::set(&state_dir, &ks, &p.env, target, p.i_know_what_im_doing)?;
+            }
+            eprintln!("env {:?} policy updated", p.env);
+        }
+        Cmd::AuditTail(a) => {
+            let lines = if use_channel {
+                match control_client::checked_call(&state_dir, &Request::AuditTail { n: a.n })? {
+                    Response::AuditLines(v) => v,
+                    other => bail!("unexpected response from the service: {other:?}"),
+                }
+            } else {
+                audit_tail::tail(&state_dir, a.n)?
+            };
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Cmd::Grant(g) => {
+            let out: NewEnvOutputDto = if use_channel {
+                expect_token(&state_dir, Request::Grant { env: g.env.clone() })?
+            } else {
+                ops::grant(t, &g.env)?.into()
+            };
+            if let Some(to) = &g.to {
+                eprintln!(
+                    "granted env {:?} to {to} (token rotated; any prior token is now dead)",
+                    g.env
+                );
+            } else {
+                eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
+            }
+            eprintln!("Deliver the token below to that identity over a secure channel.");
+            mwsqlctl::print_token_block(
+                &g.env,
+                out.listen_port,
+                out.token.expose(),
+                out.engine,
+                out.database.as_deref(),
+            );
+        }
+        Cmd::Import(i) => {
+            let report = if use_channel {
+                // Parse the legacy source locally; the daemon merges the fragment.
+                let (fragment, report) = mwsqlctl::import_poc::build_from_dir(&i.from_dir)?;
+                expect_ok(&state_dir, Request::Import(Box::new(fragment)))?;
+                report
+            } else {
+                mwsqlctl::import_poc::import(&state_dir, &ks, &i.from_dir)?
+            };
+            print_import_report(&report);
+        }
+    }
+    Ok(())
+}
+
+/// Send a request that must return [`Response::Ok`], surfacing any other reply
+/// as an error. Wraps the not-reachable case in the "start the service" hint.
+fn expect_ok(state_dir: &Path, req: Request) -> Result<()> {
+    match control_client::checked_call(state_dir, &req)? {
+        Response::Ok => Ok(()),
+        other => bail!("unexpected response from the service: {other:?}"),
+    }
+}
+
+/// Send a request that must return a [`Response::Token`] (env add / grant).
+fn expect_token(state_dir: &Path, req: Request) -> Result<NewEnvOutputDto> {
+    match control_client::checked_call(state_dir, &req)? {
+        Response::Token(dto) => Ok(dto),
+        other => bail!("unexpected response from the service: {other:?}"),
+    }
+}
+
+/// Post-`env add` connectivity check. Service mode probes through the daemon;
+/// direct mode shells out to `mwsqld test`. Both keep the env on failure and
+/// exit non-zero so CI/scripts notice.
+fn validate_after_add(
+    use_channel: bool,
+    state_dir: &Path,
+    ks: &mw_core::state::KeystoreChoice,
+    name: &str,
+) -> Result<()> {
+    if use_channel {
+        match control_client::checked_call(
+            state_dir,
+            &Request::Probe {
+                env: Some(name.to_string()),
+                all: false,
+            },
+        )? {
+            Response::ProbeResults(rs) => control_client::render_probe_results(&rs)
+                .map_err(|e| anyhow!("env {name:?} added but could not connect: {e}"))?,
+            other => bail!("unexpected response from the service: {other:?}"),
+        }
+    } else {
+        use mwsqlctl::probe::Validation;
+        match mwsqlctl::probe::validate(state_dir, ks, Some(name)) {
+            Validation::Ok => eprintln!("✓ connected."),
+            Validation::Skipped(note) => eprintln!("validation skipped: {note}"),
+            Validation::Failed(reason) => {
+                bail!("env {name:?} added but could not connect: {reason}")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render an import report — the same output whether the merge happened
+/// in-process (`--user`/`--offline`) or through the daemon.
+fn print_import_report(report: &mwsqlctl::import_poc::ImportReport) {
+    eprintln!(
+        "imported {} bastion(s), {} credential(s), {} env(s):",
+        report.bastions.len(),
+        report.credentials.len(),
+        report.envs.len()
+    );
+    for (name, port) in &report.envs {
+        eprintln!("  env {name} -> 127.0.0.1:{port}");
+    }
+    if !report.warnings.is_empty() {
+        eprintln!("\nwarnings:");
+        for w in &report.warnings {
+            eprintln!("  ! {w}");
+        }
+    }
+    eprintln!("\n{}", mwsqlctl::import_poc::decommission_checklist());
+}
+
+/// Render the service artifact for the current platform from `install-service`'s
+/// args. Never reads config or elevates; the caller applies the printed steps.
+fn run_install_service(a: &InstallServiceArgs, state_dir: Option<PathBuf>) -> Result<()> {
+    // A generated service unit runs as a dedicated account, so it always targets
+    // the system state dir regardless of --user. An explicit --state-dir still
+    // wins. This keeps the DynamicUser unit; the wizard generates the fixed-user
+    // variant.
+    let svc_state_dir = state_dir.unwrap_or_else(default_state_dir);
+    let exec_path = match a.exec_path.clone() {
+        Some(p) => p,
+        None => ops::default_daemon_path()?,
+    };
+    let params = InstallParams::new(
+        &a.service_name,
+        exec_path.to_string_lossy().to_string(),
+        svc_state_dir.to_string_lossy().to_string(),
+    );
+    let art = ops::build_service_artifact(&params, false)?;
+    if let Some(path) = a.write.clone() {
+        ops::write_service_artifact(&path, &art.artifact, a.force)?;
+        eprintln!("wrote {}", path.display());
+        eprintln!(
+            "\nNext steps (run with the privileges they require):\n{}",
+            art.steps
+        );
+    } else {
+        print!("{}", art.artifact);
+        eprintln!("\n# ---- operator steps ----\n{}", art.steps);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
