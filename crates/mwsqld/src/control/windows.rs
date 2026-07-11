@@ -83,7 +83,7 @@ pub(crate) async fn serve_loop(
                             let _permit = permit;
                             // Carry the pipe handle into the resolver (see
                             // PipeHandle). The resolver runs AFTER handle_conn has
-                            // read the client's frames, so impersonation succeeds;
+                            // read the client's Hello frame, so impersonation succeeds;
                             // block_in_place keeps the impersonation thread-local
                             // with no await between impersonate and revert.
                             let handle = PipeHandle(conn.as_raw_handle());
@@ -197,7 +197,7 @@ fn build_sddl(admins_sid: &Option<Vec<u8>>) -> String {
 /// Resolve the peer's token membership. FAIL-CLOSED: an impersonation or token
 /// error yields `Deny` with a best-effort [`PeerIdentity`]. `RevertToSelf` runs
 /// on every exit via the Drop guard. `handle` is the pipe-server handle; the
-/// caller has already read the client's frames, so impersonation succeeds.
+/// caller has already read the client's Hello frame, so impersonation succeeds.
 fn resolve_peer(handle: HANDLE, admins_sid: &Option<Vec<u8>>) -> (AuthDecision, PeerIdentity) {
     if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
         return (

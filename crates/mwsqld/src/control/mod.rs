@@ -14,6 +14,7 @@
 //! bounded buffer and decoding off that, so mw-core stays runtime-agnostic.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -49,6 +50,13 @@ pub(crate) const ADMIN_GROUP: &str = "middlewhere-admins";
 /// keeps each task short-lived, so a small cap is plenty.
 const MAX_INFLIGHT: usize = 16;
 
+/// Cap on how long a denied connection waits to drain the client's pending
+/// `Request`. A cooperative client has already written it, so the drain returns
+/// at once; a Hello-only probe sends none, so this bounds the wait — the task
+/// (and its `MAX_INFLIGHT` permit) can never be pinned by a peer that never
+/// follows its `Hello` with a `Request`.
+const DENY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Spawn-free entry: run the platform accept loop until `shutdown` fires. Called
 /// from `Daemon::run`, holding an `Arc<Daemon>` so handlers can mutate the live
 /// env table. Any bind error is logged and the loop simply exits — a daemon that
@@ -81,6 +89,12 @@ pub(crate) async fn serve(daemon: Arc<Daemon>, shutdown: &mut broadcast::Receive
 ///   unauthorized peer (which never sends a `Request`) is still audited as a
 ///   deny with its uid/user — closing the audit gap that resolving after the
 ///   `Request` read would open.
+///
+/// On a DENY we still read and discard the client's pending `Request` (bounded by
+/// `MAX_FRAME`, and by [`DENY_DRAIN_TIMEOUT`] against a Hello-only probe that
+/// sends none) BEFORE replying: the CLI writes its whole (up to `MAX_FRAME`)
+/// `Request` before it reads our `Response`, so closing without draining would
+/// break its blocked write with a pipe error that masks the `Denied` diagnostic.
 ///
 /// `resolve` runs at most once, synchronously, with no `.await` between an
 /// impersonation and its revert (the Windows closure does the whole check under
@@ -118,6 +132,11 @@ where
     let (decision, peer) = resolve();
     if let AuthDecision::Deny(reason) = &decision {
         admin_event(&peer, "authz", "", Decision::Deny, Some(reason.clone())).emit();
+        // Drain the client's pending Request before replying so its blocked write
+        // completes and it reads this Denied instead of a broken pipe. Bounded by
+        // MAX_FRAME (read_request) and by DENY_DRAIN_TIMEOUT (a Hello-only probe
+        // sends no Request); the drained frame is discarded either way.
+        let _ = tokio::time::timeout(DENY_DRAIN_TIMEOUT, read_request(&mut stream)).await;
         let _ = write_response(&mut stream, &Response::Denied(reason.clone())).await;
         return;
     }
@@ -380,9 +399,12 @@ mod tests {
             },
         )
         .unwrap();
-        // NOTE: no Request frame is sent — only Hello.
+        // NOTE: no Request frame is sent — only Hello. Close the write half so the
+        // server's deny-drain read hits EOF at once instead of waiting out
+        // DENY_DRAIN_TIMEOUT; the read half stays open to receive the Denied.
         client.write_all(&buf).await.unwrap();
         client.flush().await.unwrap();
+        client.shutdown().await.unwrap();
         let resp = read_response(&mut client).await.unwrap();
         srv.await.unwrap();
 
@@ -390,6 +412,56 @@ mod tests {
             ran.load(Ordering::SeqCst),
             "authz must run on a Hello-only probe"
         );
+        match resp {
+            Response::Denied(r) => assert_eq!(r, "nope"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // D4: a denied peer whose Request is larger than the socket buffer must still
+    // read the Denied. The server has to DRAIN that pending Request first —
+    // otherwise the client's blocked write breaks with a pipe error before it
+    // ever reads the diagnostic. A tiny duplex buffer forces the client's write
+    // to block until the server drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denied_peer_with_large_request_still_reads_denied() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (daemon, _tmp) = empty_daemon().await;
+        let (client, server) = duplex(64);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let srv = tokio::spawn(async move {
+            handle_conn(daemon, server, move || {
+                flag.store(true, Ordering::SeqCst);
+                (AuthDecision::Deny("nope".into()), PeerIdentity::default())
+            })
+            .await;
+        });
+
+        let mut client = client;
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        // A Request whose encoding far exceeds the 64-byte duplex buffer, so
+        // write_all blocks until the server reads (drains) it.
+        write_frame(
+            &mut buf,
+            &Request::RmEnv {
+                name: "x".repeat(4096),
+            },
+        )
+        .unwrap();
+        client.write_all(&buf).await.unwrap();
+        client.flush().await.unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        srv.await.unwrap();
+
+        assert!(ran.load(Ordering::SeqCst), "authz must run");
         match resp {
             Response::Denied(r) => assert_eq!(r, "nope"),
             other => panic!("expected Denied, got {other:?}"),

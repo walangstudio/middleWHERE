@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::{error, info, warn};
 
@@ -63,7 +63,8 @@ pub struct EnvRuntime {
 /// connect, so publishing a new [`EnvRuntime`] via `current.send_replace` swaps
 /// what NEW connections see without disturbing in-flight ones. `abort` stops
 /// this env's accept loop (dropping its `sessions` JoinSet, so its live
-/// sessions too); `forwards` are the SSH tunnels this env's pool dials through.
+/// sessions too). This env's SSH tunnels live inside the published
+/// [`EnvRuntime`], not here, so an in-flight snapshot keeps them across a swap.
 struct EnvHandle {
     current: watch::Sender<Arc<EnvRuntime>>,
     abort: AbortHandle,
@@ -92,13 +93,11 @@ pub struct Daemon {
     /// Internal shutdown fan-out: every accept loop + the reaper subscribe to
     /// it; `run` fires it when the external shutdown signal arrives.
     shutdown: broadcast::Sender<()>,
-    /// Reaper cadence, fixed at bind (a later live add won't retune it). Tracks
-    /// the tightest initial idle timeout, or a 300s floor when the initial env
-    /// set is empty or all-zero — the common case now that a daemon starts with
-    /// no envs and gets them added live over the control channel. The reaper is
-    /// ALWAYS spawned and snapshots the live registry each tick, so live-added
-    /// envs are reaped; a fully-zero-timeout deployment just does nothing per tick.
-    reap_interval: Duration,
+    /// Wakes the reaper when the live env set changes so it retunes its sweep
+    /// cadence at once. `apply_add_env` signals it, so a live-added env with a
+    /// short idle timeout is swept within its own window instead of waiting out
+    /// the previous (possibly 60s) interval.
+    reap_wake: Arc<Notify>,
     // Below are threaded for Phase 5's live-mutation handlers; nothing reads
     // them yet.
     #[allow(dead_code)]
@@ -126,7 +125,6 @@ impl Daemon {
         let bastions = BastionRegistry::new();
         let envs: EnvRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (shutdown, _) = broadcast::channel(1);
-        let mut idle_timeouts = Vec::new();
 
         for (env_name, env) in &cfg.envs {
             // Stub engines: skip rather than fail the whole daemon so the
@@ -157,27 +155,15 @@ impl Daemon {
                 .await
                 .with_context(|| format!("bind {} for env {}", runtime.listen_addr, env_name))?;
             info!(env = env_name, addr = %listener.local_addr()?, "listening");
-            idle_timeouts.push(runtime.idle_timeout);
             let handle = spawn_env(Arc::new(runtime), listener, &shutdown);
             envs.lock().await.insert(env_name.clone(), handle);
         }
-
-        // One reaper serves every env. Cadence = the tightest non-zero initial
-        // timeout, else a 300s floor: envs are commonly added LIVE after the
-        // daemon starts empty, so a bind-time "no timeouts" snapshot must NOT
-        // disable reaping. The reaper is always spawned in `run`.
-        let reap_interval = idle_timeouts
-            .into_iter()
-            .filter(|d| !d.is_zero())
-            .min()
-            .map(reaper_interval)
-            .unwrap_or_else(|| reaper_interval(Duration::from_secs(300)));
 
         Ok(Self {
             state_dir,
             envs,
             shutdown,
-            reap_interval,
+            reap_wake: Arc::new(Notify::new()),
             ks,
             listen_host: listen_host.to_string(),
             allow_tofu,
@@ -197,9 +183,9 @@ impl Daemon {
         // cheap.
         let reap_abort = {
             let reap_envs = self.envs.clone();
+            let reap_wake = self.reap_wake.clone();
             let mut sub = self.shutdown.subscribe();
-            let interval = self.reap_interval;
-            tokio::spawn(async move { reap_loop(reap_envs, interval, &mut sub).await })
+            tokio::spawn(async move { reap_loop(reap_envs, reap_wake, &mut sub).await })
                 .abort_handle()
         };
 
@@ -277,6 +263,9 @@ impl Daemon {
             .with_context(|| format!("bind {} for env {}", runtime.listen_addr, name))?;
         let handle = spawn_env(Arc::new(runtime), listener, &self.shutdown);
         self.envs.lock().await.insert(name.to_string(), handle);
+        // Retune the reaper now, so this env's (possibly short) idle window takes
+        // effect immediately rather than after a sleep sized for the old cadence.
+        self.reap_wake.notify_one();
         Ok(())
     }
 
@@ -522,16 +511,21 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
 /// connections sitting idle in the pool are candidates).
 ///
 /// The cadence is RECOMPUTED each iteration from the CURRENT registry's tightest
-/// non-zero idle timeout (falling back to `base` when nothing has a timeout), so
-/// an env added live over the control channel with a short timeout is swept at
-/// its own cadence rather than the bind-time one. When every env is zero-timeout
-/// the loop sleeps `base` and does nothing (no busy-loop).
-async fn reap_loop(envs: EnvRegistry, base: Duration, shutdown: &mut broadcast::Receiver<()>) {
+/// non-zero idle timeout (falling back to [`REAP_FALLBACK_INTERVAL`] when nothing
+/// has a timeout), so an env added live over the control channel with a short
+/// timeout is swept at its own cadence rather than the bind-time one. A live add
+/// signals `wake` so the fresh cadence takes effect at once instead of after the
+/// current sleep. When every env is zero-timeout the loop idles at the fallback
+/// cadence and does nothing (no busy-loop).
+async fn reap_loop(envs: EnvRegistry, wake: Arc<Notify>, shutdown: &mut broadcast::Receiver<()>) {
     loop {
-        let interval = current_reap_interval(&envs, base).await;
+        let interval = current_reap_interval(&envs).await;
         tokio::select! {
             biased;
             _ = shutdown.recv() => break,
+            // A live env add wakes us so the NEXT sleep uses the fresh cadence
+            // rather than waiting out the current (possibly 60s) interval.
+            _ = wake.notified() => continue,
             _ = tokio::time::sleep(interval) => {
                 // Snapshot the current runtimes, then reap OFF-lock: `reap_idle`
                 // only touches idle pooled conns (never an in-flight query), and
@@ -559,9 +553,14 @@ async fn reap_loop(envs: EnvRegistry, base: Duration, shutdown: &mut broadcast::
     }
 }
 
+/// Fallback reap cadence when no live env has a non-zero idle timeout. Matches
+/// `reaper_interval`'s 60s ceiling, so an all-zero deployment wakes at most once a
+/// minute and finds nothing to do (cheap idle, no busy-loop).
+const REAP_FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Sweep cadence for the CURRENT env set: `reaper_interval` of the tightest
-/// non-zero idle timeout live right now, else `base`.
-async fn current_reap_interval(envs: &EnvRegistry, base: Duration) -> Duration {
+/// non-zero idle timeout live right now, else [`REAP_FALLBACK_INTERVAL`].
+async fn current_reap_interval(envs: &EnvRegistry) -> Duration {
     let guard = envs.lock().await;
     guard
         .values()
@@ -569,7 +568,7 @@ async fn current_reap_interval(envs: &EnvRegistry, base: Duration) -> Duration {
         .filter(|d| !d.is_zero())
         .min()
         .map(reaper_interval)
-        .unwrap_or(base)
+        .unwrap_or(REAP_FALLBACK_INTERVAL)
 }
 
 async fn accept_loop(
@@ -786,5 +785,111 @@ mod tests {
             "mssql must be flagged unsupported, not failed"
         );
         assert!(r.reason.contains("not supported"), "{}", r.reason);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingBackend(Arc<AtomicUsize>);
+    impl Backend for CountingBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn reap_idle(&self, _idle_timeout: Duration) -> usize {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+    }
+
+    fn runtime_with_timeout(backend: Arc<dyn Backend>, idle_timeout: Duration) -> EnvRuntime {
+        EnvRuntime {
+            name: "e".into(),
+            engine: engine_for(EngineKind::MySql),
+            backend,
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: [0; 20],
+            },
+            listen_addr: "127.0.0.1:1".parse().unwrap(),
+            idle_timeout,
+            forwards: Arc::new(Vec::new()),
+        }
+    }
+
+    fn env_handle(rt: EnvRuntime) -> EnvHandle {
+        let (current, _rx) = watch::channel(Arc::new(rt));
+        EnvHandle {
+            current,
+            abort: tokio::spawn(async {}).abort_handle(),
+            listen_addr: "127.0.0.1:1".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cadence_tracks_the_tightest_live_timeout() {
+        // D3: the reaper sizes its sleep from the LIVE registry each iteration.
+        let envs: EnvRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Empty: the cheap fallback, not a busy-loop.
+        assert_eq!(current_reap_interval(&envs).await, REAP_FALLBACK_INTERVAL);
+
+        // A zero-timeout env still yields the fallback (reaping is disabled for
+        // it, so it must not drive the cadence to zero).
+        let count = Arc::new(AtomicUsize::new(0));
+        let zero = runtime_with_timeout(Arc::new(CountingBackend(count.clone())), Duration::ZERO);
+        envs.lock().await.insert("z".into(), env_handle(zero));
+        assert_eq!(current_reap_interval(&envs).await, REAP_FALLBACK_INTERVAL);
+
+        // A short-timeout env tightens the cadence to reaper_interval(timeout).
+        let short = runtime_with_timeout(
+            Arc::new(CountingBackend(count.clone())),
+            Duration::from_secs(6),
+        );
+        envs.lock().await.insert("s".into(), env_handle(short));
+        assert_eq!(
+            current_reap_interval(&envs).await,
+            reaper_interval(Duration::from_secs(6))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_retunes_on_a_live_add_without_waiting_out_the_base_interval() {
+        // D3: a daemon that started empty sleeps at the 60s fallback. A live add
+        // must NOT sit idle behind that sleep — signalling `wake` retunes the
+        // cadence to the new env's window, so its first sweep lands promptly.
+        let envs: EnvRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let wake = Arc::new(Notify::new());
+        let (_sd, mut sd_rx) = broadcast::channel(1);
+
+        let reap_envs = envs.clone();
+        let reap_wake = wake.clone();
+        let task = tokio::spawn(async move { reap_loop(reap_envs, reap_wake, &mut sd_rx).await });
+
+        // Let the loop park on its first (empty-registry, 60s fallback) sleep.
+        tokio::task::yield_now().await;
+
+        // Live-add a short-timeout env and signal the reaper, exactly as
+        // apply_add_env does. reaper_interval(10s) = 5s.
+        let count = Arc::new(AtomicUsize::new(0));
+        let rt = runtime_with_timeout(
+            Arc::new(CountingBackend(count.clone())),
+            Duration::from_secs(10),
+        );
+        envs.lock().await.insert("e".into(), env_handle(rt));
+        wake.notify_one();
+
+        // Let the loop consume the wake and re-park on the fresh 5s sleep.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Advancing only 5s (< the 60s base) must trigger a sweep — proof the
+        // live add didn't wait out the previous interval.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "live-added env swept at its own cadence, not the 60s base"
+        );
+
+        task.abort();
     }
 }

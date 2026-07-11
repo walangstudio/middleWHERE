@@ -536,6 +536,10 @@ fn fail_msg(peer: &PeerIdentity, action: &str, target: &str, msg: &str) -> Respo
     Response::Error(msg.to_string())
 }
 
+/// The config change is durable but the env isn't serving yet; shared by the
+/// audit note and the user-facing advisory so the two never drift.
+const NOT_YET_LIVE: &str = "persisted but not yet live";
+
 /// A token-minting mutation (add_env / grant) whose config persisted but whose
 /// live apply then failed. The minted cleartext is ONE-TIME, so it must reach
 /// the operator even though the env isn't live yet — dropping it would strand an
@@ -549,17 +553,16 @@ fn token_but_not_live(
     out: mw_core::mutate::NewEnvOutput,
     e: anyhow::Error,
 ) -> Response {
-    let note = format!(
-        "{action} on {target} persisted but not yet live \
-         (restart the service to bind it): {e:#}"
-    );
+    let note =
+        format!("{action} on {target} {NOT_YET_LIVE} (restart the service to bind it): {e:#}");
     admin_event(peer, action, target, Decision::Error, Some(note.clone())).emit();
     warn!("{note}");
     // Carry a user-facing advisory in the token response so the CLI can warn the
     // operator that the env isn't serving yet (vs a clean success, note=None).
     let mut dto: mw_core::control::NewEnvOutputDto = out.into();
-    dto.note =
-        Some("persisted but not yet live — restart the service to bind this env".to_string());
+    dto.note = Some(format!(
+        "{NOT_YET_LIVE} — restart the service to bind this env"
+    ));
     Response::Token(dto)
 }
 
