@@ -210,7 +210,9 @@ pub fn run(opts: WizardOpts) -> Result<()> {
 }
 
 fn run_inner(opts: WizardOpts) -> Result<()> {
-    let service = !opts.user;
+    // Share the one mode decision with the command router so they can't drift.
+    // The wizard has no --offline, so it's Channel iff service mode (not --user).
+    let service = control_client::decide_mode(opts.user, false) == control_client::Mode::Channel;
 
     // Interactive-only. Fail before doing anything when there's no terminal.
     if !std::io::stdin().is_terminal() {

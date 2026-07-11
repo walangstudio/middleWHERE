@@ -56,15 +56,19 @@ pub enum Mode {
     Direct,
 }
 
-/// Resolve the access mode. The channel is used ONLY for a flagless command
-/// against the system service dir — the one deployment a running daemon owns.
-/// Everything else is direct (in-process file): `--user` (per-user, no service),
-/// `--offline` (explicit direct), or a target that isn't the system service dir
-/// (a custom `--state-dir`, or a v0.2.x legacy per-user fallback — no daemon
-/// listens there, so dialing a socket would just fail; edit the file instead).
-/// `target_is_system` is `state_dir == default_state_dir()`.
-pub fn decide_mode(user: bool, offline: bool, target_is_system: bool) -> Mode {
-    if user || offline || !target_is_system {
+/// Resolve the access mode from the two flags. Direct (in-process file) iff
+/// `--user` (a per-user deployment has no service) or `--offline` (explicit
+/// direct); otherwise service mode talks to the daemon over the channel.
+///
+/// The socket/pipe path is state-dir-independent — a daemon installed with any
+/// `--state-dir` still listens at the fixed `/run/middlewhere/mwsqld.sock` (or
+/// the fixed Windows pipe) — so the resolved state dir is NOT a mode signal: a
+/// custom-`--state-dir` service install is still reachable over the channel. If
+/// no daemon is up, [`call`] returns [`CallError::Unreachable`] and the CLI
+/// prints the recovery hint. The command router and the wizard share this one
+/// helper so they can never drift.
+pub fn decide_mode(user: bool, offline: bool) -> Mode {
+    if user || offline {
         Mode::Direct
     } else {
         Mode::Channel
@@ -229,8 +233,9 @@ pub fn checked_call(state_dir: &Path, req: &Request) -> Result<Response> {
     match call(CONTROL_SERVICE_NAME, state_dir, req) {
         Ok(r) => Ok(r),
         Err(CallError::Unreachable(ep)) => bail!(
-            "the middleWHERE service isn't reachable at {ep}; start it, or run \
-             {} to edit the sealed config directly.",
+            "the middleWHERE service isn't reachable at {ep}; start it, pass \
+             --user for a per-user deployment, or run {} to edit the sealed \
+             config directly.",
             offline_hint()
         ),
         Err(CallError::Failed(e)) => Err(e),
@@ -469,20 +474,14 @@ mod tests {
     }
 
     #[test]
-    fn decide_mode_channel_only_for_flagless_system_target() {
-        // The one channel case: flagless, against the system service dir.
-        assert_eq!(decide_mode(false, false, true), Mode::Channel);
-
-        // Any flag forces direct even against the system dir.
-        assert_eq!(decide_mode(true, false, true), Mode::Direct); // --user
-        assert_eq!(decide_mode(false, true, true), Mode::Direct); // --offline
-
-        // A non-system target (custom --state-dir / legacy per-user fallback) is
-        // direct even flagless — no daemon owns it, so dialing a socket would just
-        // fail; edit the file. (Regression: the old target_needs_root gate.)
-        assert_eq!(decide_mode(false, false, false), Mode::Direct);
-        assert_eq!(decide_mode(true, false, false), Mode::Direct);
-        assert_eq!(decide_mode(false, true, false), Mode::Direct);
+    fn decide_mode_channel_iff_service_mode() {
+        // Flagless service mode → channel; the resolved state dir is irrelevant
+        // (the socket/pipe path is state-dir-independent).
+        assert_eq!(decide_mode(false, false), Mode::Channel);
+        // Either flag forces direct.
+        assert_eq!(decide_mode(true, false), Mode::Direct); // --user
+        assert_eq!(decide_mode(false, true), Mode::Direct); // --offline
+        assert_eq!(decide_mode(true, true), Mode::Direct);
     }
 
     #[cfg(unix)]

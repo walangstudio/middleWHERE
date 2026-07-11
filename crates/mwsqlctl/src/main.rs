@@ -378,11 +378,13 @@ fn main() -> Result<()> {
              the running service."
         );
     }
-    // Channel only for a flagless command against the system service dir; a
-    // custom --state-dir or a legacy per-user fallback (target_needs_root false)
-    // has no daemon, so it stays direct.
-    let use_channel = control_client::decide_mode(user, cli.offline, target_needs_root)
-        == control_client::Mode::Channel;
+    // Service mode talks to the running daemon over the control channel; `--user`
+    // and `--offline` edit a config file directly. The socket/pipe path is
+    // state-dir-independent, so the daemon (authoritative for whatever config it
+    // loaded) serves the request regardless of `--state-dir`; if none is running,
+    // the control client returns Unreachable and the router prints the hint.
+    let use_channel =
+        control_client::decide_mode(user, cli.offline) == control_client::Mode::Channel;
     let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {
