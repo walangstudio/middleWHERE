@@ -188,9 +188,22 @@ impl BastionRegistry {
 /// One local-port forwarder. `local_port` is the address the backend pool
 /// should connect to; the task copies bytes between that local socket and
 /// a freshly-opened `direct-tcpip` channel for each accepted connection.
+///
+/// Dropping a `LocalForward` ABORTS its accept task (see the `Drop` impl): a bare
+/// `JoinHandle` only detaches on drop, which would leave the 127.0.0.1 listener
+/// (and, via the captured bastion-session slot, the SSH tunnel) running forever
+/// after a live `env rm` / credential-or-bastion rotate / probe teardown.
 pub struct LocalForward {
     pub local_port: u16,
-    pub _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LocalForward {
+    fn drop(&mut self) {
+        // Stop the accept loop so the local listener is released and no new
+        // tunnels are opened through the bastion once this forward is discarded.
+        self.task.abort();
+    }
 }
 
 /// Bind a local listener on 127.0.0.1:0 and start forwarding accepted conns
@@ -233,8 +246,5 @@ pub async fn start_local_forward(
             });
         }
     });
-    Ok(LocalForward {
-        local_port,
-        _task: task,
-    })
+    Ok(LocalForward { local_port, task })
 }

@@ -68,21 +68,24 @@ pub(crate) async fn serve(daemon: Arc<Daemon>, shutdown: &mut broadcast::Receive
     }
 }
 
-/// Shared per-connection state machine, generic over the transport stream. The
-/// caller has already resolved the peer identity + authorization decision
-/// (platform-specific, done before the first `.await` so Windows impersonation
-/// stays thread-local). Sequence: read `Hello` + version-check, enforce the
-/// authz decision, read one request, dispatch, write one response, close.
-async fn handle_conn<S>(
-    daemon: Arc<Daemon>,
-    mut stream: S,
-    decision: AuthDecision,
-    peer: PeerIdentity,
-) where
+/// Shared per-connection state machine, generic over the transport stream.
+///
+/// CRITICAL ORDERING: the daemon reads the client's `Hello` + `Request` frames
+/// FIRST, and only THEN runs `resolve` (the platform peer-identity + authz
+/// decision). Windows `ImpersonateNamedPipeClient` fails with
+/// `ERROR_CANNOT_IMPERSONATE` until the client has written to the pipe, so
+/// resolving before the read would deny every request. Reading a frame mutates
+/// nothing and is bounded by `MAX_FRAME`; authorization still gates DISPATCH, so
+/// an unauthorized peer's request is parsed but never applied. `resolve` is
+/// called at most once, synchronously, with no `.await` between an impersonation
+/// and its revert (the Windows closure runs the whole check under
+/// `block_in_place`).
+async fn handle_conn<S, R>(daemon: Arc<Daemon>, mut stream: S, resolve: R)
+where
     S: AsyncRead + AsyncWrite + Unpin,
+    R: FnOnce() -> (AuthDecision, PeerIdentity),
 {
-    // 1. Version preamble. Reject a mismatch (or a missing Hello) before doing
-    //    any work or leaking whether authz would have passed.
+    // 1. Version preamble. Reject a mismatch (or a missing Hello) up front.
     match read_request(&mut stream).await {
         Ok(Request::Hello { version }) if version == PROTOCOL_VERSION => {}
         Ok(Request::Hello { .. }) => {
@@ -104,19 +107,23 @@ async fn handle_conn<S>(
         Err(_) => return, // truncated/hostile framing: drop silently.
     }
 
-    // 2. Enforce authorization. A denied peer is audited and told, then dropped
-    //    without ever reading its request payload.
+    // 2. The request. Read it BEFORE authorizing so the client has written to
+    //    the pipe (a hard requirement for Windows named-pipe impersonation).
+    let req = match read_request(&mut stream).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // 3. Resolve the peer identity + authorization decision. On Windows this
+    //    impersonates the now-written pipe client; on Unix it reads SO_PEERCRED.
+    let (decision, peer) = resolve();
     if let AuthDecision::Deny(reason) = &decision {
         admin_event(&peer, "authz", "", Decision::Deny, Some(reason.clone())).emit();
         let _ = write_response(&mut stream, &Response::Denied(reason.clone())).await;
         return;
     }
 
-    // 3. The actual request. Dispatch emits its own per-action audit line.
-    let req = match read_request(&mut stream).await {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+    // 4. Dispatch. Each handler emits its own per-action audit line.
     let resp = handlers::dispatch(&daemon, &peer, req).await;
     if let Err(e) = write_response(&mut stream, &resp).await {
         warn!(err = %e, "control response write failed");
@@ -279,6 +286,101 @@ mod tests {
         let mut server = server;
         let err = read_request(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("exceeds MAX_FRAME"), "{err}");
+    }
+
+    /// A live but env-less daemon with a sealed empty config on disk, so
+    /// `ListEnvs` dispatch (which reloads the config) succeeds. The returned
+    /// `TempDir` must be kept in scope for the daemon's lifetime.
+    async fn empty_daemon() -> (Arc<Daemon>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ks = mw_core::state::KeystoreChoice::default_file(tmp.path());
+        mw_core::state::init(tmp.path(), &ks).unwrap();
+        let daemon = Daemon::bind(
+            tmp.path().to_path_buf(),
+            &mw_core::config::Config::default(),
+            "127.0.0.1",
+            false,
+            ks,
+        )
+        .await
+        .unwrap();
+        (Arc::new(daemon), tmp)
+    }
+
+    // The reorder fix (bug #1): handle_conn must read Hello + Request BEFORE
+    // calling `resolve`. Proven on the ALLOW path — reaching dispatch (empty
+    // `ListEnvs` -> empty Rows) is only possible if the request was read first,
+    // and the flag confirms `resolve` ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_conn_reads_request_before_resolve_then_dispatches() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (daemon, _tmp) = empty_daemon().await;
+        let (client, server) = duplex(4096);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+
+        let srv = tokio::spawn(async move {
+            handle_conn(daemon, server, move || {
+                flag.store(true, Ordering::SeqCst);
+                (AuthDecision::Allow, PeerIdentity::default())
+            })
+            .await;
+        });
+
+        let mut client = client;
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        write_frame(&mut buf, &Request::ListEnvs).unwrap();
+        client.write_all(&buf).await.unwrap();
+        client.flush().await.unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        srv.await.unwrap();
+
+        assert!(ran.load(Ordering::SeqCst), "resolver must have run");
+        match resp {
+            Response::Rows(rows) => assert!(rows.is_empty(), "no envs => no rows"),
+            other => panic!("expected empty Rows, got {other:?}"),
+        }
+    }
+
+    // Same reorder path, DENY branch through the real handle_conn: the request is
+    // read, then `resolve` denies, then the client gets Denied (no dispatch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_conn_denies_after_reading_request() {
+        let (daemon, _tmp) = empty_daemon().await;
+        let (client, server) = duplex(4096);
+        let srv = tokio::spawn(async move {
+            handle_conn(daemon, server, || {
+                (AuthDecision::Deny("nope".into()), PeerIdentity::default())
+            })
+            .await;
+        });
+
+        let mut client = client;
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        write_frame(&mut buf, &Request::ListEnvs).unwrap();
+        client.write_all(&buf).await.unwrap();
+        client.flush().await.unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        srv.await.unwrap();
+
+        match resp {
+            Response::Denied(r) => assert_eq!(r, "nope"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     // Response reader mirroring read_request, for the test client half.

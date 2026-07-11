@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -60,8 +60,12 @@ pub(crate) async fn serve_loop(
                     let daemon = Arc::clone(&daemon);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let (decision, peer) = resolve_peer(&stream);
-                        handle_conn(daemon, stream, decision, peer).await;
+                        // Capture the fd; `stream` owns it and stays alive inside
+                        // handle_conn, so the resolver reads valid creds. On Unix
+                        // SO_PEERCRED needs no prior client write, but resolving
+                        // after the read keeps one code path with Windows.
+                        let fd = stream.as_raw_fd();
+                        handle_conn(daemon, stream, move || resolve_peer(fd)).await;
                     });
                 }
                 Err(e) => {
@@ -243,8 +247,7 @@ fn cpath(path: &Path) -> Option<std::ffi::CString> {
 
 /// Resolve the connecting peer and decide. FAIL-CLOSED: any resolution error
 /// yields `Deny` with a best-effort [`PeerIdentity`] for the audit record.
-fn resolve_peer(stream: &UnixStream) -> (AuthDecision, PeerIdentity) {
-    let fd = stream.as_raw_fd();
+fn resolve_peer(fd: RawFd) -> (AuthDecision, PeerIdentity) {
     let (uid, gid) = match peer_creds(fd) {
         Some(c) => c,
         None => {

@@ -78,9 +78,13 @@ pub struct Daemon {
     /// Internal shutdown fan-out: every accept loop + the reaper subscribe to
     /// it; `run` fires it when the external shutdown signal arrives.
     shutdown: broadcast::Sender<()>,
-    /// Reaper cadence, fixed from the initial env set (a later add won't retune
-    /// it). `None` when no env has a non-zero idle timeout.
-    reap_interval: Option<Duration>,
+    /// Reaper cadence, fixed at bind (a later live add won't retune it). Tracks
+    /// the tightest initial idle timeout, or a 300s floor when the initial env
+    /// set is empty or all-zero — the common case now that a daemon starts with
+    /// no envs and gets them added live over the control channel. The reaper is
+    /// ALWAYS spawned and snapshots the live registry each tick, so live-added
+    /// envs are reaped; a fully-zero-timeout deployment just does nothing per tick.
+    reap_interval: Duration,
     // Below are threaded for Phase 5's live-mutation handlers; nothing reads
     // them yet.
     #[allow(dead_code)]
@@ -144,13 +148,16 @@ impl Daemon {
             envs.lock().await.insert(env_name.clone(), handle);
         }
 
-        // One reaper serves every env; its cadence tracks the tightest configured
-        // timeout. `None` (skip reaping) when no env has a non-zero timeout.
+        // One reaper serves every env. Cadence = the tightest non-zero initial
+        // timeout, else a 300s floor: envs are commonly added LIVE after the
+        // daemon starts empty, so a bind-time "no timeouts" snapshot must NOT
+        // disable reaping. The reaper is always spawned in `run`.
         let reap_interval = idle_timeouts
             .into_iter()
             .filter(|d| !d.is_zero())
             .min()
-            .map(reaper_interval);
+            .map(reaper_interval)
+            .unwrap_or_else(|| reaper_interval(Duration::from_secs(300)));
 
         Ok(Self {
             state_dir,
@@ -170,13 +177,17 @@ impl Daemon {
     /// keep running. The two binary call sites wrap the bound daemon in an `Arc`.
     pub async fn run(self: Arc<Self>, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
         // One sweep task serves every env; it breaks on the internal shutdown
-        // fan-out below. Skipped entirely when no env has a non-zero timeout.
-        let reap_abort = self.reap_interval.map(|interval| {
+        // fan-out below. ALWAYS spawned (even for a zero-env / all-zero-timeout
+        // daemon) so envs added live over the control channel are still reaped;
+        // the loop skips zero-timeout envs per tick, so an all-zero deployment is
+        // cheap.
+        let reap_abort = {
             let reap_envs = self.envs.clone();
             let mut sub = self.shutdown.subscribe();
+            let interval = self.reap_interval;
             tokio::spawn(async move { reap_loop(reap_envs, interval, &mut sub).await })
                 .abort_handle()
-        });
+        };
 
         // Control channel: apply CLI-sent config mutations on the live daemon.
         // Shares the same internal shutdown fan-out as the env accept loops, so
@@ -197,9 +208,7 @@ impl Daemon {
         for (_, handle) in self.envs.lock().await.drain() {
             handle.abort.abort();
         }
-        if let Some(reap) = reap_abort {
-            reap.abort();
-        }
+        reap_abort.abort();
         control_abort.abort();
         info!("clean exit");
         Ok(())

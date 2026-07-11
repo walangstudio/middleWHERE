@@ -378,8 +378,11 @@ fn main() -> Result<()> {
              the running service."
         );
     }
-    let use_channel =
-        control_client::decide_mode(user, cli.offline) == control_client::Mode::Channel;
+    // Channel only for a flagless command against the system service dir; a
+    // custom --state-dir or a legacy per-user fallback (target_needs_root false)
+    // has no daemon, so it stays direct.
+    let use_channel = control_client::decide_mode(user, cli.offline, target_needs_root)
+        == control_client::Mode::Channel;
     let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {

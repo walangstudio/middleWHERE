@@ -59,6 +59,9 @@ pub(crate) async fn serve_loop(
     }
 
     let sem = inflight_limiter();
+    // The FIRST instance failing is fatal to the channel (logged by the caller);
+    // in-loop failures below are non-fatal (log + continue) so one transient
+    // error can't kill the control channel for the daemon's lifetime.
     let mut server = create_instance(&pipe_name, true, &admins_sid)?;
     info!(pipe = %pipe_name, "control channel listening");
 
@@ -67,33 +70,71 @@ pub(crate) async fn serve_loop(
             biased;
             _ = shutdown.recv() => break,
             res = server.connect() => match res {
-                Ok(()) => {
-                    let next = create_instance(&pipe_name, false, &admins_sid)?;
-                    let permit = match Arc::clone(&sem).acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break,
-                    };
-                    let conn = std::mem::replace(&mut server, next);
-                    let daemon = Arc::clone(&daemon);
-                    let admins_sid = admins_sid.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        // Impersonation is thread-local: resolve the peer inline
-                        // (no yield) BEFORE any await inside the handler.
-                        let (decision, peer) =
-                            tokio::task::block_in_place(|| resolve_peer(&conn, &admins_sid));
-                        handle_conn(daemon, conn, decision, peer).await;
-                    });
-                }
+                Ok(()) => match create_instance(&pipe_name, false, &admins_sid) {
+                    Ok(next) => {
+                        let permit = match Arc::clone(&sem).acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        let conn = std::mem::replace(&mut server, next);
+                        let daemon = Arc::clone(&daemon);
+                        let admins_sid = admins_sid.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            // Carry the pipe handle into the resolver (see
+                            // PipeHandle). The resolver runs AFTER handle_conn has
+                            // read the client's frames, so impersonation succeeds;
+                            // block_in_place keeps the impersonation thread-local
+                            // with no await between impersonate and revert.
+                            let handle = PipeHandle(conn.as_raw_handle());
+                            handle_conn(daemon, conn, move || {
+                                // Rebind the whole PipeHandle: edition-2021 disjoint
+                                // capture would otherwise grab the !Send raw field
+                                // and make the task future !Send.
+                                let handle = handle;
+                                tokio::task::block_in_place(|| resolve_peer(handle.0, &admins_sid))
+                            })
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        // No replacement listener: don't tear down the channel.
+                        // Drop this client, reuse the current instance as the
+                        // next listener after a short backoff.
+                        warn!(
+                            err = %format!("{e:#}"),
+                            "could not create replacement control pipe instance; dropping connection"
+                        );
+                        let _ = server.disconnect();
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                },
                 Err(e) => {
                     warn!(err = %e, "named pipe connect failed");
-                    server = create_instance(&pipe_name, false, &admins_sid)?;
+                    match create_instance(&pipe_name, false, &admins_sid) {
+                        Ok(s) => server = s,
+                        Err(e2) => {
+                            warn!(
+                                err = %format!("{e2:#}"),
+                                "could not recreate control pipe instance; backing off"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
                 }
             }
         }
     }
     Ok(())
 }
+
+/// A raw pipe `HANDLE` is `*mut c_void` (`!Send`), but a Windows handle is valid
+/// process-wide; carrying it into the connection task for the thread-local
+/// impersonation (done under `block_in_place`) is sound.
+struct PipeHandle(HANDLE);
+// SAFETY: the handle references a kernel pipe object usable from any thread in
+// the process; we only read it, under block_in_place, on one worker thread.
+unsafe impl Send for PipeHandle {}
 
 /// Create one pipe instance with the admins-only DACL. `first` sets
 /// `first_pipe_instance` so a squatter cannot pre-create the pipe name and
@@ -155,13 +196,9 @@ fn build_sddl(admins_sid: &Option<Vec<u8>>) -> String {
 
 /// Resolve the peer's token membership. FAIL-CLOSED: an impersonation or token
 /// error yields `Deny` with a best-effort [`PeerIdentity`]. `RevertToSelf` runs
-/// on every exit via the Drop guard.
-fn resolve_peer(
-    conn: &NamedPipeServer,
-    admins_sid: &Option<Vec<u8>>,
-) -> (AuthDecision, PeerIdentity) {
-    // RawHandle and HANDLE are both `*mut c_void`; no cast needed.
-    let handle: HANDLE = conn.as_raw_handle();
+/// on every exit via the Drop guard. `handle` is the pipe-server handle; the
+/// caller has already read the client's frames, so impersonation succeeds.
+fn resolve_peer(handle: HANDLE, admins_sid: &Option<Vec<u8>>) -> (AuthDecision, PeerIdentity) {
     if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
         return (
             AuthDecision::Deny(format!(

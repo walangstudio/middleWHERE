@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tracing::warn;
 
 use mw_core::audit::Decision;
 use mw_core::config::{Config, EngineKind};
@@ -236,7 +237,11 @@ async fn add_env_req(daemon: &Arc<Daemon>, peer: &PeerIdentity, dto: EnvInputDto
     match cfg.envs.get(&target) {
         Some(env) => {
             if let Err(e) = daemon.apply_add_env(&cfg, env, &target).await {
-                return persisted_but_apply_failed(peer, "add_env", &target, &target, e);
+                // The env + its token hash are already durable. The minted token
+                // is ONE-TIME — never swallow it, or the operator is locked out
+                // of an env that now exists. Return it with the not-yet-live
+                // condition recorded in the audit log; a restart binds the env.
+                return token_but_not_live(peer, "add_env", &target, out, e);
             }
         }
         None => return fail_msg(peer, "add_env", &target, "env vanished after save"),
@@ -282,7 +287,10 @@ async fn grant_req(daemon: &Arc<Daemon>, peer: &PeerIdentity, env: String) -> Re
         Some(e) => {
             let new_auth = e.client_auth.clone();
             if let Err(err) = daemon.apply_swap_authz(&env, new_auth).await {
-                return persisted_but_apply_failed(peer, "grant", &env, &env, err);
+                // The rotated token hash is durable; the cleartext is one-time.
+                // Return it rather than stranding the operator with a token they
+                // just invalidated but never received.
+                return token_but_not_live(peer, "grant", &env, out, err);
             }
         }
         None => return fail_msg(peer, "grant", &env, "env vanished after save"),
@@ -526,6 +534,28 @@ fn fail(peer: &PeerIdentity, action: &str, target: &str, e: anyhow::Error) -> Re
 fn fail_msg(peer: &PeerIdentity, action: &str, target: &str, msg: &str) -> Response {
     admin_event(peer, action, target, Decision::Error, Some(msg.to_string())).emit();
     Response::Error(msg.to_string())
+}
+
+/// A token-minting mutation (add_env / grant) whose config persisted but whose
+/// live apply then failed. The minted cleartext is ONE-TIME, so it must reach
+/// the operator even though the env isn't live yet — dropping it would strand an
+/// env that now exists. Audit the not-yet-live condition + warn, but still return
+/// the token. (The CLI can't yet render this warning alongside the token — that
+/// would need a protocol field; the daemon log carries it.)
+fn token_but_not_live(
+    peer: &PeerIdentity,
+    action: &str,
+    target: &str,
+    out: mw_core::mutate::NewEnvOutput,
+    e: anyhow::Error,
+) -> Response {
+    let note = format!(
+        "{action} on {target} persisted but not yet live \
+         (restart the service to bind it): {e:#}"
+    );
+    admin_event(peer, action, target, Decision::Error, Some(note.clone())).emit();
+    warn!("{note}");
+    Response::Token(out.into())
 }
 
 /// The config was persisted but the live apply failed. The two now disagree

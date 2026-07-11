@@ -56,11 +56,15 @@ pub enum Mode {
     Direct,
 }
 
-/// Resolve the access mode from the two flags. `--user` is always direct (a
-/// per-user deployment has no service); `--offline` forces direct even in
-/// service mode; otherwise service mode goes through the channel.
-pub fn decide_mode(user: bool, offline: bool) -> Mode {
-    if user || offline {
+/// Resolve the access mode. The channel is used ONLY for a flagless command
+/// against the system service dir — the one deployment a running daemon owns.
+/// Everything else is direct (in-process file): `--user` (per-user, no service),
+/// `--offline` (explicit direct), or a target that isn't the system service dir
+/// (a custom `--state-dir`, or a v0.2.x legacy per-user fallback — no daemon
+/// listens there, so dialing a socket would just fail; edit the file instead).
+/// `target_is_system` is `state_dir == default_state_dir()`.
+pub fn decide_mode(user: bool, offline: bool, target_is_system: bool) -> Mode {
+    if user || offline || !target_is_system {
         Mode::Direct
     } else {
         Mode::Channel
@@ -303,33 +307,61 @@ fn call_unix(service_name: &str, state_dir: &Path, req: &Request) -> Result<Resp
     finish(exchange(&mut stream, req))
 }
 
-/// The daemon prefers `/run/middlewhere/<svc>.sock`, falling back to
-/// `<state_dir>/control.sock`. Dial the run-dir socket when it exists, else the
-/// state-dir fallback — mirroring the daemon's own choice.
+/// The shared runtime dir the daemon binds its socket in, mirrored **exactly**
+/// from mwsqld `control::unix::runtime_dir_for`: `/run/middlewhere` on Linux,
+/// `/var/run/middlewhere` on macOS (stock macOS has no `/run`), nothing
+/// elsewhere. Keep this in lockstep with the daemon — a divergence makes the
+/// channel unreachable on the affected OS.
+#[cfg(unix)]
+fn runtime_dir_for(os: &str) -> Option<std::path::PathBuf> {
+    match os {
+        "linux" => Some(std::path::PathBuf::from("/run/middlewhere")),
+        "macos" => Some(std::path::PathBuf::from("/var/run/middlewhere")),
+        _ => None,
+    }
+}
+
+/// The daemon binds `<runtime>/<svc>.sock` when its runtime dir is usable, else
+/// `<state_dir>/control.sock`. Dial the runtime socket when it actually exists,
+/// else the state-dir fallback — the same per-OS candidates in the same order as
+/// mwsqld `control::unix::resolve_socket`.
 #[cfg(unix)]
 fn unix_socket_path(state_dir: &Path, svc: &str) -> std::path::PathBuf {
-    let run = Path::new("/run/middlewhere").join(format!("{svc}.sock"));
-    if run.exists() {
-        run
-    } else {
-        state_dir.join("control.sock")
+    if let Some(dir) = runtime_dir_for(std::env::consts::OS) {
+        let sock = dir.join(format!("{svc}.sock"));
+        if sock.exists() {
+            return sock;
+        }
     }
+    state_dir.join("control.sock")
 }
 
 #[cfg(windows)]
 fn call_windows(service_name: &str, req: &Request) -> Result<Response, CallError> {
     use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
 
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_PIPE_BUSY: i32 = 231;
+    // SECURITY_IMPERSONATION_LEVEL::SecurityIdentification << 16. Opening the
+    // pipe with this (std ORs in SECURITY_SQOS_PRESENT for us) caps the daemon's
+    // ImpersonateNamedPipeClient at IDENTIFICATION: it may check our token's
+    // membership but never act *as* us. Defense-in-depth against a compromised
+    // daemon — the DACL already restricts who can open the pipe at all.
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     let pipe = format!(r"\\.\pipe\middlewhere-{service_name}-control");
     // A busy pipe means the daemon is up but every instance is momentarily in
     // use; back off briefly and retry rather than failing the command.
     let mut file = None;
     for attempt in 0..10 {
-        match OpenOptions::new().read(true).write(true).open(&pipe) {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&pipe)
+        {
             Ok(f) => {
                 file = Some(f);
                 break;
@@ -437,11 +469,38 @@ mod tests {
     }
 
     #[test]
-    fn decide_mode_channel_only_for_online_service() {
-        assert_eq!(decide_mode(false, false), Mode::Channel);
-        assert_eq!(decide_mode(true, false), Mode::Direct); // --user
-        assert_eq!(decide_mode(false, true), Mode::Direct); // --offline
-        assert_eq!(decide_mode(true, true), Mode::Direct);
+    fn decide_mode_channel_only_for_flagless_system_target() {
+        // The one channel case: flagless, against the system service dir.
+        assert_eq!(decide_mode(false, false, true), Mode::Channel);
+
+        // Any flag forces direct even against the system dir.
+        assert_eq!(decide_mode(true, false, true), Mode::Direct); // --user
+        assert_eq!(decide_mode(false, true, true), Mode::Direct); // --offline
+
+        // A non-system target (custom --state-dir / legacy per-user fallback) is
+        // direct even flagless — no daemon owns it, so dialing a socket would just
+        // fail; edit the file. (Regression: the old target_needs_root gate.)
+        assert_eq!(decide_mode(false, false, false), Mode::Direct);
+        assert_eq!(decide_mode(true, false, false), Mode::Direct);
+        assert_eq!(decide_mode(false, true, false), Mode::Direct);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_matches_daemon_per_os() {
+        use std::path::PathBuf;
+        // Must stay identical to mwsqld control::unix::runtime_dir_for, or the
+        // channel is unreachable on the diverging OS (the macOS bug this fixes).
+        assert_eq!(
+            runtime_dir_for("linux"),
+            Some(PathBuf::from("/run/middlewhere"))
+        );
+        assert_eq!(
+            runtime_dir_for("macos"),
+            Some(PathBuf::from("/var/run/middlewhere"))
+        );
+        assert_eq!(runtime_dir_for("freebsd"), None);
+        assert_eq!(runtime_dir_for("windows"), None);
     }
 
     #[test]
