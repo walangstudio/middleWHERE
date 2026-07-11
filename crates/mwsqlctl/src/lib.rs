@@ -70,6 +70,26 @@ pub fn print_token_block(
     println!("{token}");
 }
 
+/// Render a freshly minted env token from a control-channel [`NewEnvOutputDto`]:
+/// the standard token block, then — when the daemon flagged the env as persisted
+/// but not yet live (`note` is `Some`, only on the online path when the live bind
+/// failed) — a WARNING to stderr so the operator knows a restart is needed. The
+/// single render point for `env add`, `grant`, and the wizard, so every path
+/// surfaces the note the same way. `note = None` (clean success, or any
+/// direct/offline write) prints nothing extra.
+pub fn render_new_env(env: &str, out: &mw_core::control::NewEnvOutputDto) {
+    print_token_block(
+        env,
+        out.listen_port,
+        out.token.expose(),
+        out.engine,
+        out.database.as_deref(),
+    );
+    if let Some(note) = &out.note {
+        eprintln!("⚠ {note}");
+    }
+}
+
 /// A paste-ready client connection URI for the local proxy listener, or `None`
 /// for engines without one (MsSql). The token is the password, so a persisted
 /// URI persists the secret — the same exposure as the password field above.

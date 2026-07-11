@@ -555,7 +555,12 @@ fn token_but_not_live(
     );
     admin_event(peer, action, target, Decision::Error, Some(note.clone())).emit();
     warn!("{note}");
-    Response::Token(out.into())
+    // Carry a user-facing advisory in the token response so the CLI can warn the
+    // operator that the env isn't serving yet (vs a clean success, note=None).
+    let mut dto: mw_core::control::NewEnvOutputDto = out.into();
+    dto.note =
+        Some("persisted but not yet live — restart the service to bind this env".to_string());
+    Response::Token(dto)
 }
 
 /// The config was persisted but the live apply failed. The two now disagree

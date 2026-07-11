@@ -312,27 +312,15 @@ fn call_unix(service_name: &str, state_dir: &Path, req: &Request) -> Result<Resp
     finish(exchange(&mut stream, req))
 }
 
-/// The shared runtime dir the daemon binds its socket in, mirrored **exactly**
-/// from mwsqld `control::unix::runtime_dir_for`: `/run/middlewhere` on Linux,
-/// `/var/run/middlewhere` on macOS (stock macOS has no `/run`), nothing
-/// elsewhere. Keep this in lockstep with the daemon — a divergence makes the
-/// channel unreachable on the affected OS.
-#[cfg(unix)]
-fn runtime_dir_for(os: &str) -> Option<std::path::PathBuf> {
-    match os {
-        "linux" => Some(std::path::PathBuf::from("/run/middlewhere")),
-        "macos" => Some(std::path::PathBuf::from("/var/run/middlewhere")),
-        _ => None,
-    }
-}
-
 /// The daemon binds `<runtime>/<svc>.sock` when its runtime dir is usable, else
 /// `<state_dir>/control.sock`. Dial the runtime socket when it actually exists,
 /// else the state-dir fallback — the same per-OS candidates in the same order as
-/// mwsqld `control::unix::resolve_socket`.
+/// mwsqld `control::unix::resolve_socket`. The runtime dir comes from the single
+/// source of truth [`mw_core::control::runtime_dir_for`] so CLI and daemon can
+/// never diverge.
 #[cfg(unix)]
 fn unix_socket_path(state_dir: &Path, svc: &str) -> std::path::PathBuf {
-    if let Some(dir) = runtime_dir_for(std::env::consts::OS) {
+    if let Some(dir) = mw_core::control::runtime_dir_for(std::env::consts::OS) {
         let sock = dir.join(format!("{svc}.sock"));
         if sock.exists() {
             return sock;
@@ -482,24 +470,6 @@ mod tests {
         assert_eq!(decide_mode(true, false), Mode::Direct); // --user
         assert_eq!(decide_mode(false, true), Mode::Direct); // --offline
         assert_eq!(decide_mode(true, true), Mode::Direct);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runtime_dir_matches_daemon_per_os() {
-        use std::path::PathBuf;
-        // Must stay identical to mwsqld control::unix::runtime_dir_for, or the
-        // channel is unreachable on the diverging OS (the macOS bug this fixes).
-        assert_eq!(
-            runtime_dir_for("linux"),
-            Some(PathBuf::from("/run/middlewhere"))
-        );
-        assert_eq!(
-            runtime_dir_for("macos"),
-            Some(PathBuf::from("/var/run/middlewhere"))
-        );
-        assert_eq!(runtime_dir_for("freebsd"), None);
-        assert_eq!(runtime_dir_for("windows"), None);
     }
 
     #[test]

@@ -519,14 +519,9 @@ fn main() -> Result<()> {
             };
             eprintln!("env {name:?} added.");
             // The token is one-time — always print it, even if validation then
-            // fails (the env is kept; the operator fixes and re-tests).
-            mwsqlctl::print_token_block(
-                &name,
-                out.listen_port,
-                out.token.expose(),
-                out.engine,
-                out.database.as_deref(),
-            );
+            // fails (the env is kept; the operator fixes and re-tests). A
+            // persisted-but-not-live note (online apply failure) is surfaced too.
+            mwsqlctl::render_new_env(&name, &out);
             if !no_validate {
                 validate_after_add(use_channel, &state_dir, &ks, &name)?;
             }
@@ -641,13 +636,7 @@ fn main() -> Result<()> {
                 eprintln!("env {:?} token rotated; any prior token is now dead", g.env);
             }
             eprintln!("Deliver the token below to that identity over a secure channel.");
-            mwsqlctl::print_token_block(
-                &g.env,
-                out.listen_port,
-                out.token.expose(),
-                out.engine,
-                out.database.as_deref(),
-            );
+            mwsqlctl::render_new_env(&g.env, &out);
         }
         Cmd::Import(i) => {
             let report = if use_channel {

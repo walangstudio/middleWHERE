@@ -125,6 +125,12 @@ pub struct NewEnvOutputDto {
     pub listen_port: u16,
     pub engine: EngineKind,
     pub database: Option<String>,
+    /// Optional advisory the CLI should surface alongside the token. `None` on a
+    /// clean success; set when the env was persisted (token minted) but its live
+    /// bind failed, so the operator learns the env needs a restart to go live
+    /// instead of silently getting a token for a not-yet-serving env.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl From<NewEnvOutput> for NewEnvOutputDto {
@@ -134,6 +140,7 @@ impl From<NewEnvOutput> for NewEnvOutputDto {
             listen_port: o.listen_port,
             engine: o.engine,
             database: o.database,
+            note: None,
         }
     }
 }
@@ -158,6 +165,20 @@ pub enum Response {
     Denied(String),
     /// The mutation or read failed; carries a human-readable message.
     Error(String),
+}
+
+/// Platform runtime dir the installer provisions for the control socket: systemd
+/// `RuntimeDirectory` at `/run/middlewhere` on Linux, `/var/run/middlewhere` on
+/// macOS (stock macOS has no `/run`). `None` on a platform without a
+/// conventional runtime dir. Single source of truth shared by the daemon (which
+/// binds the socket there) and the CLI (which connects to it); pure over the OS
+/// name (`std::env::consts::OS`) so every branch is testable.
+pub fn runtime_dir_for(os: &str) -> Option<std::path::PathBuf> {
+    match os {
+        "linux" => Some(std::path::PathBuf::from("/run/middlewhere")),
+        "macos" => Some(std::path::PathBuf::from("/var/run/middlewhere")),
+        _ => None,
+    }
 }
 
 /// Encode `msg` as a length-prefixed CBOR frame and flush it. Errors (rather
@@ -388,6 +409,7 @@ mod tests {
                 listen_port: 6033,
                 engine: EngineKind::MySql,
                 database: Some("app".into()),
+                note: Some("persisted but not yet live".into()),
             }),
             Response::Rows(vec!["a".into(), "b".into()]),
             Response::AuditLines(vec!["line1".into(), "line2".into()]),
@@ -413,6 +435,7 @@ mod tests {
                     assert_eq!(a.listen_port, b.listen_port);
                     assert_eq!(a.engine, b.engine);
                     assert_eq!(a.database, b.database);
+                    assert_eq!(a.note, b.note);
                 }
                 (Response::Rows(a), Response::Rows(b)) => assert_eq!(a, b),
                 (Response::AuditLines(a), Response::AuditLines(b)) => assert_eq!(a, b),
@@ -460,5 +483,20 @@ mod tests {
     fn truncated_length_prefix_is_an_error() {
         let framed = [0u8; 2]; // fewer than 4 length bytes
         assert!(read_frame::<_, Request>(&mut framed.as_slice()).is_err());
+    }
+
+    #[test]
+    fn runtime_dir_per_os() {
+        use std::path::PathBuf;
+        assert_eq!(
+            runtime_dir_for("linux"),
+            Some(PathBuf::from("/run/middlewhere"))
+        );
+        assert_eq!(
+            runtime_dir_for("macos"),
+            Some(PathBuf::from("/var/run/middlewhere"))
+        );
+        assert_eq!(runtime_dir_for("freebsd"), None);
+        assert_eq!(runtime_dir_for("windows"), None);
     }
 }

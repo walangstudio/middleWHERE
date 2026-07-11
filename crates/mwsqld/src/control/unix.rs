@@ -80,20 +80,10 @@ pub(crate) async fn serve_loop(
     Ok(())
 }
 
-/// Platform runtime dir the installer provisions: systemd `RuntimeDirectory`
-/// lands at `/run/middlewhere` on Linux, and Phase-7's macOS setup creates
-/// `/var/run/middlewhere` (stock macOS has no `/run`). `None` on a unix without
-/// a conventional runtime dir. Pure over the OS name so every branch is testable.
-fn runtime_dir_for(os: &str) -> Option<PathBuf> {
-    match os {
-        "linux" => Some(PathBuf::from("/run/middlewhere")),
-        "macos" => Some(PathBuf::from("/var/run/middlewhere")),
-        _ => None,
-    }
-}
-
+/// The platform runtime dir for the control socket, from mw-core's single source
+/// of truth (shared with the CLI).
 fn runtime_dir_candidate() -> Option<PathBuf> {
-    runtime_dir_for(std::env::consts::OS)
+    mw_core::control::runtime_dir_for(std::env::consts::OS)
 }
 
 /// Pick the socket path and, when it lives in the shared runtime dir, that dir
@@ -414,21 +404,6 @@ unsafe fn cstr_to_string(p: *const libc::c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn runtime_dir_per_os() {
-        assert_eq!(
-            runtime_dir_for("linux"),
-            Some(PathBuf::from("/run/middlewhere"))
-        );
-        assert_eq!(
-            runtime_dir_for("macos"),
-            Some(PathBuf::from("/var/run/middlewhere"))
-        );
-        // No conventional runtime dir elsewhere -> state-dir fallback only.
-        assert_eq!(runtime_dir_for("freebsd"), None);
-        assert_eq!(runtime_dir_for("windows"), None);
-    }
 
     #[test]
     fn usable_runtime_dir_is_preferred_and_flagged_for_securing() {

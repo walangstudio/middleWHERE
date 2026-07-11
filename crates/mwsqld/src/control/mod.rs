@@ -70,16 +70,21 @@ pub(crate) async fn serve(daemon: Arc<Daemon>, shutdown: &mut broadcast::Receive
 
 /// Shared per-connection state machine, generic over the transport stream.
 ///
-/// CRITICAL ORDERING: the daemon reads the client's `Hello` + `Request` frames
-/// FIRST, and only THEN runs `resolve` (the platform peer-identity + authz
-/// decision). Windows `ImpersonateNamedPipeClient` fails with
-/// `ERROR_CANNOT_IMPERSONATE` until the client has written to the pipe, so
-/// resolving before the read would deny every request. Reading a frame mutates
-/// nothing and is bounded by `MAX_FRAME`; authorization still gates DISPATCH, so
-/// an unauthorized peer's request is parsed but never applied. `resolve` is
-/// called at most once, synchronously, with no `.await` between an impersonation
-/// and its revert (the Windows closure runs the whole check under
-/// `block_in_place`).
+/// CRITICAL ORDERING: read the `Hello` frame FIRST, THEN `resolve` (peer
+/// identity + authz decision) and audit the allow/deny, and only then read the
+/// `Request` and dispatch. Two reasons this exact order matters:
+/// * Windows `ImpersonateNamedPipeClient` fails with `ERROR_CANNOT_IMPERSONATE`
+///   until the client has written AND the server has read from the pipe —
+///   reading `Hello` satisfies that, so impersonating here (not before any read)
+///   is what fixes the "every request denied" showstopper.
+/// * Authorizing right after `Hello` means a Hello-only probe from an
+///   unauthorized peer (which never sends a `Request`) is still audited as a
+///   deny with its uid/user — closing the audit gap that resolving after the
+///   `Request` read would open.
+///
+/// `resolve` runs at most once, synchronously, with no `.await` between an
+/// impersonation and its revert (the Windows closure does the whole check under
+/// `block_in_place`). `MAX_FRAME` bounds every read.
 async fn handle_conn<S, R>(daemon: Arc<Daemon>, mut stream: S, resolve: R)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -107,21 +112,21 @@ where
         Err(_) => return, // truncated/hostile framing: drop silently.
     }
 
-    // 2. The request. Read it BEFORE authorizing so the client has written to
-    //    the pipe (a hard requirement for Windows named-pipe impersonation).
-    let req = match read_request(&mut stream).await {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    // 3. Resolve the peer identity + authorization decision. On Windows this
-    //    impersonates the now-written pipe client; on Unix it reads SO_PEERCRED.
+    // 2. Resolve the peer + authorize NOW (after the Hello read satisfies Windows
+    //    impersonation), and audit the decision here so a Hello-only probe is
+    //    recorded even if it never sends a request.
     let (decision, peer) = resolve();
     if let AuthDecision::Deny(reason) = &decision {
         admin_event(&peer, "authz", "", Decision::Deny, Some(reason.clone())).emit();
         let _ = write_response(&mut stream, &Response::Denied(reason.clone())).await;
         return;
     }
+
+    // 3. The request. Only an authorized peer reaches this read.
+    let req = match read_request(&mut stream).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
 
     // 4. Dispatch. Each handler emits its own per-action audit line.
     let resp = handlers::dispatch(&daemon, &peer, req).await;
@@ -307,12 +312,11 @@ mod tests {
         (Arc::new(daemon), tmp)
     }
 
-    // The reorder fix (bug #1): handle_conn must read Hello + Request BEFORE
-    // calling `resolve`. Proven on the ALLOW path — reaching dispatch (empty
-    // `ListEnvs` -> empty Rows) is only possible if the request was read first,
-    // and the flag confirms `resolve` ran.
+    // handle_conn resolves right after Hello, then reads the Request and
+    // dispatches. Proven on the ALLOW path — reaching dispatch (empty `ListEnvs`
+    // -> empty Rows) requires resolve to have run first, and the flag confirms it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn handle_conn_reads_request_before_resolve_then_dispatches() {
+    async fn handle_conn_resolves_after_hello_then_dispatches() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (daemon, _tmp) = empty_daemon().await;
         let (client, server) = duplex(4096);
@@ -349,14 +353,19 @@ mod tests {
         }
     }
 
-    // Same reorder path, DENY branch through the real handle_conn: the request is
-    // read, then `resolve` denies, then the client gets Denied (no dispatch).
+    // F5: a Hello-ONLY probe from an unauthorized peer (no Request frame ever
+    // sent) is still authorized-and-denied right after Hello — proving the deny
+    // (and its audit) fires without waiting for a Request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn handle_conn_denies_after_reading_request() {
+    async fn hello_only_unauthorized_peer_is_denied() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (daemon, _tmp) = empty_daemon().await;
         let (client, server) = duplex(4096);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
         let srv = tokio::spawn(async move {
-            handle_conn(daemon, server, || {
+            handle_conn(daemon, server, move || {
+                flag.store(true, Ordering::SeqCst);
                 (AuthDecision::Deny("nope".into()), PeerIdentity::default())
             })
             .await;
@@ -371,12 +380,16 @@ mod tests {
             },
         )
         .unwrap();
-        write_frame(&mut buf, &Request::ListEnvs).unwrap();
+        // NOTE: no Request frame is sent — only Hello.
         client.write_all(&buf).await.unwrap();
         client.flush().await.unwrap();
         let resp = read_response(&mut client).await.unwrap();
         srv.await.unwrap();
 
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "authz must run on a Hello-only probe"
+        );
         match resp {
             Response::Denied(r) => assert_eq!(r, "nope"),
             other => panic!("expected Denied, got {other:?}"),

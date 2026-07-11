@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use mw_core::config::{EngineKind, HostKeyFingerprint, Policy};
-use mw_core::control::{CredInputDto, Request, Response};
+use mw_core::control::{CredInputDto, NewEnvOutputDto, Request, Response};
 use mw_core::secret::SecretStr;
 use mw_core::state::resolve_cli_target;
 
@@ -104,18 +104,16 @@ impl Backend<'_> {
         }
     }
 
-    fn add_env(&self, input: ops::EnvInput) -> Result<envs::NewEnvOutput> {
+    /// Returns the control-channel DTO so the daemon's persisted-but-not-live
+    /// `note` survives to the render (the direct path has no live apply, so its
+    /// `From` conversion sets `note = None`).
+    fn add_env(&self, input: ops::EnvInput) -> Result<NewEnvOutputDto> {
         match self {
-            Backend::Direct(t) => ops::add_env(*t, input),
+            Backend::Direct(t) => Ok(ops::add_env(*t, input)?.into()),
             Backend::Channel(sd) => {
                 let dto = control_client::env_dto(&input);
                 match control_client::checked_call(sd, &Request::AddEnv(dto))? {
-                    Response::Token(d) => Ok(envs::NewEnvOutput {
-                        token: d.token,
-                        listen_port: d.listen_port,
-                        engine: d.engine,
-                        database: d.database,
-                    }),
+                    Response::Token(d) => Ok(d),
                     other => bail!("unexpected response from the service: {other:?}"),
                 }
             }
@@ -455,15 +453,7 @@ fn add_envs_loop(b: &Backend) -> Result<bool> {
                     break;
                 }
             };
-            let print_block = |o: &envs::NewEnvOutput| {
-                crate::print_token_block(
-                    &name,
-                    o.listen_port,
-                    o.token.expose(),
-                    o.engine,
-                    o.database.as_deref(),
-                );
-            };
+            let print_block = |o: &NewEnvOutputDto| crate::render_new_env(&name, o);
             match b.validate(&name) {
                 crate::probe::Validation::Ok => {
                     println!("  ✓ connected");

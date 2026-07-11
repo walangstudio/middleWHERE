@@ -44,6 +44,19 @@ pub struct EnvRuntime {
     /// Close this env's backend connections after this much inactivity. Zero
     /// disables idle reaping for the env.
     pub idle_timeout: Duration,
+    /// SSH tunnels this snapshot's pool dials through, tied to the SNAPSHOT's
+    /// lifetime (not the [`EnvHandle`]). A rotate publishes a NEW runtime with
+    /// NEW forwards; an in-flight session holding the OLD snapshot keeps the OLD
+    /// forwards `Arc` alive (so its pool's `127.0.0.1:<port>` listener stays up)
+    /// until that session ends, then the old [`LocalForward`]s drop and abort —
+    /// no mid-session break AND no tunnel leak. `Arc` so an authz/policy swap
+    /// (which reuses the pool) shares the same tunnels. Empty when no bastion.
+    ///
+    /// Held only for this lifetime/RAII effect — never read by name in non-test
+    /// code, hence `allow(dead_code)`; dropping it (with the snapshot) is what
+    /// tears the tunnels down.
+    #[allow(dead_code)]
+    forwards: Arc<Vec<LocalForward>>,
 }
 
 /// Live handle to one running env. The accept loop reads `current` on every
@@ -54,10 +67,11 @@ pub struct EnvRuntime {
 struct EnvHandle {
     current: watch::Sender<Arc<EnvRuntime>>,
     abort: AbortHandle,
-    #[allow(dead_code)] // Phase 5 (live add/rebuild) reads these.
-    listen_addr: SocketAddr,
+    /// Kept for status/bookkeeping. The env's SSH tunnels now live inside the
+    /// published [`EnvRuntime`] (not here), so an in-flight snapshot keeps its
+    /// tunnels alive across a swap; see [`EnvRuntime::forwards`].
     #[allow(dead_code)]
-    forwards: Vec<LocalForward>,
+    listen_addr: SocketAddr,
 }
 
 /// The daemon's live env table. An async mutex so the future control channel
@@ -137,14 +151,14 @@ impl Daemon {
                      MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1"
                 ));
             }
-            let (runtime, forwards) =
+            let runtime =
                 build_env_runtime(env_name, env, cfg, listen_host, &bastions, allow_tofu).await?;
             let listener = TcpListener::bind(runtime.listen_addr)
                 .await
                 .with_context(|| format!("bind {} for env {}", runtime.listen_addr, env_name))?;
             info!(env = env_name, addr = %listener.local_addr()?, "listening");
             idle_timeouts.push(runtime.idle_timeout);
-            let handle = spawn_env(Arc::new(runtime), listener, forwards, &shutdown);
+            let handle = spawn_env(Arc::new(runtime), listener, &shutdown);
             envs.lock().await.insert(env_name.clone(), handle);
         }
 
@@ -227,7 +241,6 @@ impl Daemon {
 fn spawn_env(
     runtime: Arc<EnvRuntime>,
     listener: TcpListener,
-    forwards: Vec<LocalForward>,
     shutdown: &broadcast::Sender<()>,
 ) -> EnvHandle {
     let listen_addr = runtime.listen_addr;
@@ -238,7 +251,6 @@ fn spawn_env(
         current,
         abort: task.abort_handle(),
         listen_addr,
-        forwards,
     }
 }
 
@@ -251,7 +263,7 @@ impl Daemon {
     /// Add an env to the live daemon: build its pool + forwards, bind its
     /// listener (a port conflict fails HERE), and start serving it.
     pub(crate) async fn apply_add_env(&self, cfg: &Config, env: &Env, name: &str) -> Result<()> {
-        let (runtime, forwards) = build_env_runtime(
+        let runtime = build_env_runtime(
             name,
             env,
             cfg,
@@ -263,7 +275,7 @@ impl Daemon {
         let listener = TcpListener::bind(runtime.listen_addr)
             .await
             .with_context(|| format!("bind {} for env {}", runtime.listen_addr, name))?;
-        let handle = spawn_env(Arc::new(runtime), listener, forwards, &self.shutdown);
+        let handle = spawn_env(Arc::new(runtime), listener, &self.shutdown);
         self.envs.lock().await.insert(name.to_string(), handle);
         Ok(())
     }
@@ -293,15 +305,18 @@ impl Daemon {
     }
 
     /// Rebuild an env's backend pool (credential/bastion change): establish a
-    /// fresh pool + forwards and publish them. In-flight sessions keep their old
-    /// snapshot until they reconnect; the old forwards are dropped here.
+    /// fresh pool + forwards and publish them as a new [`EnvRuntime`] snapshot.
+    /// In-flight sessions keep their OLD snapshot — and, because the forwards now
+    /// live inside the runtime, their OLD tunnels — until they finish; the old
+    /// [`LocalForward`]s drop (and abort) only when the last such snapshot is
+    /// gone, so a rotate never breaks a live session and never leaks a tunnel.
     pub(crate) async fn apply_rebuild_backend(
         &self,
         cfg: &Config,
         env: &Env,
         name: &str,
     ) -> Result<()> {
-        let (runtime, forwards) = build_env_runtime(
+        let runtime = build_env_runtime(
             name,
             env,
             cfg,
@@ -310,11 +325,10 @@ impl Daemon {
             self.allow_tofu,
         )
         .await?;
-        let mut guard = self.envs.lock().await;
+        let guard = self.envs.lock().await;
         let handle = guard
-            .get_mut(name)
+            .get(name)
             .ok_or_else(|| anyhow!("no such env {name}"))?;
-        handle.forwards = forwards;
         handle.current.send_replace(Arc::new(runtime));
         Ok(())
     }
@@ -396,9 +410,10 @@ async fn establish_backend(
     Ok((engine, backend))
 }
 
-/// Build one env's runtime plus the SSH forwards it owns. The forwards are
-/// returned (not pushed into a shared vec) so each env can hold and replace its
-/// own tunnels; they must outlive the returned backend (its pool dials them).
+/// Build one env's runtime, including the SSH forwards its pool dials through.
+/// The forwards are held INSIDE the runtime (as a shared `Arc`), tied to the
+/// snapshot's lifetime, so a later swap that publishes a new snapshot with new
+/// forwards leaves an in-flight session's old tunnels intact until it ends.
 async fn build_env_runtime(
     name: &str,
     env: &Env,
@@ -406,14 +421,14 @@ async fn build_env_runtime(
     listen_host: &str,
     bastions: &BastionRegistry,
     allow_tofu: bool,
-) -> Result<(EnvRuntime, Vec<LocalForward>)> {
+) -> Result<EnvRuntime> {
     let mut forwards: Vec<LocalForward> = Vec::new();
     let (engine, backend) =
         establish_backend(name, env, cfg, bastions, &mut forwards, allow_tofu).await?;
     let listen_addr: SocketAddr = format!("{listen_host}:{}", env.listen_port)
         .parse()
         .map_err(|e| anyhow!("bad listen addr for env {name}: {e}"))?;
-    let runtime = EnvRuntime {
+    Ok(EnvRuntime {
         name: name.to_string(),
         engine,
         backend: Arc::from(backend),
@@ -421,8 +436,8 @@ async fn build_env_runtime(
         client_auth: env.client_auth.clone(),
         listen_addr,
         idle_timeout: Duration::from_secs(env.pool.idle_timeout_secs as u64),
-    };
-    Ok((runtime, forwards))
+        forwards: Arc::new(forwards),
+    })
 }
 
 /// Which envs `test_envs` probes.
@@ -505,15 +520,19 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
 /// timeout, freeing the server-side connection. Zero-timeout envs are skipped.
 /// Runs until shutdown; the sweep itself never touches an in-flight query (only
 /// connections sitting idle in the pool are candidates).
-async fn reap_loop(envs: EnvRegistry, interval: Duration, shutdown: &mut broadcast::Receiver<()>) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // consume the immediate first tick
+///
+/// The cadence is RECOMPUTED each iteration from the CURRENT registry's tightest
+/// non-zero idle timeout (falling back to `base` when nothing has a timeout), so
+/// an env added live over the control channel with a short timeout is swept at
+/// its own cadence rather than the bind-time one. When every env is zero-timeout
+/// the loop sleeps `base` and does nothing (no busy-loop).
+async fn reap_loop(envs: EnvRegistry, base: Duration, shutdown: &mut broadcast::Receiver<()>) {
     loop {
+        let interval = current_reap_interval(&envs, base).await;
         tokio::select! {
             biased;
             _ = shutdown.recv() => break,
-            _ = ticker.tick() => {
+            _ = tokio::time::sleep(interval) => {
                 // Snapshot the current runtimes, then reap OFF-lock: `reap_idle`
                 // only touches idle pooled conns (never an in-flight query), and
                 // holding the registry mutex across it would block a live swap.
@@ -538,6 +557,19 @@ async fn reap_loop(envs: EnvRegistry, interval: Duration, shutdown: &mut broadca
             }
         }
     }
+}
+
+/// Sweep cadence for the CURRENT env set: `reaper_interval` of the tightest
+/// non-zero idle timeout live right now, else `base`.
+async fn current_reap_interval(envs: &EnvRegistry, base: Duration) -> Duration {
+    let guard = envs.lock().await;
+    guard
+        .values()
+        .map(|h| h.current.borrow().idle_timeout)
+        .filter(|d| !d.is_zero())
+        .min()
+        .map(reaper_interval)
+        .unwrap_or(base)
 }
 
 async fn accept_loop(
@@ -622,6 +654,7 @@ mod tests {
             },
             listen_addr: "127.0.0.1:1".parse().unwrap(),
             idle_timeout: Duration::ZERO,
+            forwards: Arc::new(Vec::new()),
         };
         let (tx, rx) = watch::channel(Arc::new(rt));
 
@@ -638,8 +671,74 @@ mod tests {
         assert!(matches!(snapshot.policy, Policy::ReadOnly));
         // ...and shares the SAME backend Arc (pool reuse, no rebuild)...
         assert!(Arc::ptr_eq(&snapshot.backend, &rx.borrow().backend));
+        // ...and the SAME forwards Arc (authz/policy swaps reuse the tunnels)...
+        assert!(Arc::ptr_eq(&snapshot.forwards, &rx.borrow().forwards));
         // ...but a fresh connect sees the new policy.
         assert!(matches!(rx.borrow().policy, Policy::ReadWrite));
+    }
+
+    // Helper: an EnvRuntime carrying a specific forwards Arc, for the lifetime
+    // test below. No real tunnels needed — we assert on Arc strong counts.
+    fn runtime_with_forwards(forwards: Arc<Vec<LocalForward>>) -> EnvRuntime {
+        EnvRuntime {
+            name: "e".into(),
+            engine: engine_for(EngineKind::MySql),
+            backend: Arc::new(StubBackend) as Arc<dyn Backend>,
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: [0; 20],
+            },
+            listen_addr: "127.0.0.1:1".parse().unwrap(),
+            idle_timeout: Duration::ZERO,
+            forwards,
+        }
+    }
+
+    #[test]
+    fn rebuild_keeps_old_forwards_until_last_snapshot_drops() {
+        // F1: a rebuild (apply_rebuild_backend) publishes a NEW runtime with NEW
+        // forwards. An in-flight session holding the OLD snapshot must keep the
+        // OLD forwards Arc alive (its tunnels stay up) until it drops; only then
+        // do the old LocalForwards drop (and, in production, abort). No leak, no
+        // mid-session break.
+        //
+        // Strong-count bookkeeping: cloning `Arc<EnvRuntime>` shares ONE inner
+        // `forwards` Arc, so the count tracks how many live EnvRuntime instances
+        // embed it (plus our test handle).
+        let old_forwards = Arc::new(Vec::new());
+        let (tx, rx) = watch::channel(Arc::new(runtime_with_forwards(old_forwards.clone())));
+
+        // In-flight session snapshots the old runtime (same EnvRuntime instance).
+        let snapshot = rx.borrow().clone();
+        assert_eq!(
+            Arc::strong_count(&old_forwards),
+            2,
+            "test handle + the one old EnvRuntime's field"
+        );
+
+        // Rebuild: publish a new runtime with NEW forwards. send_replace drops the
+        // watch's Arc to the OLD EnvRuntime, but `snapshot` still holds it.
+        let new_forwards = Arc::new(Vec::new());
+        tx.send_replace(Arc::new(runtime_with_forwards(new_forwards.clone())));
+
+        // THE F1 INVARIANT: the old forwards are NOT dropped — the in-flight
+        // snapshot still keeps the old EnvRuntime (and thus its tunnels) alive.
+        assert_eq!(
+            Arc::strong_count(&old_forwards),
+            2,
+            "old forwards still alive via the in-flight snapshot after the swap"
+        );
+        // New connects see the new forwards.
+        assert!(Arc::ptr_eq(&rx.borrow().forwards, &new_forwards));
+
+        // The last snapshot ends -> old EnvRuntime drops -> old forwards released
+        // (in production, LocalForward::drop aborts the listener here).
+        drop(snapshot);
+        assert_eq!(
+            Arc::strong_count(&old_forwards),
+            1,
+            "released once the last snapshot is gone (only our test handle remains)"
+        );
     }
 
     fn mssql_config() -> Config {
