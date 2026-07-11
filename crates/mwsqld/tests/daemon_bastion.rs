@@ -221,7 +221,7 @@ async fn select_one_through_bastion() {
     .await
     .unwrap();
     let (tx, rx) = broadcast::channel(1);
-    let h = tokio::spawn(daemon.run(rx));
+    let h = tokio::spawn(std::sync::Arc::new(daemon).run(rx));
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

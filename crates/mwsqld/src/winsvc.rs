@@ -121,7 +121,7 @@ fn run_service() -> Result<()> {
             ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             0,
         )?;
-        daemon.run(rx).await
+        std::sync::Arc::new(daemon).run(rx).await
     });
 
     report(

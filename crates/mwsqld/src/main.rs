@@ -154,7 +154,7 @@ fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     let _ = tx.send(());
                 });
-                daemon.run(rx).await
+                std::sync::Arc::new(daemon).run(rx).await
             }
             Cmd::Test {
                 env,

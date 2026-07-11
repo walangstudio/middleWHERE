@@ -1759,6 +1759,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "libc",
  "mw-core",
  "mw-net",
  "mysql_async",
@@ -1773,6 +1774,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-service",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

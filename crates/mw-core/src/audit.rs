@@ -69,6 +69,67 @@ impl AuditEvent {
     }
 }
 
+/// Control-plane audit record: one admin mutation or authorization decision on
+/// the daemon control channel. Lands in the SAME daily-rolled JSONL as
+/// [`AuditEvent`] (via [`AdminEvent::emit`]) so an operator has one log for both
+/// query traffic and config changes. `kind = "admin"` distinguishes it from a
+/// query line; peer_uid/peer_gid identify the connecting process on Unix and are
+/// absent on Windows (where `peer_user` carries the resolved account/SID).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminEvent {
+    pub ts: String,
+    /// Always "admin"; marks this as a control-plane event, not a query.
+    pub kind: &'static str,
+    /// The mutation or read applied (e.g. "add_env", "set_policy", "authz").
+    pub action: String,
+    /// The object acted on (env/cred/bastion name), empty when not applicable.
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_uid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_gid: Option<u32>,
+    pub peer_user: String,
+    pub decision: Decision,
+    /// Denial reason or failure message; absent on a clean allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AdminEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        action: impl Into<String>,
+        target: impl Into<String>,
+        peer_uid: Option<u32>,
+        peer_gid: Option<u32>,
+        peer_user: impl Into<String>,
+        decision: Decision,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            ts: now_iso8601(),
+            kind: "admin",
+            action: action.into(),
+            target: target.into(),
+            peer_uid,
+            peer_gid,
+            peer_user: peer_user.into(),
+            decision,
+            error,
+        }
+    }
+
+    /// Serialize to the shared audit target exactly like [`AuditEvent::emit`], so
+    /// the daemon's daily-rolled JSONL receives one line per admin action.
+    pub fn emit(&self) {
+        match serde_json::to_string(self) {
+            Ok(line) => tracing::info!(target: "middlewhere::audit", "{line}"),
+            Err(e) => tracing::warn!(target: "middlewhere::audit", err = %e,
+                                     "failed to serialize admin event"),
+        }
+    }
+}
+
 fn hash_stmt(sql: &str) -> String {
     let mut h = Sha256::new();
     h.update(sql.as_bytes());
@@ -190,5 +251,41 @@ mod tests {
         // ts is ISO-8601 with a `T` separator
         assert!(s.contains("\"ts\":\""));
         assert!(s.contains("T"));
+    }
+
+    #[test]
+    fn admin_event_serializes_allow_and_deny() {
+        let allow = AdminEvent::new(
+            "add_env",
+            "stage",
+            Some(1000),
+            Some(1000),
+            "alice",
+            Decision::Allow,
+            None,
+        );
+        let s = serde_json::to_string(&allow).unwrap();
+        assert!(s.contains(r#""kind":"admin""#), "{s}");
+        assert!(s.contains(r#""action":"add_env""#), "{s}");
+        assert!(s.contains(r#""decision":"allow""#), "{s}");
+        assert!(s.contains(r#""peer_uid":1000"#), "{s}");
+        // A clean allow omits the error field entirely.
+        assert!(!s.contains("error"), "{s}");
+
+        // A Windows-style deny: no uid/gid, reason in `error`.
+        let deny = AdminEvent::new(
+            "authz",
+            "",
+            None,
+            None,
+            "CORP\\bob",
+            Decision::Deny,
+            Some("not a member of middlewhere-admins".into()),
+        );
+        let s = serde_json::to_string(&deny).unwrap();
+        assert!(s.contains(r#""decision":"deny""#), "{s}");
+        assert!(s.contains("not a member"), "{s}");
+        // uid/gid omitted when absent (Windows).
+        assert!(!s.contains("peer_uid"), "{s}");
     }
 }

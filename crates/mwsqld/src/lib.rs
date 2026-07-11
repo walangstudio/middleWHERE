@@ -26,6 +26,8 @@ pub use mw_core::state::{
     save_config, KeystoreChoice, CONFIG_FILE_NAME, FILE_MASTER_KEY_NAME,
 };
 
+pub(crate) mod control;
+
 #[cfg(windows)]
 pub mod winsvc;
 
@@ -163,7 +165,10 @@ impl Daemon {
         })
     }
 
-    pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+    /// Takes `Arc<Self>` so the control-channel task can hold a live handle to
+    /// the daemon and call the `apply_*` mutators while the accept/reap loops
+    /// keep running. The two binary call sites wrap the bound daemon in an `Arc`.
+    pub async fn run(self: Arc<Self>, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
         // One sweep task serves every env; it breaks on the internal shutdown
         // fan-out below. Skipped entirely when no env has a non-zero timeout.
         let reap_abort = self.reap_interval.map(|interval| {
@@ -172,6 +177,15 @@ impl Daemon {
             tokio::spawn(async move { reap_loop(reap_envs, interval, &mut sub).await })
                 .abort_handle()
         });
+
+        // Control channel: apply CLI-sent config mutations on the live daemon.
+        // Shares the same internal shutdown fan-out as the env accept loops, so
+        // Ctrl-C / SCM stop tears it down too — no new shutdown source.
+        let control_abort = {
+            let daemon = Arc::clone(&self);
+            let mut sub = self.shutdown.subscribe();
+            tokio::spawn(async move { control::serve(daemon, &mut sub).await }).abort_handle()
+        };
 
         let _ = shutdown.recv().await;
         info!("shutdown signal received");
@@ -186,6 +200,7 @@ impl Daemon {
         if let Some(reap) = reap_abort {
             reap.abort();
         }
+        control_abort.abort();
         info!("clean exit");
         Ok(())
     }
