@@ -105,7 +105,7 @@ fn run_service() -> Result<()> {
     let serve_result = rt.block_on(async {
         let cfg = crate::load_config(&state_dir, &ks)?;
         // Service mode is non-interactive: never accept an unpinned host key.
-        let daemon = crate::Daemon::bind(state_dir.clone(), &cfg, "127.0.0.1", false).await?;
+        let daemon = crate::Daemon::bind(state_dir.clone(), &cfg, "127.0.0.1", false, ks).await?;
 
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         // Bridge the blocking std mpsc from the SCM control handler into the

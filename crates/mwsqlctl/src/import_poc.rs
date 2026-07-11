@@ -31,7 +31,7 @@ use mw_core::config::{
     Policy, PoolSettings,
 };
 use mw_core::secret::{SecretBytes, SecretStr};
-use mw_core::state::{load_config, save_config, KeystoreChoice};
+use mw_core::state::{with_config, KeystoreChoice};
 use mw_core::token::{double_sha1, generate_token};
 
 const CLIENT_PORT_BASE: u16 = 6033;
@@ -341,42 +341,14 @@ pub fn build_from_dir(src_dir: &Path) -> Result<(Config, ImportReport)> {
     Ok((cfg, report))
 }
 
-/// Import into the sealed config at `state_dir`. Refuses if any imported
-/// name already exists there.
+/// Import into the sealed config at `state_dir`. The source dir is parsed here
+/// (filesystem access); the validated merge — collision checks + extend — lives
+/// in [`mw_core::mutate::merge_import`] so the daemon shares it.
 pub fn import(state_dir: &Path, ks: &KeystoreChoice, src_dir: &Path) -> Result<ImportReport> {
     let (fragment, report) = build_from_dir(src_dir)?;
-
-    let mut existing = load_config(state_dir, ks)?;
-    for n in fragment.bastions.keys() {
-        if existing.bastions.contains_key(n) {
-            bail!("bastion {n:?} already exists in target config");
-        }
-    }
-    for n in fragment.credentials.keys() {
-        if existing.credentials.contains_key(n) {
-            bail!("credential {n:?} already exists in target config");
-        }
-    }
-    for n in fragment.envs.keys() {
-        if existing.envs.contains_key(n) {
-            bail!("env {n:?} already exists in target config");
-        }
-    }
-    let used: std::collections::HashSet<u16> =
-        existing.envs.values().map(|e| e.listen_port).collect();
-    for e in fragment.envs.values() {
-        if used.contains(&e.listen_port) {
-            bail!(
-                "listen port {} collides with an existing env; clear the target first",
-                e.listen_port
-            );
-        }
-    }
-
-    existing.bastions.extend(fragment.bastions);
-    existing.credentials.extend(fragment.credentials);
-    existing.envs.extend(fragment.envs);
-    save_config(state_dir, ks, &existing)?;
+    with_config(state_dir, ks, |cfg| {
+        mw_core::mutate::merge_import(cfg, fragment)
+    })?;
     Ok(report)
 }
 

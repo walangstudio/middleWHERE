@@ -96,9 +96,10 @@ async fn client_chain() {
 
     // Live half: bring up the daemon and run SELECT 1 via the wrapper.
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = mwsqld::Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false)
-        .await
-        .unwrap();
+    let daemon =
+        mwsqld::Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false, ks.clone())
+            .await
+            .unwrap();
     let (txc, rx) = tokio::sync::broadcast::channel(1);
     let h = tokio::spawn(daemon.run(rx));
     tokio::time::sleep(Duration::from_millis(100)).await;

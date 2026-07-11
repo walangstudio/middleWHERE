@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
-use tokio::task::JoinSet;
+use tokio::sync::{broadcast, watch, Mutex};
+use tokio::task::{AbortHandle, JoinSet};
 use tracing::{error, info, warn};
 
 use mw_core::config::{ClientAuth, Config, EngineKind, Env, Policy};
@@ -29,10 +29,13 @@ pub use mw_core::state::{
 #[cfg(windows)]
 pub mod winsvc;
 
+#[derive(Clone)]
 pub struct EnvRuntime {
     pub name: String,
     pub engine: &'static dyn Engine,
-    pub backend: Box<dyn Backend>,
+    /// `Arc`, not `Box`, so a policy/authz swap can publish a fresh runtime
+    /// snapshot while an in-flight session keeps the SAME pool alive.
+    pub backend: Arc<dyn Backend>,
     pub policy: Policy,
     pub client_auth: ClientAuth,
     pub listen_addr: SocketAddr,
@@ -40,6 +43,24 @@ pub struct EnvRuntime {
     /// disables idle reaping for the env.
     pub idle_timeout: Duration,
 }
+
+/// Live handle to one running env. The accept loop reads `current` on every
+/// connect, so publishing a new [`EnvRuntime`] via `current.send_replace` swaps
+/// what NEW connections see without disturbing in-flight ones. `abort` stops
+/// this env's accept loop (dropping its `sessions` JoinSet, so its live
+/// sessions too); `forwards` are the SSH tunnels this env's pool dials through.
+struct EnvHandle {
+    current: watch::Sender<Arc<EnvRuntime>>,
+    abort: AbortHandle,
+    #[allow(dead_code)] // Phase 5 (live add/rebuild) reads these.
+    listen_addr: SocketAddr,
+    #[allow(dead_code)]
+    forwards: Vec<LocalForward>,
+}
+
+/// The daemon's live env table. An async mutex so the future control channel
+/// can add/remove/swap envs while the accept + reap loops read it.
+type EnvRegistry = Arc<Mutex<HashMap<String, EnvHandle>>>;
 
 /// Install the process-global tracing + audit subscriber. This belongs in
 /// the binary entrypoint, NOT in `Daemon::bind` — library code must not
@@ -51,10 +72,27 @@ pub use tracing_appender::non_blocking::WorkerGuard as AuditGuard;
 
 pub struct Daemon {
     pub state_dir: PathBuf,
-    pub envs: Arc<HashMap<String, EnvRuntime>>,
-    pub bound: Vec<(String, TcpListener)>,
-    _bastions: BastionRegistry,
-    _forwards: Vec<LocalForward>,
+    envs: EnvRegistry,
+    /// Internal shutdown fan-out: every accept loop + the reaper subscribe to
+    /// it; `run` fires it when the external shutdown signal arrives.
+    shutdown: broadcast::Sender<()>,
+    /// Reaper cadence, fixed from the initial env set (a later add won't retune
+    /// it). `None` when no env has a non-zero idle timeout.
+    reap_interval: Option<Duration>,
+    // Below are threaded for Phase 5's live-mutation handlers; nothing reads
+    // them yet.
+    #[allow(dead_code)]
+    ks: KeystoreChoice,
+    #[allow(dead_code)]
+    listen_host: String,
+    #[allow(dead_code)]
+    allow_tofu: bool,
+    /// Held so bastion SSH sessions stay open and re-usable across a live add.
+    #[allow(dead_code)]
+    bastions: BastionRegistry,
+    /// Serializes a future load -> mutate -> save -> apply cycle.
+    #[allow(dead_code)]
+    config_write: Arc<Mutex<()>>,
 }
 
 impl Daemon {
@@ -63,11 +101,12 @@ impl Daemon {
         cfg: &Config,
         listen_host: &str,
         allow_tofu: bool,
+        ks: KeystoreChoice,
     ) -> Result<Self> {
         let bastions = BastionRegistry::new();
-        let mut envs = HashMap::new();
-        let mut bound = Vec::new();
-        let mut forwards: Vec<LocalForward> = Vec::new();
+        let envs: EnvRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (shutdown, _) = broadcast::channel(1);
+        let mut idle_timeouts = Vec::new();
 
         for (env_name, env) in &cfg.envs {
             // Stub engines: skip rather than fail the whole daemon so the
@@ -92,62 +131,180 @@ impl Daemon {
                      MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1"
                 ));
             }
-            let runtime = build_env_runtime(
-                env_name,
-                env,
-                cfg,
-                listen_host,
-                &bastions,
-                &mut forwards,
-                allow_tofu,
-            )
-            .await?;
+            let (runtime, forwards) =
+                build_env_runtime(env_name, env, cfg, listen_host, &bastions, allow_tofu).await?;
             let listener = TcpListener::bind(runtime.listen_addr)
                 .await
                 .with_context(|| format!("bind {} for env {}", runtime.listen_addr, env_name))?;
             info!(env = env_name, addr = %listener.local_addr()?, "listening");
-            bound.push((env_name.clone(), listener));
-            envs.insert(env_name.clone(), runtime);
+            idle_timeouts.push(runtime.idle_timeout);
+            let handle = spawn_env(Arc::new(runtime), listener, forwards, &shutdown);
+            envs.lock().await.insert(env_name.clone(), handle);
         }
+
+        // One reaper serves every env; its cadence tracks the tightest configured
+        // timeout. `None` (skip reaping) when no env has a non-zero timeout.
+        let reap_interval = idle_timeouts
+            .into_iter()
+            .filter(|d| !d.is_zero())
+            .min()
+            .map(reaper_interval);
+
         Ok(Self {
             state_dir,
-            envs: Arc::new(envs),
-            bound,
-            _bastions: bastions,
-            _forwards: forwards,
+            envs,
+            shutdown,
+            reap_interval,
+            ks,
+            listen_host: listen_host.to_string(),
+            allow_tofu,
+            bastions,
+            config_write: Arc::new(Mutex::new(())),
         })
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
-        let envs = self.envs.clone();
-        let mut accept_set: JoinSet<()> = JoinSet::new();
-        for (env_name, listener) in self.bound {
-            let envs = envs.clone();
-            let mut sub = shutdown.resubscribe();
-            accept_set.spawn(async move {
-                accept_loop(&env_name, listener, envs, &mut sub).await;
-            });
-        }
-        // Reap idle backend connections. One sweep task serves every env; its
-        // cadence tracks the tightest configured timeout. Skipped entirely when
-        // no env has a non-zero timeout (idle reaping fully disabled).
-        if let Some(min_timeout) = envs
-            .values()
-            .map(|e| e.idle_timeout)
-            .filter(|d| !d.is_zero())
-            .min()
-        {
-            let reap_envs = envs.clone();
-            let interval = reaper_interval(min_timeout);
-            let mut sub = shutdown.resubscribe();
-            accept_set.spawn(async move {
-                reap_loop(reap_envs, interval, &mut sub).await;
-            });
-        }
+        // One sweep task serves every env; it breaks on the internal shutdown
+        // fan-out below. Skipped entirely when no env has a non-zero timeout.
+        let reap_abort = self.reap_interval.map(|interval| {
+            let reap_envs = self.envs.clone();
+            let mut sub = self.shutdown.subscribe();
+            tokio::spawn(async move { reap_loop(reap_envs, interval, &mut sub).await })
+                .abort_handle()
+        });
+
         let _ = shutdown.recv().await;
         info!("shutdown signal received");
-        accept_set.shutdown().await;
+        // Fan the shutdown out so every accept loop breaks its select and drains
+        // its sessions, then abort each handle as the definitive teardown —
+        // dropping an accept loop drops its `sessions` JoinSet, exactly as the
+        // old `accept_set.shutdown().await` did.
+        let _ = self.shutdown.send(());
+        for (_, handle) in self.envs.lock().await.drain() {
+            handle.abort.abort();
+        }
+        if let Some(reap) = reap_abort {
+            reap.abort();
+        }
         info!("clean exit");
+        Ok(())
+    }
+
+    /// Number of live envs currently served. Used by tests and, later, status.
+    pub async fn env_count(&self) -> usize {
+        self.envs.lock().await.len()
+    }
+}
+
+/// Start one env's accept loop and return its live handle. Used by
+/// [`Daemon::bind`] for the initial env set and by [`Daemon::apply_add_env`]
+/// for a live add. The loop reads the watched runtime on each accept, so a
+/// later `send_replace` swaps new connections without touching in-flight ones.
+fn spawn_env(
+    runtime: Arc<EnvRuntime>,
+    listener: TcpListener,
+    forwards: Vec<LocalForward>,
+    shutdown: &broadcast::Sender<()>,
+) -> EnvHandle {
+    let listen_addr = runtime.listen_addr;
+    let (current, rx) = watch::channel(runtime);
+    let mut sub = shutdown.subscribe();
+    let task = tokio::spawn(async move { accept_loop(listener, rx, &mut sub).await });
+    EnvHandle {
+        current,
+        abort: task.abort_handle(),
+        listen_addr,
+        forwards,
+    }
+}
+
+/// Live config-apply surface. Phase 5's control handlers call these after
+/// validating + persisting a mutation; nothing calls them yet (hence the
+/// `#[allow(dead_code)]`). Each keeps the observable rule: an in-flight session
+/// keeps the runtime snapshot it started with; only new connects see a swap.
+#[allow(dead_code)]
+impl Daemon {
+    /// Add an env to the live daemon: build its pool + forwards, bind its
+    /// listener (a port conflict fails HERE), and start serving it.
+    pub(crate) async fn apply_add_env(&self, cfg: &Config, env: &Env, name: &str) -> Result<()> {
+        let (runtime, forwards) = build_env_runtime(
+            name,
+            env,
+            cfg,
+            &self.listen_host,
+            &self.bastions,
+            self.allow_tofu,
+        )
+        .await?;
+        let listener = TcpListener::bind(runtime.listen_addr)
+            .await
+            .with_context(|| format!("bind {} for env {}", runtime.listen_addr, name))?;
+        let handle = spawn_env(Arc::new(runtime), listener, forwards, &self.shutdown);
+        self.envs.lock().await.insert(name.to_string(), handle);
+        Ok(())
+    }
+
+    /// Remove an env: drop it from the registry and abort its accept loop,
+    /// which drops its `sessions` JoinSet and its forwards.
+    pub(crate) async fn apply_rm_env(&self, name: &str) {
+        if let Some(handle) = self.envs.lock().await.remove(name) {
+            handle.abort.abort();
+        }
+    }
+
+    /// Swap the client-auth for an env, reusing the existing pool + forwards.
+    pub(crate) async fn apply_swap_authz(
+        &self,
+        name: &str,
+        new_client_auth: ClientAuth,
+    ) -> Result<()> {
+        self.swap_runtime(name, move |rt| rt.client_auth = new_client_auth)
+            .await
+    }
+
+    /// Swap the firewall policy for an env, reusing the existing pool + forwards.
+    pub(crate) async fn apply_swap_policy(&self, name: &str, new_policy: Policy) -> Result<()> {
+        self.swap_runtime(name, move |rt| rt.policy = new_policy)
+            .await
+    }
+
+    /// Rebuild an env's backend pool (credential/bastion change): establish a
+    /// fresh pool + forwards and publish them. In-flight sessions keep their old
+    /// snapshot until they reconnect; the old forwards are dropped here.
+    pub(crate) async fn apply_rebuild_backend(
+        &self,
+        cfg: &Config,
+        env: &Env,
+        name: &str,
+    ) -> Result<()> {
+        let (runtime, forwards) = build_env_runtime(
+            name,
+            env,
+            cfg,
+            &self.listen_host,
+            &self.bastions,
+            self.allow_tofu,
+        )
+        .await?;
+        let mut guard = self.envs.lock().await;
+        let handle = guard
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("no such env {name}"))?;
+        handle.forwards = forwards;
+        handle.current.send_replace(Arc::new(runtime));
+        Ok(())
+    }
+
+    /// Clone the current runtime, mutate one field, publish it. Shared by the
+    /// authz/policy swaps; the clone reuses the same backend Arc + forwards.
+    async fn swap_runtime(&self, name: &str, mutate: impl FnOnce(&mut EnvRuntime)) -> Result<()> {
+        let guard = self.envs.lock().await;
+        let handle = guard
+            .get(name)
+            .ok_or_else(|| anyhow!("no such env {name}"))?;
+        let mut next = (**handle.current.borrow()).clone();
+        mutate(&mut next);
+        handle.current.send_replace(Arc::new(next));
         Ok(())
     }
 }
@@ -215,29 +372,33 @@ async fn establish_backend(
     Ok((engine, backend))
 }
 
+/// Build one env's runtime plus the SSH forwards it owns. The forwards are
+/// returned (not pushed into a shared vec) so each env can hold and replace its
+/// own tunnels; they must outlive the returned backend (its pool dials them).
 async fn build_env_runtime(
     name: &str,
     env: &Env,
     cfg: &Config,
     listen_host: &str,
     bastions: &BastionRegistry,
-    forwards: &mut Vec<LocalForward>,
     allow_tofu: bool,
-) -> Result<EnvRuntime> {
+) -> Result<(EnvRuntime, Vec<LocalForward>)> {
+    let mut forwards: Vec<LocalForward> = Vec::new();
     let (engine, backend) =
-        establish_backend(name, env, cfg, bastions, forwards, allow_tofu).await?;
+        establish_backend(name, env, cfg, bastions, &mut forwards, allow_tofu).await?;
     let listen_addr: SocketAddr = format!("{listen_host}:{}", env.listen_port)
         .parse()
         .map_err(|e| anyhow!("bad listen addr for env {name}: {e}"))?;
-    Ok(EnvRuntime {
+    let runtime = EnvRuntime {
         name: name.to_string(),
         engine,
-        backend,
+        backend: Arc::from(backend),
         policy: env.policy.clone(),
         client_auth: env.client_auth.clone(),
         listen_addr,
         idle_timeout: Duration::from_secs(env.pool.idle_timeout_secs as u64),
-    })
+    };
+    Ok((runtime, forwards))
 }
 
 /// Which envs `test_envs` probes.
@@ -320,11 +481,7 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
 /// timeout, freeing the server-side connection. Zero-timeout envs are skipped.
 /// Runs until shutdown; the sweep itself never touches an in-flight query (only
 /// connections sitting idle in the pool are candidates).
-async fn reap_loop(
-    envs: Arc<HashMap<String, EnvRuntime>>,
-    interval: Duration,
-    shutdown: &mut broadcast::Receiver<()>,
-) {
+async fn reap_loop(envs: EnvRegistry, interval: Duration, shutdown: &mut broadcast::Receiver<()>) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
@@ -333,7 +490,14 @@ async fn reap_loop(
             biased;
             _ = shutdown.recv() => break,
             _ = ticker.tick() => {
-                for rt in envs.values() {
+                // Snapshot the current runtimes, then reap OFF-lock: `reap_idle`
+                // only touches idle pooled conns (never an in-flight query), and
+                // holding the registry mutex across it would block a live swap.
+                let snapshots: Vec<Arc<EnvRuntime>> = {
+                    let guard = envs.lock().await;
+                    guard.values().map(|h| h.current.borrow().clone()).collect()
+                };
+                for rt in snapshots {
                     if rt.idle_timeout.is_zero() {
                         continue;
                     }
@@ -353,30 +517,30 @@ async fn reap_loop(
 }
 
 async fn accept_loop(
-    env_name: &str,
     listener: TcpListener,
-    envs: Arc<HashMap<String, EnvRuntime>>,
+    rx: watch::Receiver<Arc<EnvRuntime>>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
     let mut sessions: JoinSet<()> = JoinSet::new();
-    let env_name = env_name.to_string();
     loop {
         tokio::select! {
             biased;
             _ = shutdown.recv() => break,
             accept = listener.accept() => match accept {
                 Ok((sock, peer)) => {
-                    let env_name = env_name.clone();
-                    let envs = envs.clone();
+                    // Snapshot the current runtime for THIS connection; a later
+                    // swap won't disturb it.
+                    let rt = rx.borrow().clone();
                     sessions.spawn(async move {
-                        if let Err(e) = handle_one(env_name.clone(), envs, sock, peer).await {
-                            warn!(env = %env_name, peer = %peer, err = %e, "session error");
+                        let env = rt.name.clone();
+                        if let Err(e) = handle_one(rt, sock, peer).await {
+                            warn!(env = %env, peer = %peer, err = %e, "session error");
                         }
                     });
                 }
                 Err(e) => {
-                    error!(env = %env_name, err = %e, "accept failed");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    error!(env = %rx.borrow().name, err = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
@@ -385,24 +549,20 @@ async fn accept_loop(
 }
 
 async fn handle_one(
-    env_name: String,
-    envs: Arc<HashMap<String, EnvRuntime>>,
+    rt: Arc<EnvRuntime>,
     mut sock: tokio::net::TcpStream,
     _peer: SocketAddr,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
-    let env = envs
-        .get(&env_name)
-        .ok_or_else(|| anyhow!("env vanished mid-flight"))?;
     let conn_id = std::process::id().wrapping_add(rand::random::<u32>());
-    match env
+    match rt
         .engine
-        .accept(&mut sock, &env.name, &env.client_auth, conn_id)
+        .accept(&mut sock, &rt.name, &rt.client_auth, conn_id)
         .await
     {
         Ok(session) => {
-            env.engine
-                .serve(&mut sock, &session, env.backend.as_ref(), &env.policy)
+            rt.engine
+                .serve(&mut sock, &session, rt.backend.as_ref(), &rt.policy)
                 .await?;
         }
         Err(_) => { /* accept already wrote the protocol's ERR frame */ }
@@ -414,6 +574,49 @@ async fn handle_one(
 mod tests {
     use super::*;
     use mw_core::config::{ClientAuth, Env, PoolSettings};
+
+    struct StubBackend;
+    impl Backend for StubBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn watch_snapshot_isolates_in_flight_sessions() {
+        // A running env publishes its runtime through a watch channel. An
+        // in-flight session snapshots it on connect; a later swap (as
+        // `apply_swap_policy` does) must NOT change what that snapshot sees,
+        // only what a fresh connect sees — and it must reuse the same pool.
+        let rt = EnvRuntime {
+            name: "e".into(),
+            engine: engine_for(EngineKind::MySql),
+            backend: Arc::new(StubBackend) as Arc<dyn Backend>,
+            policy: Policy::ReadOnly,
+            client_auth: ClientAuth::NativePassword {
+                double_sha1: [0; 20],
+            },
+            listen_addr: "127.0.0.1:1".parse().unwrap(),
+            idle_timeout: Duration::ZERO,
+        };
+        let (tx, rx) = watch::channel(Arc::new(rt));
+
+        // In-flight session grabs its snapshot.
+        let snapshot = rx.borrow().clone();
+        assert!(matches!(snapshot.policy, Policy::ReadOnly));
+
+        // Swap policy the way `swap_runtime` does: clone current, mutate, publish.
+        let mut next = (**rx.borrow()).clone();
+        next.policy = Policy::ReadWrite;
+        tx.send_replace(Arc::new(next));
+
+        // The in-flight snapshot is untouched...
+        assert!(matches!(snapshot.policy, Policy::ReadOnly));
+        // ...and shares the SAME backend Arc (pool reuse, no rebuild)...
+        assert!(Arc::ptr_eq(&snapshot.backend, &rx.borrow().backend));
+        // ...but a fresh connect sees the new policy.
+        assert!(matches!(rx.borrow().policy, Policy::ReadWrite));
+    }
 
     fn mssql_config() -> Config {
         let mut cfg = Config::default();

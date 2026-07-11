@@ -1,13 +1,14 @@
-//! Credential CRUD. Each credential pairs a backend username with a backend
-//! password. Multiple envs may share one credential row (single rotation);
-//! envs can also reference distinct credentials that happen to share a
-//! backend username with different passwords — the schema makes this trivial.
+//! Credential CRUD — thin offline wrappers over [`mw_core::mutate`]. Each
+//! credential pairs a backend username with a backend password; multiple envs
+//! may share one credential row (single rotation). The mutation logic lives in
+//! mw-core so the daemon shares it; this module keeps load/save glue plus the
+//! read/render helpers.
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 
-use mw_core::config::{Config, Credential};
+use mw_core::config::Config;
 use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
 
@@ -21,17 +22,7 @@ pub fn add(
     password: SecretStr,
 ) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
-        if cfg.credentials.contains_key(name) {
-            bail!("credential {:?} already exists", name);
-        }
-        cfg.credentials.insert(
-            name.to_string(),
-            Credential {
-                backend_user: backend_user.to_string(),
-                backend_password: password,
-            },
-        );
-        Ok(())
+        mw_core::mutate::add_cred(cfg, name, backend_user, password)
     })
 }
 
@@ -42,35 +33,12 @@ pub fn rotate(
     new_password: SecretStr,
 ) -> Result<()> {
     with_config(state_dir, ks, |cfg| {
-        let cred = cfg
-            .credentials
-            .get_mut(name)
-            .ok_or_else(|| anyhow!("credential {:?} not found", name))?;
-        cred.backend_password = new_password;
-        Ok(())
+        mw_core::mutate::rotate_cred(cfg, name, new_password)
     })
 }
 
 pub fn rm(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<()> {
-    with_config(state_dir, ks, |cfg| {
-        let users: Vec<&str> = cfg
-            .envs
-            .iter()
-            .filter(|(_, e)| e.credential == name)
-            .map(|(n, _)| n.as_str())
-            .collect();
-        if !users.is_empty() {
-            return Err(anyhow!(
-                "credential {:?} is still referenced by env(s): {}",
-                name,
-                users.join(", ")
-            ));
-        }
-        if cfg.credentials.remove(name).is_none() {
-            bail!("credential {:?} not found", name);
-        }
-        Ok(())
-    })
+    with_config(state_dir, ks, |cfg| mw_core::mutate::rm_cred(cfg, name))
 }
 
 #[derive(Debug, Clone)]

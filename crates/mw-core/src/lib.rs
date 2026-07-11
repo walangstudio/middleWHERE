@@ -1,6 +1,8 @@
 pub mod audit;
 pub mod config;
+pub mod control;
 pub mod keyring;
+pub mod mutate;
 pub mod policy;
 pub mod seal;
 pub mod secret;

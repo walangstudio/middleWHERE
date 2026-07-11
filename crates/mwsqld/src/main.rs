@@ -147,7 +147,8 @@ fn main() -> Result<()> {
                         env.pool.idle_timeout_secs = secs;
                     }
                 }
-                let daemon = Daemon::bind(state_dir, &cfg, &listen_host, allow_tofu).await?;
+                let daemon =
+                    Daemon::bind(state_dir, &cfg, &listen_host, allow_tofu, keystore).await?;
                 let (tx, rx) = tokio::sync::broadcast::channel(1);
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;

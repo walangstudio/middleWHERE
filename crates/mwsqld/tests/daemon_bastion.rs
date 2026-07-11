@@ -211,9 +211,15 @@ async fn select_one_through_bastion() {
     std::fs::write(tmp.path().join(CONFIG_FILE_NAME), blob).unwrap();
 
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false)
-        .await
-        .unwrap();
+    let daemon = Daemon::bind(
+        tmp.path().to_path_buf(),
+        &cfg_loaded,
+        "127.0.0.1",
+        false,
+        ks,
+    )
+    .await
+    .unwrap();
     let (tx, rx) = broadcast::channel(1);
     let h = tokio::spawn(daemon.run(rx));
 
@@ -300,7 +306,14 @@ async fn bind_fails_when_bastion_unreachable() {
     std::fs::write(tmp.path().join(CONFIG_FILE_NAME), blob).unwrap();
 
     let cfg_loaded = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let res = Daemon::bind(tmp.path().to_path_buf(), &cfg_loaded, "127.0.0.1", false).await;
+    let res = Daemon::bind(
+        tmp.path().to_path_buf(),
+        &cfg_loaded,
+        "127.0.0.1",
+        false,
+        ks,
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected bind to fail when bastion unreachable"

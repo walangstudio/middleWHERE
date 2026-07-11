@@ -351,6 +351,19 @@ pub fn save_config(state_dir: &Path, keystore: &KeystoreChoice, cfg: &Config) ->
     Ok(())
 }
 
+/// Load → mutate → save harness. Every config-touching mutation funnels through
+/// this so the atomic-write + validation + backup behaviour is enforced
+/// uniformly, whether it runs offline in the CLI or online in the daemon.
+pub fn with_config<F, R>(state_dir: &Path, keystore: &KeystoreChoice, mutate: F) -> Result<R>
+where
+    F: FnOnce(&mut Config) -> Result<R>,
+{
+    let mut cfg = load_config(state_dir, keystore)?;
+    let out = mutate(&mut cfg)?;
+    save_config(state_dir, keystore, &cfg)?;
+    Ok(out)
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
