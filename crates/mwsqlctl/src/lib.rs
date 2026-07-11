@@ -71,12 +71,10 @@ pub fn print_token_block(
 }
 
 /// Render a freshly minted env token from a control-channel [`NewEnvOutputDto`]:
-/// the standard token block, then — when the daemon flagged the env as persisted
-/// but not yet live (`note` is `Some`, only on the online path when the live bind
-/// failed) — a WARNING to stderr so the operator knows a restart is needed. The
-/// single render point for `env add`, `grant`, and the wizard, so every path
-/// surfaces the note the same way. `note = None` (clean success, or any
-/// direct/offline write) prints nothing extra.
+/// the standard token block, then — via [`render_token_note`] — the daemon's
+/// persisted-but-not-live WARNING when present. The single render point for
+/// `env add`, `grant`, and the wizard, so every path surfaces the note the same
+/// way.
 pub fn render_new_env(env: &str, out: &mw_core::control::NewEnvOutputDto) {
     print_token_block(
         env,
@@ -85,7 +83,17 @@ pub fn render_new_env(env: &str, out: &mw_core::control::NewEnvOutputDto) {
         out.engine,
         out.database.as_deref(),
     );
-    if let Some(note) = &out.note {
+    render_token_note(&out.note);
+}
+
+/// Print the daemon's persisted-but-not-live warning to stderr when present
+/// (`note` is `Some` only on the online path, when the env was saved but the live
+/// bind failed and a restart is needed). The single note-render point shared by
+/// [`render_new_env`] and the `rotate-token` arm, so the warning surfaces
+/// identically wherever a token is minted. `None` (clean success, or any
+/// direct/offline write) prints nothing.
+pub fn render_token_note(note: &Option<String>) {
+    if let Some(note) = note {
         eprintln!("⚠ {note}");
     }
 }

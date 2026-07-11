@@ -219,12 +219,9 @@ fn run_inner(opts: WizardOpts) -> Result<()> {
     let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
     // Share the one mode decision with the command router so they can't drift.
     // The wizard has no --offline; channel iff flagless + system-dir target.
-    let service = control_client::decide_mode(
-        opts.user,
-        false,
-        opts.state_dir.is_some(),
-        state_dir == mw_core::state::default_state_dir(),
-    ) == control_client::Mode::Channel;
+    let service =
+        control_client::decide_mode(opts.user, false, opts.state_dir.as_deref(), &state_dir)
+            == control_client::Mode::Channel;
 
     if service {
         service::validate_service_name(&opts.service_name)?;

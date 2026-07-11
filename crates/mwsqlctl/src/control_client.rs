@@ -64,23 +64,42 @@ pub enum Mode {
 /// else edits a config file directly:
 ///   - an explicit `--state-dir` names a specific config → Direct (going to the
 ///     channel would silently mutate the daemon's production config instead);
-///   - a v0.2.x legacy per-user resolution (`target_is_system` false) → Direct;
+///   - a v0.2.x legacy per-user resolution (a resolved dir other than the system
+///     service dir) → Direct;
 ///   - `--user` / `--offline` → Direct.
 ///
+/// Both derived inputs are computed here — `state_dir_arg.is_some()` for the
+/// explicit-dir test and `resolved_state_dir == default_state_dir()` for the
+/// system-target test — so the router and wizard pass only raw inputs and the
+/// derivation can't drift between call sites.
+///
 /// If no daemon is up on the channel path, [`call`] returns
-/// [`CallError::Unreachable`] and the CLI prints the recovery hint. The command
-/// router and the wizard share this one helper so they can never drift.
+/// [`CallError::Unreachable`] and the CLI prints the recovery hint.
 pub fn decide_mode(
     user: bool,
     offline: bool,
-    state_dir_explicit: bool,
-    target_is_system: bool,
+    state_dir_arg: Option<&Path>,
+    resolved_state_dir: &Path,
 ) -> Mode {
+    let state_dir_explicit = state_dir_arg.is_some();
+    let target_is_system = resolved_state_dir == mw_core::state::default_state_dir();
     if !user && !offline && !state_dir_explicit && target_is_system {
         Mode::Channel
     } else {
         Mode::Direct
     }
+}
+
+/// Whether a Direct (config-file-editing) command is safe to run without the
+/// running service in the loop. Only a **mutation** can clobber the daemon: the
+/// Direct path writes the sealed config with no cross-process lock and no live
+/// apply, so against a running service it both loses updates (a concurrent
+/// channel write can win) and leaves the daemon serving the old config. Reads are
+/// always fine, and `--user` targets the per-user dir the daemon never owns.
+/// `reachable` is [`is_reachable`]'s result; callers should only probe (and pass
+/// `true`) when it could matter — a non-`--user` mutation.
+pub fn direct_mutation_ok(is_user: bool, is_mutation: bool, reachable: bool) -> bool {
+    !is_mutation || is_user || !reachable
 }
 
 /// `--offline` edits the sealed config directly. When that config is the
@@ -231,6 +250,53 @@ pub fn call(service_name: &str, state_dir: &Path, req: &Request) -> Result<Respo
         Err(CallError::Failed(anyhow!(
             "no control-channel transport on this platform"
         )))
+    }
+}
+
+/// Cheap liveness probe: is a daemon actually listening on the control channel?
+/// Connect (and nothing more) to the socket/pipe the router would dial — a
+/// successful connect means a daemon answered. A missing or stale endpoint
+/// (connect-refused / not-found) is not-reachable; any other error means the
+/// endpoint exists (the daemon is up but e.g. we lack rights), so it counts as
+/// reachable — matching [`call`]'s [`CallError::Unreachable`] classification.
+/// Used to guard a Direct config mutation from clobbering a running service.
+pub fn is_reachable(state_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        let path = unix_socket_path(state_dir, CONTROL_SERVICE_NAME);
+        match UnixStream::connect(&path) {
+            Ok(_) => true,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = state_dir;
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+        let pipe = format!(r"\\.\pipe\middlewhere-{CONTROL_SERVICE_NAME}-control");
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&pipe)
+        {
+            Ok(_) => true,
+            // Only "no such pipe" is not-reachable; busy/access-denied still mean
+            // the daemon is up.
+            Err(e) => e.raw_os_error() != Some(ERROR_FILE_NOT_FOUND),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = state_dir;
+        false
     }
 }
 
@@ -471,21 +537,37 @@ mod tests {
 
     #[test]
     fn decide_mode_channel_only_for_flagless_system_target() {
-        // (user, offline, state_dir_explicit, target_is_system)
+        // (user, offline, state_dir_arg, resolved_state_dir) — the helper derives
+        // state_dir_explicit + target_is_system from the last two.
+        let sys = mw_core::state::default_state_dir();
+        let other = std::path::Path::new("/srv/mw-elsewhere");
         // The ONLY channel case: flagless, no explicit --state-dir, resolves to
         // the system service dir.
-        assert_eq!(decide_mode(false, false, false, true), Mode::Channel);
+        assert_eq!(decide_mode(false, false, None, &sys), Mode::Channel);
         // Flagless but resolved to a legacy per-user dir → direct (edit it in
         // place; there is no system daemon to talk to).
-        assert_eq!(decide_mode(false, false, false, false), Mode::Direct);
+        assert_eq!(decide_mode(false, false, None, other), Mode::Direct);
         // An explicit --state-dir names a specific config → direct, even when it
         // happens to equal the system dir; the channel can't target a dir, so
         // routing it to the channel would silently mutate the daemon's config.
-        assert_eq!(decide_mode(false, false, true, true), Mode::Direct);
-        assert_eq!(decide_mode(false, false, true, false), Mode::Direct);
+        assert_eq!(decide_mode(false, false, Some(&sys), &sys), Mode::Direct);
+        assert_eq!(decide_mode(false, false, Some(other), other), Mode::Direct);
         // The explicit flags force direct.
-        assert_eq!(decide_mode(true, false, false, true), Mode::Direct); // --user
-        assert_eq!(decide_mode(false, true, false, true), Mode::Direct); // --offline
+        assert_eq!(decide_mode(true, false, None, &sys), Mode::Direct); // --user
+        assert_eq!(decide_mode(false, true, None, &sys), Mode::Direct); // --offline
+    }
+
+    #[test]
+    fn direct_mutation_blocked_only_when_reachable_nonuser_mutation() {
+        // Reads never touch the daemon's config → always allowed.
+        assert!(direct_mutation_ok(false, false, true));
+        // A non-user mutation with the service up is the one refused case.
+        assert!(!direct_mutation_ok(false, true, true));
+        // Same mutation, no daemon up → fine to edit the file directly.
+        assert!(direct_mutation_ok(false, true, false));
+        // --user targets the per-user dir the daemon never owns → allowed even
+        // when a system daemon happens to be reachable.
+        assert!(direct_mutation_ok(true, true, true));
     }
 
     #[test]

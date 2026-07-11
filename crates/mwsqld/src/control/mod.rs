@@ -50,12 +50,13 @@ pub(crate) const ADMIN_GROUP: &str = "middlewhere-admins";
 /// keeps each task short-lived, so a small cap is plenty.
 const MAX_INFLIGHT: usize = 16;
 
-/// Cap on how long a denied connection waits to drain the client's pending
-/// `Request`. A cooperative client has already written it, so the drain returns
-/// at once; a Hello-only probe sends none, so this bounds the wait — the task
-/// (and its `MAX_INFLIGHT` permit) can never be pinned by a peer that never
-/// follows its `Hello` with a `Request`.
-const DENY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock cap on every control read (the `Hello` preamble, the authorized
+/// `Request`, and the drain before a reply-then-close). A peer that connects and
+/// stalls — silent, a partial frame, or `Hello`-then-silence — must not pin its
+/// `MAX_INFLIGHT` permit: the read errors out and the task releases the permit.
+/// A cooperative client has already written its frame, so the read returns at
+/// once and this bound never bites it.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn-free entry: run the platform accept loop until `shutdown` fires. Called
 /// from `Daemon::run`, holding an `Arc<Daemon>` so handlers can mutate the live
@@ -90,11 +91,13 @@ pub(crate) async fn serve(daemon: Arc<Daemon>, shutdown: &mut broadcast::Receive
 ///   deny with its uid/user — closing the audit gap that resolving after the
 ///   `Request` read would open.
 ///
-/// On a DENY we still read and discard the client's pending `Request` (bounded by
-/// `MAX_FRAME`, and by [`DENY_DRAIN_TIMEOUT`] against a Hello-only probe that
-/// sends none) BEFORE replying: the CLI writes its whole (up to `MAX_FRAME`)
-/// `Request` before it reads our `Response`, so closing without draining would
-/// break its blocked write with a pipe error that masks the `Denied` diagnostic.
+/// Every read is bounded by [`READ_TIMEOUT`], so a silent or partial peer can't
+/// pin its `MAX_INFLIGHT` permit forever. Each reply-then-close path (version
+/// mismatch, non-`Hello` preamble, and a DENY) first drains the client's pending
+/// `Request` via [`drain_pending_request`] (bounded by `MAX_FRAME` + the read
+/// timeout): the CLI writes its whole (up to `MAX_FRAME`) `Request` before it
+/// reads our `Response`, so closing without draining would break its blocked
+/// write with a pipe error that masks the diagnostic (e.g. "upgrade the client").
 ///
 /// `resolve` runs at most once, synchronously, with no `.await` between an
 /// impersonation and its revert (the Windows closure does the whole check under
@@ -104,10 +107,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     R: FnOnce() -> (AuthDecision, PeerIdentity),
 {
-    // 1. Version preamble. Reject a mismatch (or a missing Hello) up front.
-    match read_request(&mut stream).await {
+    // 1. Version preamble. Reject a mismatch (or a missing Hello) up front. Each
+    //    reply-then-close path drains the client's pending Request first so a
+    //    large-Request client reads the error instead of dying on a broken pipe.
+    match read_request_timeout(&mut stream).await {
         Ok(Request::Hello { version }) if version == PROTOCOL_VERSION => {}
         Ok(Request::Hello { .. }) => {
+            drain_pending_request(&mut stream).await;
             let _ = write_response(
                 &mut stream,
                 &Response::Error("protocol version mismatch; upgrade the client".into()),
@@ -116,6 +122,7 @@ where
             return;
         }
         Ok(_) => {
+            drain_pending_request(&mut stream).await;
             let _ = write_response(
                 &mut stream,
                 &Response::Error("expected a Hello preamble first".into()),
@@ -123,7 +130,7 @@ where
             .await;
             return;
         }
-        Err(_) => return, // truncated/hostile framing: drop silently.
+        Err(_) => return, // truncated/hostile/timed-out framing: drop silently.
     }
 
     // 2. Resolve the peer + authorize NOW (after the Hello read satisfies Windows
@@ -133,16 +140,15 @@ where
     if let AuthDecision::Deny(reason) = &decision {
         admin_event(&peer, "authz", "", Decision::Deny, Some(reason.clone())).emit();
         // Drain the client's pending Request before replying so its blocked write
-        // completes and it reads this Denied instead of a broken pipe. Bounded by
-        // MAX_FRAME (read_request) and by DENY_DRAIN_TIMEOUT (a Hello-only probe
-        // sends no Request); the drained frame is discarded either way.
-        let _ = tokio::time::timeout(DENY_DRAIN_TIMEOUT, read_request(&mut stream)).await;
+        // completes and it reads this Denied instead of a broken pipe.
+        drain_pending_request(&mut stream).await;
         let _ = write_response(&mut stream, &Response::Denied(reason.clone())).await;
         return;
     }
 
-    // 3. The request. Only an authorized peer reaches this read.
-    let req = match read_request(&mut stream).await {
+    // 3. The request. Only an authorized peer reaches this read; the timeout keeps
+    //    an authorized-but-silent peer from pinning its permit.
+    let req = match read_request_timeout(&mut stream).await {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -192,6 +198,24 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
     framed.extend_from_slice(&len_buf);
     framed.extend_from_slice(&body);
     read_frame(&mut framed.as_slice())
+}
+
+/// [`read_request`] bounded by [`READ_TIMEOUT`]: a stalled peer yields an `Err`
+/// instead of holding its control permit forever. A timeout and a framing failure
+/// collapse to one `Err` — the caller drops the connection either way.
+async fn read_request_timeout<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
+    match tokio::time::timeout(READ_TIMEOUT, read_request(stream)).await {
+        Ok(r) => r,
+        Err(_) => bail!("control read timed out"),
+    }
+}
+
+/// Drain the client's pending `Request` before a reply-then-close, so its blocked
+/// write completes and it reads our `Response` instead of dying on a broken pipe.
+/// Bounded by `MAX_FRAME` (via [`read_request`]) and [`READ_TIMEOUT`] (a peer that
+/// sends no Request just times out); the frame is discarded.
+async fn drain_pending_request<S: AsyncRead + Unpin>(stream: &mut S) {
+    let _ = read_request_timeout(stream).await;
 }
 
 /// Encode a response with the shared codec and write it as one async frame.
@@ -401,7 +425,7 @@ mod tests {
         .unwrap();
         // NOTE: no Request frame is sent — only Hello. Close the write half so the
         // server's deny-drain read hits EOF at once instead of waiting out
-        // DENY_DRAIN_TIMEOUT; the read half stays open to receive the Denied.
+        // READ_TIMEOUT; the read half stays open to receive the Denied.
         client.write_all(&buf).await.unwrap();
         client.flush().await.unwrap();
         client.shutdown().await.unwrap();
@@ -466,6 +490,34 @@ mod tests {
             Response::Denied(r) => assert_eq!(r, "nope"),
             other => panic!("expected Denied, got {other:?}"),
         }
+    }
+
+    // R4-1: a peer that connects but never sends its Hello must not pin the task
+    // (and its MAX_INFLIGHT permit) forever. The client half is kept open and
+    // silent so the read blocks on data (not EOF), isolating READ_TIMEOUT as the
+    // thing that frees the task.
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_read_times_out_and_releases_the_task() {
+        let (daemon, _tmp) = empty_daemon().await;
+        let (_client, server) = duplex(64);
+        let srv = tokio::spawn(async move {
+            handle_conn(daemon, server, || {
+                (AuthDecision::Allow, PeerIdentity::default())
+            })
+            .await;
+        });
+
+        // Nothing is ever sent: before the timeout the task is still parked.
+        tokio::task::yield_now().await;
+        assert!(
+            !srv.is_finished(),
+            "task must still be waiting before the read timeout"
+        );
+
+        // Advancing past READ_TIMEOUT frees it (a hung .await here would mean the
+        // read had no timeout and the permit leaked).
+        tokio::time::advance(READ_TIMEOUT + Duration::from_secs(1)).await;
+        srv.await.unwrap();
     }
 
     // Response reader mirroring read_request, for the test client half.

@@ -543,9 +543,9 @@ const NOT_YET_LIVE: &str = "persisted but not yet live";
 /// A token-minting mutation (add_env / grant) whose config persisted but whose
 /// live apply then failed. The minted cleartext is ONE-TIME, so it must reach
 /// the operator even though the env isn't live yet — dropping it would strand an
-/// env that now exists. Audit the not-yet-live condition + warn, but still return
-/// the token. (The CLI can't yet render this warning alongside the token — that
-/// would need a protocol field; the daemon log carries it.)
+/// env that now exists. Audit the not-yet-live condition + warn, and surface it
+/// to the operator via the token response's `NewEnvOutputDto.note`, which the CLI
+/// renders alongside the token; the daemon log carries the fuller detail.
 fn token_but_not_live(
     peer: &PeerIdentity,
     action: &str,

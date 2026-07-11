@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use mw_core::config::{ClientAuth, Config, EngineKind, Env, Policy};
@@ -510,23 +511,29 @@ async fn probe_one_env(cfg: &Config, name: &str, allow_tofu: bool) -> EnvProbeRe
 /// Runs until shutdown; the sweep itself never touches an in-flight query (only
 /// connections sitting idle in the pool are candidates).
 ///
-/// The cadence is RECOMPUTED each iteration from the CURRENT registry's tightest
-/// non-zero idle timeout (falling back to [`REAP_FALLBACK_INTERVAL`] when nothing
-/// has a timeout), so an env added live over the control channel with a short
-/// timeout is swept at its own cadence rather than the bind-time one. A live add
-/// signals `wake` so the fresh cadence takes effect at once instead of after the
-/// current sleep. When every env is zero-timeout the loop idles at the fallback
+/// The sweep is scheduled on an ABSOLUTE deadline, not a fresh relative sleep, so
+/// a burst of live adds can only pull it EARLIER, never push it later. The cadence
+/// is the CURRENT registry's tightest non-zero idle timeout (falling back to
+/// [`REAP_FALLBACK_INTERVAL`] when nothing has a timeout). A live add signals
+/// `wake`; the deadline is then recomputed as `min(deadline, now + new_cadence)` —
+/// a tighter cadence sweeps a new short-timeout env within its own window, while a
+/// sustained stream of adds can't starve the sweep by continually resetting a
+/// relative sleep. When every env is zero-timeout the loop idles at the fallback
 /// cadence and does nothing (no busy-loop).
 async fn reap_loop(envs: EnvRegistry, wake: Arc<Notify>, shutdown: &mut broadcast::Receiver<()>) {
+    let mut deadline = Instant::now() + current_reap_interval(&envs).await;
     loop {
-        let interval = current_reap_interval(&envs).await;
         tokio::select! {
             biased;
             _ = shutdown.recv() => break,
-            // A live env add wakes us so the NEXT sleep uses the fresh cadence
-            // rather than waiting out the current (possibly 60s) interval.
-            _ = wake.notified() => continue,
-            _ = tokio::time::sleep(interval) => {
+            // A live add may tighten the cadence: pull the deadline earlier if the
+            // new env's window ends sooner, but NEVER delay it — a burst of adds
+            // must not push the sweep past the previously-scheduled deadline.
+            _ = wake.notified() => {
+                let cadence = current_reap_interval(&envs).await;
+                deadline = deadline.min(Instant::now() + cadence);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
                 // Snapshot the current runtimes, then reap OFF-lock: `reap_idle`
                 // only touches idle pooled conns (never an in-flight query), and
                 // holding the registry mutex across it would block a live swap.
@@ -548,6 +555,8 @@ async fn reap_loop(envs: EnvRegistry, wake: Arc<Notify>, shutdown: &mut broadcas
                         );
                     }
                 }
+                // Schedule the next sweep a full (freshly recomputed) cadence out.
+                deadline = Instant::now() + current_reap_interval(&envs).await;
             }
         }
     }
@@ -888,6 +897,52 @@ mod tests {
             count.load(Ordering::SeqCst),
             1,
             "live-added env swept at its own cadence, not the 60s base"
+        );
+
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_of_live_adds_does_not_starve_the_sweep() {
+        // R4-2: the sweep is anchored to an ABSOLUTE deadline, so a sustained
+        // stream of live adds (each firing `wake`) can only pull it earlier, never
+        // push it later. A naive relative sleep restarted on every wake would keep
+        // sliding the sweep out and starve idle-conn reaping for the whole burst.
+        let envs: EnvRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let wake = Arc::new(Notify::new());
+        let (_sd, mut sd_rx) = broadcast::channel(1);
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let reap_envs = envs.clone();
+        let reap_wake = wake.clone();
+        let task = tokio::spawn(async move { reap_loop(reap_envs, reap_wake, &mut sd_rx).await });
+
+        // Park on the empty-registry 60s fallback deadline.
+        tokio::task::yield_now().await;
+
+        // Three adds 2s apart, each a 10s-timeout env (reaper_interval=5s). The
+        // first anchors the deadline at ~t0+5; later adds must NOT push it past
+        // that. A relative-sleep reaper would re-arm to (last add t0+4)+5s = t0+9.
+        for i in 0..3 {
+            let rt = runtime_with_timeout(
+                Arc::new(CountingBackend(count.clone())),
+                Duration::from_secs(10),
+            );
+            envs.lock().await.insert(format!("e{i}"), env_handle(rt));
+            wake.notify_one();
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            if i < 2 {
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+        }
+
+        // Now at ~t0+4 with the deadline anchored at ~t0+5. Cross it.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            count.load(Ordering::SeqCst) > 0,
+            "anchored deadline swept despite the burst; a relative sleep would have starved it"
         );
 
         task.abort();

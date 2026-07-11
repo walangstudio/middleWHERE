@@ -383,12 +383,28 @@ fn main() -> Result<()> {
     // legacy per-user resolution, `--user`, or `--offline` edit a config file
     // directly — the channel always mutates the daemon's own loaded config, so
     // routing an explicit `--state-dir` there would silently hit the wrong one.
-    let use_channel = control_client::decide_mode(
-        user,
-        cli.offline,
-        cli.state_dir.is_some(),
-        target_needs_root,
-    ) == control_client::Mode::Channel;
+    let use_channel =
+        control_client::decide_mode(user, cli.offline, cli.state_dir.as_deref(), &state_dir)
+            == control_client::Mode::Channel;
+
+    // Guard the Direct write path against a running daemon. A non-`--user` Direct
+    // config MUTATION (`--offline`, or an explicit `--state-dir` routed to Direct)
+    // edits the sealed config file the service owns: the daemon keeps serving the
+    // old config (no live apply) and, with no cross-process lock, a concurrent
+    // channel write can be lost. Refuse when the service is reachable; reads and
+    // `--user` (the per-user dir the daemon never owns) stay allowed. Only probe
+    // when it could matter, so reads never pay for a connect.
+    if !use_channel {
+        let is_mutation = cmd_is_mutation(&cli.cmd);
+        let reachable = is_mutation && !user && control_client::is_reachable(&state_dir);
+        if !control_client::direct_mutation_ok(user, is_mutation, reachable) {
+            bail!(
+                "the middleWHERE service is running and owns its config; drop \
+                 --state-dir/--offline to configure it over the service, or stop \
+                 the service first to edit a config file directly."
+            );
+        }
+    }
     let t = Target::new(&state_dir, &ks);
 
     match cli.cmd {
@@ -548,9 +564,7 @@ fn main() -> Result<()> {
             };
             eprintln!("env {:?} token rotated. New token (save now):", name);
             println!("{}", out.token.expose());
-            if let Some(note) = &out.note {
-                eprintln!("⚠ {note}");
-            }
+            mwsqlctl::render_token_note(&out.note);
         }
         Cmd::Env(EnvCmd::List) => {
             if use_channel {
@@ -660,6 +674,32 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a command mutates the sealed config (vs a read-only listing/probe).
+/// Drives the "don't Direct-edit a running service's config" guard: only
+/// mutations can cause the lost-update race, so reads stay allowed in Direct
+/// mode. Wizard/Init/Uninstall/InstallService are dispatched before the guard
+/// and classified as non-mutating so they never trip it; a newly added command
+/// defaults to a mutation (the safe side of the guard).
+fn cmd_is_mutation(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::Bastion(BastionCmd::List)
+        | Cmd::Cred(CredCmd::List)
+        | Cmd::Env(EnvCmd::List)
+        | Cmd::Env(EnvCmd::Test { .. })
+        | Cmd::AuditTail(_)
+        | Cmd::Wizard(_)
+        | Cmd::Init(_)
+        | Cmd::Uninstall(_)
+        | Cmd::InstallService(_) => false,
+        Cmd::Bastion(_)
+        | Cmd::Cred(_)
+        | Cmd::Env(_)
+        | Cmd::Policy(_)
+        | Cmd::Grant(_)
+        | Cmd::Import(_) => true,
+    }
 }
 
 /// Send a request that must return [`Response::Ok`], surfacing any other reply

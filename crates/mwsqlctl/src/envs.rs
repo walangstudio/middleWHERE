@@ -9,7 +9,6 @@ use std::path::Path;
 use anyhow::Result;
 
 use mw_core::config::{Config, EngineKind, Policy};
-use mw_core::secret::SecretStr;
 use mw_core::state::KeystoreChoice;
 
 use crate::store::with_config;
@@ -22,10 +21,6 @@ pub fn add(state_dir: &Path, ks: &KeystoreChoice, args: EnvAddArgs<'_>) -> Resul
 
 pub fn rm(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<()> {
     with_config(state_dir, ks, |cfg| mw_core::mutate::rm_env(cfg, name))
-}
-
-pub fn rotate_token(state_dir: &Path, ks: &KeystoreChoice, name: &str) -> Result<SecretStr> {
-    Ok(grant(state_dir, ks, name)?.token)
 }
 
 /// Rotate the env token and return it together with the env's listen port,
