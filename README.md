@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-296%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-300%20passing-brightgreen)
 
 middleWHERE sits between whoever runs queries and your real database. The
 caller connects to a local port with a name and a token, and runs SQL. They
@@ -185,6 +185,28 @@ export MW_STATE_DIR=/var/lib/middlewhere MW_FILE_KEYSTORE=1
 If you run `mwsqld` by hand, it and `mwsqlctl` must resolve the same state
 dir: same default, same `MW_STATE_DIR`, or same `--state-dir` on both.
 Flagless service config needs none of this; it dials the daemon's socket.
+
+### The quick way: one command from a connection URL
+
+If you already have a connection string, which is what Supabase, Neon, RDS, and
+most `docker-compose` files hand you, pass it straight to `env add`. It fills in
+the engine, host, port, and database, stores the login as a credential named
+after the env, and prints the client token:
+
+```sh
+mwsqlctl env add staging1 --url 'postgresql://appuser@db.internal:5432/app' --listen-port 6433
+# backend password: (typed, hidden)
+```
+
+Leave the password out of the URL, as above, and you are prompted for it with
+echo off. A password inside the URL works but lands in your shell history, so
+the command warns and you should rotate it. For scripts, pass
+`--password-stdin` and feed it in (see
+[Scripting credential setup](#scripting-credential-setup)).
+
+Add `--bastion <name>` if the database sits behind a jump host. Use the longer
+form below when several environments share one login, or when you want a
+credential name of your own.
 
 ### A worked example
 

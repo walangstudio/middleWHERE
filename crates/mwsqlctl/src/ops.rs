@@ -133,6 +133,70 @@ pub fn rotate_credential(t: Target, name: &str, password_stdin: bool) -> Result<
     cred::rotate(t.state_dir, t.ks, name, SecretStr::new(pw))
 }
 
+/// A backend connection string, split into the pieces `env add` needs.
+/// Everything a hosted database hands you (Supabase, Neon, RDS, a
+/// docker-compose file) is already in this shape, so accepting it directly
+/// saves inventing a credential name and retyping five flags.
+#[derive(Debug)]
+pub struct ParsedUrl {
+    pub engine: EngineKind,
+    pub host: String,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub db_user: String,
+    /// Present only when the URL carried one. Prompted for otherwise, which is
+    /// the better habit: a password in the URL lands in shell history and, on
+    /// most systems, the process table.
+    pub password: Option<SecretStr>,
+}
+
+/// Parse `postgres://user:pass@host:5432/db` (or `mysql://…`) into env fields.
+/// Percent-encoded userinfo is decoded, so a password with `@` or `/` in it
+/// survives the round trip.
+pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
+    let url = url::Url::parse(raw).with_context(|| format!("parse connection url {raw:?}"))?;
+    let engine = match url.scheme() {
+        "postgres" | "postgresql" => EngineKind::Postgres,
+        "mysql" | "mariadb" => EngineKind::MySql,
+        other => bail!(
+            "unsupported url scheme {other:?}; use postgres:// or mysql:// \
+             (mssql is not implemented yet)"
+        ),
+    };
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("connection url has no host"))?
+        .to_string();
+    let db_user = percent_decode(url.username());
+    if db_user.is_empty() {
+        bail!(
+            "connection url has no username; add one (postgres://<user>@host/db) \
+             or use --credential to reuse a login you already added"
+        );
+    }
+    let database = match url.path().trim_start_matches('/') {
+        "" => None,
+        db => Some(percent_decode(db)),
+    };
+    Ok(ParsedUrl {
+        engine,
+        host,
+        port: url.port(),
+        database,
+        db_user,
+        password: url.password().map(|p| SecretStr::new(percent_decode(p))),
+    })
+}
+
+/// `url` only percent-decodes lazily, and its decoder yields bytes; userinfo is
+/// UTF-8 in practice, so a lossy decode is enough and cannot fail on input.
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// Non-secret inputs for adding an env. `backend_port` defaults to the engine's
 /// conventional port when `None`.
 pub struct EnvInput {
@@ -280,6 +344,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ks = KeystoreChoice::default_file(tmp.path());
         (tmp, ks)
+    }
+
+    #[test]
+    fn parse_connection_url_splits_a_postgres_url() {
+        let p = parse_connection_url("postgresql://appuser@db.internal:5432/app").unwrap();
+        assert!(matches!(p.engine, EngineKind::Postgres));
+        assert_eq!(p.host, "db.internal");
+        assert_eq!(p.port, Some(5432));
+        assert_eq!(p.database.as_deref(), Some("app"));
+        assert_eq!(p.db_user, "appuser");
+        assert!(p.password.is_none(), "no password means prompt for one");
+    }
+
+    /// The reason this uses a real url parser: a password with reserved
+    /// characters must survive, or the daemon authenticates with the wrong one.
+    #[test]
+    fn parse_connection_url_decodes_percent_encoded_userinfo() {
+        let p = parse_connection_url("mysql://a%40b:p%2Fw%40rd@h:3307/d").unwrap();
+        assert!(matches!(p.engine, EngineKind::MySql));
+        assert_eq!(p.db_user, "a@b");
+        assert_eq!(p.password.unwrap().expose(), "p/w@rd");
+        assert_eq!(p.port, Some(3307));
+    }
+
+    #[test]
+    fn parse_connection_url_defaults_and_rejections() {
+        // No port and no database: both optional, filled in downstream.
+        let p = parse_connection_url("mysql://u@h").unwrap();
+        assert_eq!(p.port, None);
+        assert_eq!(p.database, None);
+
+        for (raw, want) in [
+            ("mssql://u@h/d", "unsupported url scheme"),
+            ("postgres://h/d", "no username"),
+            ("not a url", "parse connection url"),
+        ] {
+            let err = parse_connection_url(raw).unwrap_err().to_string();
+            assert!(err.contains(want), "{raw}: got {err}");
+        }
     }
 
     /// Silently keeping only the first pin is the dangerous outcome: the drop

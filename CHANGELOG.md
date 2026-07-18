@@ -24,6 +24,19 @@ versions are fixes only.
   `init`/`uninstall` still elevate - they install/remove the OS service.
 - **`mwsql <env> -e "SQL"` now works as documented.** A bare env name defaults
   to the `run` subcommand; `mwsql run <env>` still works.
+
+### Added
+
+- **`env add --url <connection-string>`** sets up a connection in one command.
+  `mwsqlctl env add staging1 --url 'postgresql://appuser@db.internal:5432/app'`
+  derives the engine, host, port, and database, stores the login as a credential
+  named after the env, and mints the token - replacing a `cred add` plus an
+  `env add` with five flags. Percent-encoded userinfo is decoded, so a password
+  containing `@` or `/` survives. Omit the password to be prompted (a password
+  in the URL is used but warned about, since it is already in your shell
+  history), or pass `--password-stdin` for unattended runs. `--url` and
+  `--credential` are mutually exclusive: the URL brings its own login, while
+  `--credential` reuses one you already added.
 - **Re-pinning a bastion fingerprint now takes effect without a restart.**
   `bastion set-fingerprint` forgets the daemon's cached SSH session and rebuilds
   every env using that bastion, so the next tunnel re-checks the host key

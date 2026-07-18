@@ -1005,6 +1005,143 @@ mod tests {
         }
     }
 
+    /// Minimal in-process sshd: a host key and password auth, nothing else.
+    /// Enough for `build_env_runtime`, which opens the session and binds a
+    /// local forward but never opens a channel until a client connects, and the
+    /// backend pool is lazy so no database is needed either.
+    mod sshd {
+        use russh::server::{self, Auth, Handler, Server as _};
+        use std::sync::Arc;
+
+        const HOST_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBjYB3+5hdIxwZUQWix9vH/LSQ2C+nvZaftFvADx4FEMgAAAJDWMN3Q1jDd
+0AAAAAtzc2gtZWQyNTUxOQAAACBjYB3+5hdIxwZUQWix9vH/LSQ2C+nvZaftFvADx4FEMg
+AAAEBc1+jlhd4Rab8V08LKYQ66QNsuuZIn9lArqKEKd08EUGNgHf7mF0jHBlRBaLH28f8t
+JDYL6e9lp+0W8APHgUQyAAAACXRlc3Qtb25seQECAwQ=
+-----END OPENSSH PRIVATE KEY-----
+";
+        pub const USER: &str = "tester";
+        pub const PASSWORD: &str = "tunnel-pw-9f7a1d";
+
+        #[derive(Clone)]
+        struct Srv;
+        #[derive(Default)]
+        pub struct H;
+
+        impl server::Server for Srv {
+            type Handler = H;
+            fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> H {
+                H
+            }
+        }
+
+        impl Handler for H {
+            type Error = russh::Error;
+            async fn auth_password(&mut self, u: &str, p: &str) -> Result<Auth, Self::Error> {
+                if u == USER && p == PASSWORD {
+                    Ok(Auth::Accept)
+                } else {
+                    Ok(Auth::reject())
+                }
+            }
+        }
+
+        /// Start on an ephemeral port and return it. The task is detached; it
+        /// dies with the test runtime.
+        pub async fn start() -> u16 {
+            let key = russh::keys::PrivateKey::from_openssh(HOST_KEY).unwrap();
+            let config = Arc::new(server::Config {
+                keys: vec![key],
+                ..Default::default()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = Srv.run_on_socket(config, &listener).await;
+            });
+            port
+        }
+    }
+
+    /// The security-critical path: a re-pin whose reconnect FAILS must take the
+    /// env offline, never leave it serving through the tunnel the operator just
+    /// declared untrusted. Revert the `apply_rm_env` in `set_fingerprint_req`
+    /// and this fails with the env still live.
+    #[tokio::test]
+    async fn failed_repin_stops_the_env_instead_of_serving_the_old_tunnel() {
+        let port = sshd::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ks = KeystoreChoice::default_file(tmp.path());
+        init(tmp.path(), &ks).unwrap();
+
+        // Bastion with no pins + allow_tofu, so the FIRST connect succeeds.
+        mw_core::state::with_config(tmp.path(), &ks, |cfg| {
+            mw_core::mutate::add_bastion(
+                cfg,
+                BastionAddArgs {
+                    name: "b",
+                    host: "127.0.0.1",
+                    port,
+                    ssh_user: sshd::USER,
+                    auth: BastionAuthInput::Password(SecretStr::new(sshd::PASSWORD)),
+                    fingerprint: None,
+                },
+            )?;
+            mw_core::mutate::add_cred(cfg, "c", "u", SecretStr::new("p"))?;
+            mw_core::mutate::add_env(
+                cfg,
+                EnvAddArgs {
+                    name: "e",
+                    backend_host: "127.0.0.1",
+                    backend_port: 3306,
+                    default_database: None,
+                    bastion: Some("b"),
+                    credential: "c",
+                    policy: Policy::ReadOnly,
+                    listen_port: Some(0),
+                    max_pool: None,
+                    engine: EngineKind::MySql,
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cfg = load_config(tmp.path(), &ks).unwrap();
+        let daemon = Arc::new(
+            Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", true, ks)
+                .await
+                .unwrap(),
+        );
+        assert!(daemon.has_env("e").await, "precondition: env is serving");
+
+        // Pin a fingerprint the test sshd cannot present: the reconnect is
+        // refused by check_server_key, exactly as a MITM'd host would be.
+        let resp = dispatch(
+            &daemon,
+            &peer(),
+            Request::SetFingerprint {
+                bastion: "b".into(),
+                fingerprint: HostKeyFingerprint {
+                    algo: "ssh-ed25519".into(),
+                    sha256_b64: "definitely-not-the-real-key".into(),
+                },
+            },
+        )
+        .await;
+
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("STOPPED"), "{msg}"),
+            other => panic!("a failed re-pin must not report success: {other:?}"),
+        }
+        assert!(
+            !daemon.has_env("e").await,
+            "env still serving through the rejected tunnel: fail-open regression"
+        );
+    }
+
     #[tokio::test]
     async fn second_hello_is_a_protocol_error() {
         let (daemon, _tmp) = empty_daemon().await;

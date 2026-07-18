@@ -1743,12 +1743,14 @@ dependencies = [
  "clap",
  "libc",
  "mw-core",
+ "percent-encoding",
  "rand 0.8.6",
  "rpassword",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "url",
  "winresource",
 ]
 

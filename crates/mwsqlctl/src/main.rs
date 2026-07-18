@@ -232,20 +232,31 @@ enum EnvCmd {
 #[derive(Args)]
 struct EnvAddArgs {
     name: String,
-    #[arg(long)]
-    backend_host: String,
+    /// Whole connection in one flag: `postgres://user@host:5432/db` (or
+    /// `mysql://…`). Fills in engine, host, port, database, and the backend
+    /// login, creating a credential named after this env. Leave the password
+    /// out and it is prompted; putting it in the URL exposes it to your shell
+    /// history. Use --credential instead to reuse a login you already added.
+    #[arg(long, conflicts_with_all = ["backend_host", "credential", "engine", "database"])]
+    url: Option<String>,
+    #[arg(long, required_unless_present = "url")]
+    backend_host: Option<String>,
     /// Backend port. Defaults to the engine's conventional port
     /// (mysql 3306, postgres 5432, mssql 1433).
     #[arg(long)]
     backend_port: Option<u16>,
-    #[arg(long, value_enum, default_value_t = EngineKindArg::Mysql)]
-    engine: EngineKindArg,
+    #[arg(long, value_enum)]
+    engine: Option<EngineKindArg>,
     #[arg(long)]
     database: Option<String>,
     #[arg(long)]
     bastion: Option<String>,
-    #[arg(long)]
-    credential: String,
+    #[arg(long, required_unless_present = "url")]
+    credential: Option<String>,
+    /// With --url: read the backend password from stdin instead of prompting,
+    /// so an unattended run can supply it without putting it in the URL.
+    #[arg(long, requires = "url")]
+    password_stdin: bool,
     #[arg(long, value_enum, default_value_t = PolicyKindArg::ReadOnly)]
     policy: PolicyKindArg,
     #[arg(long)]
@@ -519,14 +530,50 @@ fn main() -> Result<()> {
         Cmd::Env(EnvCmd::Add(a)) => {
             let name = a.name.clone();
             let no_validate = a.no_validate;
+            // `--url` carries the login too, so it creates the credential first
+            // and the env then names it. Without it the caller supplied the
+            // pieces (and an existing --credential) the long way.
+            let (backend_host, backend_port, engine, database, credential) = match &a.url {
+                Some(raw) => {
+                    let p = ops::parse_connection_url(raw)?;
+                    let cred_name = name.clone();
+                    add_credential_for_url(
+                        use_channel,
+                        &state_dir,
+                        t,
+                        &cred_name,
+                        &p,
+                        a.password_stdin,
+                    )?;
+                    eprintln!("credential {cred_name:?} added from url");
+                    (
+                        p.host,
+                        a.backend_port.or(p.port),
+                        p.engine,
+                        a.database.clone().or(p.database),
+                        cred_name,
+                    )
+                }
+                None => (
+                    a.backend_host
+                        .clone()
+                        .expect("clap requires it without --url"),
+                    a.backend_port,
+                    a.engine.unwrap_or(EngineKindArg::Mysql).into(),
+                    a.database.clone(),
+                    a.credential
+                        .clone()
+                        .expect("clap requires it without --url"),
+                ),
+            };
             let input = ops::EnvInput {
                 name: a.name,
-                backend_host: a.backend_host,
-                backend_port: a.backend_port,
-                engine: a.engine.into(),
-                database: a.database,
+                backend_host,
+                backend_port,
+                engine,
+                database,
                 bastion: a.bastion,
-                credential: a.credential,
+                credential,
                 policy: a.policy.into(),
                 listen_port: a.listen_port,
                 max_pool: a.max_pool,
@@ -716,6 +763,43 @@ fn expect_token(state_dir: &Path, req: Request) -> Result<NewEnvOutputDto> {
     match control_client::checked_call(state_dir, &req)? {
         Response::Token(dto) => Ok(dto),
         other => bail!("unexpected response from the service: {other:?}"),
+    }
+}
+
+/// Store the login carried by `env add --url` as a credential named after the
+/// env. Mirrors the `cred add` arm across both modes. A password in the URL is
+/// used as-is but called out: it is already in the shell history by then, and
+/// the operator should know to rotate it.
+fn add_credential_for_url(
+    use_channel: bool,
+    state_dir: &std::path::Path,
+    t: ops::Target<'_>,
+    cred_name: &str,
+    parsed: &ops::ParsedUrl,
+    password_stdin: bool,
+) -> anyhow::Result<()> {
+    let password = match &parsed.password {
+        Some(pw) => {
+            eprintln!(
+                "warning: the password came from the url, so it is in your shell \
+                 history and may be visible in the process table - rotate it, or \
+                 omit it from the url next time and let it be prompted"
+            );
+            pw.clone()
+        }
+        None => SecretStr::new(ops::read_secret("backend password: ", password_stdin)?),
+    };
+    if use_channel {
+        expect_ok(
+            state_dir,
+            Request::AddCred(CredInputDto {
+                name: cred_name.to_string(),
+                backend_user: parsed.db_user.clone(),
+                password,
+            }),
+        )
+    } else {
+        cred::add(t.state_dir, t.ks, cred_name, &parsed.db_user, password)
     }
 }
 
