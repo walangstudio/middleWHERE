@@ -99,19 +99,13 @@ pub struct Daemon {
     /// short idle timeout is swept within its own window instead of waiting out
     /// the previous (possibly 60s) interval.
     reap_wake: Arc<Notify>,
-    // Below are threaded for Phase 5's live-mutation handlers; nothing reads
-    // them yet.
-    #[allow(dead_code)]
+    // Below are read by the control-channel handlers (control/handlers.rs).
     ks: KeystoreChoice,
-    #[allow(dead_code)]
     listen_host: String,
-    #[allow(dead_code)]
     allow_tofu: bool,
     /// Held so bastion SSH sessions stay open and re-usable across a live add.
-    #[allow(dead_code)]
     bastions: BastionRegistry,
-    /// Serializes a future load -> mutate -> save -> apply cycle.
-    #[allow(dead_code)]
+    /// Serializes each load -> mutate -> save -> apply cycle.
     config_write: Arc<Mutex<()>>,
 }
 
@@ -219,6 +213,12 @@ impl Daemon {
     pub async fn env_count(&self) -> usize {
         self.envs.lock().await.len()
     }
+
+    /// Whether this env is currently being served. An env can exist in the
+    /// sealed config without being live: `bind` skips unsupported engines.
+    pub(crate) async fn has_env(&self, name: &str) -> bool {
+        self.envs.lock().await.contains_key(name)
+    }
 }
 
 /// Start one env's accept loop and return its live handle. Used by
@@ -241,11 +241,10 @@ fn spawn_env(
     }
 }
 
-/// Live config-apply surface. Phase 5's control handlers call these after
-/// validating + persisting a mutation; nothing calls them yet (hence the
-/// `#[allow(dead_code)]`). Each keeps the observable rule: an in-flight session
-/// keeps the runtime snapshot it started with; only new connects see a swap.
-#[allow(dead_code)]
+/// Live config-apply surface, called by the control handlers
+/// (control/handlers.rs) after validating + persisting a mutation. Each keeps
+/// the observable rule: an in-flight session keeps the runtime snapshot it
+/// started with; only new connects see a swap.
 impl Daemon {
     /// Add an env to the live daemon: build its pool + forwards, bind its
     /// listener (a port conflict fails HERE), and start serving it.

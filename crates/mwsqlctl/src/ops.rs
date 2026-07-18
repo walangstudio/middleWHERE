@@ -57,12 +57,39 @@ pub struct BastionInput {
     pub fingerprints: Vec<String>,
 }
 
+/// Only one pinned key per bastion is wired end to end today: the mutation and
+/// the control DTO both carry a single fingerprint. Accepting several and
+/// keeping `.first()` would silently drop the rest, and the drop only surfaces
+/// much later as a hard connection refusal when the unpinned host answers.
+pub fn single_fingerprint(fingerprints: &[String]) -> Result<Option<HostKeyFingerprint>> {
+    if fingerprints.len() > 1 {
+        bail!(
+            "only one --fingerprint is supported per bastion (got {}); \
+             pin the key the bastion presents today",
+            fingerprints.len()
+        );
+    }
+    fingerprints
+        .first()
+        .map(|s| parse_fingerprint(s))
+        .transpose()
+}
+
 /// Resolve a bastion's auth secret in-process: read the PEM key file (prompting
 /// for a passphrase) or prompt for the SSH password. Shared by the offline
 /// [`add_bastion`] and the online control-channel path so both prompt
 /// identically before the secret is sealed / sent.
 pub fn resolve_bastion_auth(input: &BastionInput) -> Result<bastion::BastionAuthInput> {
     if let Some(path) = &input.key_file {
+        // The key is validated, sealed, and stored, but the daemon cannot USE
+        // it yet (mw-net's BastionSession only speaks password auth until
+        // Phase 7b). Storing silently would strand the operator at first
+        // connect with no hint of why.
+        eprintln!(
+            "warning: SSH key auth is stored but NOT functional yet - every \
+             connection through this bastion will fail until key auth ships; \
+             use password auth for a working tunnel"
+        );
         let pem = std::fs::read(path).with_context(|| format!("read key {}", path.display()))?;
         let passphrase = if read_yes_no("key has a passphrase? [y/N]: ")? {
             Some(SecretStr::new(read_secret("key passphrase: ", false)?))
@@ -81,11 +108,7 @@ pub fn resolve_bastion_auth(input: &BastionInput) -> Result<bastion::BastionAuth
 
 pub fn add_bastion(t: Target, input: BastionInput) -> Result<()> {
     let auth = resolve_bastion_auth(&input)?;
-    let fingerprint = input
-        .fingerprints
-        .first()
-        .map(|s| parse_fingerprint(s))
-        .transpose()?;
+    let fingerprint = single_fingerprint(&input.fingerprints)?;
     bastion::add(
         t.state_dir,
         t.ks,
@@ -257,6 +280,26 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ks = KeystoreChoice::default_file(tmp.path());
         (tmp, ks)
+    }
+
+    /// Silently keeping only the first pin is the dangerous outcome: the drop
+    /// surfaces later as an unexplained connection refusal.
+    #[test]
+    fn single_fingerprint_rejects_a_second_pin() {
+        assert!(single_fingerprint(&[]).unwrap().is_none());
+
+        let one = ["ssh-ed25519:AAAA".to_string()];
+        assert_eq!(
+            single_fingerprint(&one).unwrap().unwrap().sha256_b64,
+            "AAAA"
+        );
+
+        let two = [
+            "ssh-ed25519:AAAA".to_string(),
+            "ssh-ed25519:BBBB".to_string(),
+        ];
+        let err = single_fingerprint(&two).unwrap_err().to_string();
+        assert!(err.contains("only one --fingerprint"), "{err}");
     }
 
     #[test]

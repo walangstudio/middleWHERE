@@ -417,3 +417,110 @@ unsafe fn wide_ptr_to_string(p: *const u16) -> String {
     let slice = std::slice::from_raw_parts(p, len as usize);
     String::from_utf16_lossy(slice)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    #[test]
+    fn wide_roundtrips_through_wide_to_string() {
+        assert_eq!(wide_to_string(&wide("hello")), "hello");
+        assert_eq!(wide_to_string(&wide("")), "");
+    }
+
+    #[test]
+    fn wide_to_string_stops_at_first_nul() {
+        // wide() always NUL-terminates; anything appended after that NUL must
+        // never surface in the decoded string.
+        let mut w = wide("ab");
+        w.push('X' as u16);
+        assert_eq!(wide_to_string(&w), "ab");
+    }
+
+    #[test]
+    fn wide_ptr_to_string_reads_until_nul() {
+        let w = wide("hi");
+        let s = unsafe { wide_ptr_to_string(w.as_ptr()) };
+        assert_eq!(s, "hi");
+    }
+
+    #[test]
+    fn well_known_administrators_sid_formats_as_expected_string() {
+        let sid = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)
+            .expect("BUILTIN\\Administrators must always resolve");
+        let s = sid_to_string(sid.as_ptr() as *const c_void).expect("format sid");
+        assert_eq!(s, "S-1-5-32-544");
+    }
+
+    #[test]
+    fn resolve_group_sid_unknown_name_returns_none() {
+        assert!(resolve_group_sid("mw-test-nonexistent-group-3f9a1c").is_none());
+    }
+
+    #[test]
+    fn build_sddl_includes_group_ace_when_resolvable() {
+        let admins = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID).unwrap();
+        let sddl = build_sddl(&Some(admins));
+        assert_eq!(sddl, "D:(A;;GA;;;S-1-5-32-544)(A;;GA;;;BA)(A;;GA;;;SY)");
+    }
+
+    #[test]
+    fn build_sddl_omits_group_ace_when_unresolvable() {
+        assert_eq!(build_sddl(&None), "D:(A;;GA;;;BA)(A;;GA;;;SY)");
+    }
+
+    /// FAIL-CLOSED: an invalid pipe handle can never impersonate, so
+    /// `resolve_peer` must deny rather than fall through to an allow. No real
+    /// pipe or elevation needed. This exercises the real syscall path (not
+    /// just the pure decision peercred.rs already covers).
+    #[test]
+    fn resolve_peer_denies_on_invalid_handle() {
+        let (decision, peer) = resolve_peer(std::ptr::null_mut(), &None);
+        match decision {
+            AuthDecision::Deny(reason) => assert!(reason.contains("impersonate"), "{reason}"),
+            AuthDecision::Allow => panic!("an invalid pipe handle must never be allowed"),
+        }
+        assert!(peer.uid.is_none() && peer.gid.is_none());
+    }
+
+    /// Real allow-path end to end: a genuine named pipe client/server pair in
+    /// this process, impersonated exactly as `serve_loop` does, with
+    /// `admins_sid = None` (the "middlewhere-admins" group doesn't exist on a
+    /// dev/CI box), so the allow can only come from the BUILTIN\Administrators
+    /// fallback, the same path `serve_loop` takes when that group is
+    /// unresolvable. Skips (rather than fails) when the current process isn't
+    /// elevated, so it never flakes a non-elevated box; on the elevated boxes
+    /// this repo actually runs on (dev box + CI), it proves the whole
+    /// impersonate -> token -> membership -> revert path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_peer_allows_over_a_real_pipe_when_current_process_is_admin() {
+        let pipe_name = format!(r"\\.\pipe\mwsqld-test-{}", std::process::id());
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create test pipe");
+        let mut client = ClientOptions::new()
+            .open(&pipe_name)
+            .expect("open test pipe client");
+        server.connect().await.expect("server accept");
+
+        // handle_conn's ordering: the server must READ from the pipe before
+        // impersonating, or ImpersonateNamedPipeClient fails with
+        // ERROR_CANNOT_IMPERSONATE.
+        client.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).await.unwrap();
+
+        let handle = server.as_raw_handle();
+        let (decision, peer) = tokio::task::block_in_place(|| resolve_peer(handle, &None));
+
+        match decision {
+            AuthDecision::Allow => assert!(!peer.user.is_empty()),
+            AuthDecision::Deny(reason) => {
+                eprintln!("skip: current process is not an admin ({reason})");
+            }
+        }
+    }
+}

@@ -5,21 +5,55 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
-## [0.4.0] - 2026-07-11
+## [0.4.0] - 2026-07-18
 
 ### Changed
 
-- **Config commands no longer elevate — the running daemon applies them.**
-  `env`/`cred`/`bastion`/`policy`/`grant`/`import` and the wizard now send the
-  change to the running `mwsqld` over a local control channel; the daemon (which
-  already owns the master key and the sealed config) validates, re-seals, and
-  applies it **live** to just the affected env — no `sudo`/UAC, no service
-  restart, no root-owned config files. This replaces the 0.3.0 auto-elevation of
-  config commands, which a security review found could target the wrong
-  deployment (data loss), rotate a token the running service never saw (a
-  revocation no-op), or leave `config.sealed` root-owned so the service user
-  could not read it (crash loop). `init`/`uninstall` still elevate — they
-  install/remove the OS service.
+- **Config commands no longer elevate - the running daemon applies them.**
+  `env`/`cred`/`bastion`/`policy`/`grant`/`import` and the standalone
+  `mwsqlctl wizard` now send the change to the running `mwsqld` over a local
+  control channel; the daemon (which already owns the master key and the sealed
+  config) validates, re-seals, and applies it **live** to just the affected
+  env - no `sudo`/UAC, no service restart, no root-owned config files. (The
+  wizard offered inside `init`'s "Configure connections now?" prompt still runs
+  in the elevated direct path and restarts the service at the end.) This
+  replaces the 0.3.0 auto-elevation of config commands, which a security review
+  found could target the wrong deployment (data loss), rotate a token the
+  running service never saw (a revocation no-op), or leave `config.sealed`
+  root-owned so the service user could not read it (crash loop).
+  `init`/`uninstall` still elevate - they install/remove the OS service.
+- **`mwsql <env> -e "SQL"` now works as documented.** A bare env name defaults
+  to the `run` subcommand; `mwsql run <env>` still works.
+- **Re-pinning a bastion fingerprint now takes effect without a restart.**
+  `bastion set-fingerprint` forgets the daemon's cached SSH session and rebuilds
+  every env using that bastion, so the next tunnel re-checks the host key
+  against the new pin. Previously the old (possibly TOFU-accepted) session kept
+  serving until a daemon restart. Graceful while the reconnect succeeds:
+  in-flight sessions finish on the old tunnel, new connections get the
+  re-checked one. If an env cannot reconnect under the new pin it is **stopped**
+  rather than left serving through the tunnel that was just declared untrusted,
+  and the CLI says which envs went offline and why. `bastion rm` also forgets
+  the cached session, so a later bastion reusing the name cannot inherit the
+  removed one's tunnel.
+- **Successful admin reads are audited too.** `list`/`audit`/`env test` over
+  the control channel now leave an audit line with the peer's OS identity, not
+  just mutations and denials.
+
+### Fixed
+
+- `mwsqlctl bastion add --key-file` warns that SSH key auth is stored but not
+  functional yet, instead of failing silently at first connect.
+- `bastion add` now refuses a second `--fingerprint` instead of silently
+  keeping the first and discarding the rest. One pin per bastion is what the
+  config and control channel actually carry; the silent drop only surfaced
+  later as an unexplained connection refusal.
+- `mwsqlctl audit` no longer writes its own audit entry on success. Reading the
+  log used to push the mutations and denials being investigated out of the tail
+  window it had just been asked to show.
+- Loading `master.key` warns when the file is group/world accessible (a widened
+  backup/restore copy should not be trusted silently).
+- Removed the unused `min_idle` pool setting; it was never read by either
+  engine's pool builder. Existing sealed configs load unchanged.
 
 ### Added
 
@@ -44,10 +78,12 @@ versions are fixes only.
 
 ### Notes
 
-- v1 scope: loopback + local-peer only (no remote control); a single
-  `middlewhere-admins` group (no read-only vs read-write admin roles); a
-  credential rotation drops the old backend pool immediately (in-flight sessions
-  on it reconnect). These are deliberate deferrals.
+- v1 scope (deliberate deferrals): loopback + local-peer only (no remote
+  control), and a single `middlewhere-admins` group (no read-only vs read-write
+  admin roles).
+- A credential/bastion rotation is graceful: in-flight sessions keep serving on
+  their existing backend pool and SSH tunnels until they end, and only new
+  connections pick up the rotated secret - no mid-session break.
 
 ## [0.3.0] - 2026-07-09
 

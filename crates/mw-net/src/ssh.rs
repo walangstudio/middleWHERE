@@ -183,6 +183,24 @@ impl BastionRegistry {
         drop(s);
         Ok(slot)
     }
+
+    /// Forget the cached session for `name` so the next [`Self::get_or_open`]
+    /// opens a fresh one, re-authenticating and re-checking the host-key pin.
+    /// Called on bastion removal and fingerprint re-pin: without it a
+    /// name-keyed slot would keep serving the OLD tunnel (old host, old key)
+    /// forever. Returns whether an entry was cached.
+    ///
+    /// Only the registry's reference is dropped, never the session itself. A
+    /// live forward holds a read guard on its slot for the whole lifetime of
+    /// each tunneled connection, so taking the write lock here would block the
+    /// caller (which holds the config-write lock) until every in-flight query
+    /// through that bastion finished. Instead the session closes on its own
+    /// once the last forward still holding it goes away, which matches how a
+    /// credential rotation already behaves: in-flight sessions finish on the
+    /// old tunnel, new connections get the re-checked one.
+    pub async fn evict(&self, name: &str) -> bool {
+        self.inner.write().await.remove(name).is_some()
+    }
 }
 
 /// One local-port forwarder. `local_port` is the address the backend pool
@@ -247,4 +265,55 @@ pub async fn start_local_forward(
         }
     });
     Ok(LocalForward { local_port, task })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mw_core::secret::SecretStr;
+
+    fn unreachable_bastion() -> Bastion {
+        Bastion {
+            host: "127.0.0.1".into(),
+            // Port 1: nothing listens there; connect fails fast.
+            port: 1,
+            ssh_user: "u".into(),
+            auth: BastionAuth::Password {
+                password: SecretStr::new("p"),
+            },
+            pinned_host_keys: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_removes_slot_so_next_open_reconnects() {
+        let reg = BastionRegistry::new();
+        assert!(!reg.evict("nope").await, "unknown name is a no-op");
+
+        assert!(reg
+            .get_or_open("b", &unreachable_bastion(), false)
+            .await
+            .is_err());
+        assert!(reg.inner.read().await.contains_key("b"));
+        assert!(reg.evict("b").await);
+        assert!(!reg.inner.read().await.contains_key("b"));
+    }
+
+    /// A forward holds a read guard on its slot for the whole life of a
+    /// tunneled connection. Evicting must not wait on it: the caller holds the
+    /// config-write lock, so one long-running query would otherwise wedge every
+    /// admin command until it finished.
+    #[tokio::test]
+    async fn evict_does_not_wait_on_a_live_forwards_read_guard() {
+        let reg = BastionRegistry::new();
+        let slot = Arc::new(RwLock::new(None));
+        reg.inner.write().await.insert("b".into(), slot.clone());
+
+        let held = slot.read().await;
+        let evicted = tokio::time::timeout(std::time::Duration::from_secs(5), reg.evict("b"))
+            .await
+            .expect("evict blocked on a live forward's read guard");
+        drop(held);
+        assert!(evicted);
+    }
 }

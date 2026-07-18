@@ -179,7 +179,7 @@ struct BastionAddArgs {
     #[arg(long, group = "auth")]
     key_file: Option<PathBuf>,
     /// Pinned host-key fingerprint in the form `<algo>:<sha256_b64>` (e.g.
-    /// `ssh-ed25519:AAAA...`). May be repeated to pin multiple keys.
+    /// `ssh-ed25519:AAAA...`). One pin per bastion.
     #[arg(long = "fingerprint")]
     fingerprints: Vec<String>,
 }

@@ -3,75 +3,63 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-188%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-296%20passing-brightgreen)
 
-middleWHERE sits between whoever is running queries and your real database. The
-caller connects to a local port, logs in with a name and a token, and runs SQL.
-They never get the database host, the username, the password, or anything about
-how the connection is actually made.
+middleWHERE sits between whoever runs queries and your real database. The
+caller connects to a local port with a name and a token, and runs SQL. They
+never see the database host, the username, the password, or how the connection
+is made.
 
-## Why this exists
+## Why
 
-We kept handing database access to tools and to LLM agents, and every time it
-meant handing over real credentials and connection details in some config file
-or environment variable. That is exactly what you do not want sitting next to a
-model that summarizes its context, or a tool that logs its arguments.
+Handing database access to tools and AI agents usually means handing them real
+credentials in a config file or an environment variable. Anything that logs its
+arguments or summarizes its context can leak them.
 
-middleWHERE fixes that with two ideas:
+middleWHERE fixes this in two ways:
 
-The caller is told nothing about the backend. It gets an environment name like
-`staging1` and a token. The real host, port, database user, and password stay
-inside the daemon and are never sent to the client. Someone reading the client
-side, a model, or a leaked log cannot learn where the data lives or how to
-reach it directly.
+- **The caller learns nothing about the backend.** It gets an environment name
+  like `staging1` and a token. The real host, user, and password stay inside
+  the daemon and are never sent to the client.
+- **Read-only is enforced here, not at the database.** Every statement is
+  parsed. Writes, DDL, multi-statement payloads, and dangerous functions are
+  rejected before they reach the backend, no matter what the backend account
+  is allowed to do.
 
-Read-only is enforced here, not at the database. Even if the database account
-behind an environment can write, middleWHERE parses every statement and rejects
-writes, DDL, multi-statement payloads, and dangerous functions before they ever
-reach the backend. A confused script or a prompt-injected agent cannot modify
-or destroy data through it, regardless of what the underlying account is
-allowed to do.
+A confused script or a prompt-injected agent cannot change your data or learn
+where it lives.
 
-## What it supports
+## What works with it
 
-- PostgreSQL 12 to 17 (including Supabase).
-- MySQL 5.6 to 9.x and MariaDB 10/11.
+- PostgreSQL 12 to 17 (including Supabase)
+- MySQL 5.6 to 9.x, MariaDB 10 and 11
 
-Connect with whatever you already use. These are verified working:
+Connect with what you already use. Verified: `psql`, pgAdmin, `mysql`, MySQL
+Workbench, DBeaver, JDBC (pgjdbc, mysql-connector-j).
 
-- `psql` and the PostgreSQL libpq family.
-- pgAdmin.
-- `mysql` command-line client.
-- MySQL Workbench.
-- DBeaver, against both engines.
-- JDBC applications (pgjdbc, mysql-connector-j).
+Log in with the environment name as the username and the token as the
+password. The local port is loopback-only and has no TLS, so turn SSL off in
+the client.
 
-There is no TLS on the local port because it only listens on loopback, so turn
-SSL off in the client. You log in with the environment name as the username and
-the issued token as the password.
+## The three binaries
 
-## How it is put together
+No extra runtime, no DLLs.
 
-Three binaries, no extra runtime, no DLLs:
-
-- `mwsqld` is the daemon. It holds the sealed config, opens one local port per
-  environment, checks every query, and writes the audit log. It also runs as a
-  Windows service.
-- `mwsqlctl` is the admin tool. You use it to set up credentials, bastions, and
-  environments, to rotate tokens, to read the audit tail, and to generate the
-  service files. It works offline against the sealed config.
-- `mwsql` is an optional client wrapper for MySQL that keeps a token in your OS
-  keyring so you do not paste it every time. Any native client works too.
+- `mwsqld` is the daemon. It holds the sealed config and the master key, opens
+  one local port per environment, checks every query, and writes the audit
+  log. It runs as a system service, including on Windows.
+- `mwsqlctl` is the admin tool: bastions, credentials, environments, tokens,
+  audit tail, service files. Against a running service it applies each change
+  live over a local admin channel, no elevation needed. `--user` and
+  `--offline` edit the sealed config file directly instead.
+- `mwsql` is an optional client wrapper for MySQL. It keeps your token in the
+  OS keyring so you do not paste it every time. Any native client works too.
 
 ## Install
 
 Download the archive for your platform from the
-[Releases](https://github.com/walangstudio/middleWHERE/releases) page, verify its
-SHA-256 against the published `SHA256SUMS`, and extract the three binaries
-(`mwsqld`, `mwsqlctl`, `mwsql`) wherever you like. Extracting them yourself keeps
-the binary at a path you chose and can see under `sudo` — `mwsqlctl init` then
-installs the service from there (it re-execs its own absolute path under `sudo`,
-so the extract location does not matter).
+[Releases](https://github.com/walangstudio/middleWHERE/releases) page, check
+the SHA-256, and extract the three binaries anywhere you like.
 
 Linux / macOS:
 
@@ -95,279 +83,249 @@ if ((Get-FileHash $asset -Algorithm SHA256).Hash -ne $expected) { throw "Checksu
 Expand-Archive $asset -DestinationPath C:\middlewhere -Force
 ```
 
-The archive holds **only the binaries** — nothing is registered or started yet.
-Run `mwsqlctl init` to install the managed service (see
-[Getting started](#getting-started)), or `mwsqld run` to run it by hand.
-
+The archive holds only the binaries. Nothing is registered or started yet.
+`mwsqlctl init` installs the managed service; `mwsqld run` runs it by hand.
 Or build from source (see [Build and test](#build-and-test)). Windows release
-binaries are unsigned; SmartScreen may warn until reputation accrues.
+binaries are unsigned, so SmartScreen may warn at first.
 
 ## Getting started
 
-### The guided way (recommended)
-
-Two steps: install the service, then configure connections.
+### The guided way
 
 ```sh
 ./mwsqlctl init
 ```
 
-`init` installs middleWHERE as a service. It self-elevates with `sudo`
-(confirming first), creates the `mwsqld` system account, seeds the sealed config,
-writes a hardened `User=mwsqld` systemd unit, and runs `systemctl enable --now`.
-The daemon comes up idle (no environments yet, so it binds nothing). `init` then
-asks **Configure connections now?** — answer yes and it walks you straight into
-the wizard while still elevated.
+`init` installs middleWHERE as a service. It self-elevates (asking first),
+creates the `mwsqld` system account, seeds the sealed config, writes a
+hardened service unit, starts it, and adds you to the `middlewhere-admins`
+group so you can configure it later without `sudo` (log in again for the
+membership to take effect).
 
-The wizard adds bastions, credentials, and environments — passwords are prompted
-and masked, never on the command line — then restarts the service so the new
-loopback listeners bind. After you add an environment it **validates the
-connection** (opens the bastion tunnel, then connects and authenticates to the
-real database); if it can't reach the backend it tells you why and offers to keep
-it, edit and retry, or discard. Run it again any time to add or change
-connections:
+`init` then asks **Configure connections now?** Answer yes and it walks you
+through bastions, credentials, and environments right there, still elevated,
+and restarts the service at the end to apply them. Passwords are prompted and
+masked, never typed on the command line.
+
+To add or change connections later, run the wizard on its own. This form
+talks to the running daemon and applies each change live, no restart:
 
 ```sh
 mwsqlctl wizard
 ```
 
-Re-check a connection at any time:
+After you add an environment the wizard validates it: it opens the bastion
+tunnel and logs in to the real database. If that fails it tells you why and
+offers to keep, edit, or discard the entry. Re-check any time:
 
 ```sh
 mwsqlctl env test <env>      # or --all
 ```
 
-For a per-user deployment with no service and no elevation (handy for local
-dev), use `--user` — you configure and run it yourself:
+### Per-user, no service
+
+Handy for local development. No elevation, OS keychain instead of a key file:
 
 ```sh
-mwsqlctl --user init       # seed a per-user config (OS keychain, no service)
+mwsqlctl --user init       # seed a per-user config
 mwsqlctl --user wizard     # add bastions / credentials / environments
-mwsqld   --user run        # then run it
+mwsqld   --user run        # run the daemon yourself
 ```
 
-To tear it all down, `uninstall` is the inverse of `init` — it stops and removes
-the service and wipes the sealed config, master key, and audit log (self-elevates
-the same way). It is destructive, so it confirms first; pass `--yes` to skip the
-prompt in a script. Re-run `init` afterwards for a clean slate.
+### Uninstall
+
+`uninstall` is the inverse of `init`: it stops and removes the service and
+wipes the sealed config, master key, and audit log. It confirms first;
+`--yes` skips the prompt in scripts.
 
 ```sh
-mwsqlctl uninstall            # service deployment (self-elevates, asks to confirm)
-mwsqlctl --user uninstall     # per-user deployment (no elevation)
+mwsqlctl uninstall            # service deployment (self-elevates)
+mwsqlctl --user uninstall     # per-user deployment
 ```
-
-The rest of this section covers the manual commands the wizard runs, for when you
-want to script them or understand the moving parts.
 
 ### The manual way
 
-`init` is the one privileged step; the `bastion add` / `cred add` / `env add`
-commands below are exactly what the wizard runs to configure, so you can script
-them instead. Both the daemon and the admin tool point at one state directory.
-Service deployments use `--file-keystore`, which keeps the master key in a locked
-file in the state directory (a daemon account has no login session to reach an OS
-keychain); a `--user` install gets the OS keychain instead.
+The wizard just runs the commands below. Script them directly if you prefer.
 
-The flagless default targets the **system service** dir — `/var/lib/middlewhere`
-(Linux), `/Library/Application Support/middlewhere` (macOS),
-`C:\ProgramData\middlewhere` (Windows) — with the file keystore, because the
-common deployment is a managed service. `init` seeds that dir (locked to `0700`,
-owner-only — no `mkdir`/`chmod` first), installs the systemd unit, and starts it:
+`init` is the one privileged step. It seeds the state dir
+(`/var/lib/middlewhere` on Linux, `/Library/Application Support/middlewhere`
+on macOS, `C:\ProgramData\middlewhere` on Windows), locked to the service
+account, with the master key in a locked file (`--file-keystore` is the
+service default; a daemon account has no login session to reach an OS
+keychain).
 
 ```sh
 ./mwsqlctl init           # self-elevates; installs + starts the mwsqld service
 ```
 
-Because the state dir is then root-owned, the configure commands below run under
-`sudo` too, and a change needs a restart to take effect:
+Once the service is up, run the configure commands below flagless: no `sudo`,
+no `--state-dir`. They go to the running daemon over its admin channel, which
+validates, re-seals, and applies each change live. You must be in the
+`middlewhere-admins` group (or root).
+
+Passing an explicit `--state-dir` means "edit this config file directly",
+which would silently diverge from what the daemon is serving, so mutations
+with `--state-dir` are refused while the service runs. The recovery path when
+the service is stopped is `--offline` from an elevated shell:
 
 ```sh
-sudo systemctl restart mwsqld
+sudo mwsqlctl --offline --state-dir /var/lib/middlewhere --file-keystore env add ...
 ```
 
-Pass `--user` for the per-user dir (`~/.local/state/middlewhere` on Linux,
-honoring `$XDG_STATE_HOME`; `~/Library/Application Support/middlewhere` on macOS;
-`%LOCALAPPDATA%\middlewhere` on Windows) and the OS keychain — no elevation, no
-service:
+`--user` targets the per-user dir (`~/.local/state/middlewhere` on Linux,
+honoring `$XDG_STATE_HOME`; `~/Library/Application Support/middlewhere` on
+macOS; `%LOCALAPPDATA%\middlewhere` on Windows) and the OS keychain.
 
-```sh
-mwsqlctl --user init
-```
-
-That generates a master key, seals an empty config, and creates the directory
-layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
-overwrite an existing `config.sealed`, so re-running `--user init` is safe; in
-service mode a re-run reuses the existing config and just reinstalls the unit.
-
-To skip repeating the flags on every command, export them once:
+To avoid repeating flags, export them once:
 
 ```sh
 export MW_STATE_DIR=/var/lib/middlewhere MW_FILE_KEYSTORE=1
 ```
 
-Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
-— so either rely on the same default on both, set the same `MW_STATE_DIR`, or
-pass the same `--state-dir` to both.
+If you run `mwsqld` by hand, it and `mwsqlctl` must resolve the same state
+dir: same default, same `MW_STATE_DIR`, or same `--state-dir` on both.
+Flagless service config needs none of this; it dials the daemon's socket.
 
 ### A worked example
 
-This builds a real layout: two SSH jump hosts (one for staging, one for prod),
-two staging databases that share a single login behind the staging jump host, a
-production database that uses the same database username but a different
-password behind its own jump host, and a local database running in Docker on
-the daemon host. Values in `<angle brackets>` are yours to fill in; everything
-else is literal. `<state-dir>` is wherever you ran `init`.
+Two SSH jump hosts (staging and prod), two staging databases sharing one
+login, a production database behind its own jump host, and a local database
+in Docker. Values in `<angle brackets>` are yours; everything else is
+literal. Commands are shown flagless (live, against the running service);
+add `--user` for a per-user deployment.
 
-**Bastions.** Add the two jump hosts. Pinning the host key (`--fingerprint`)
-makes a swapped jump host fail closed; repeat the flag to pin more than one key.
-
-Run it without a password flag and `mwsqlctl` prompts for the password with echo
-off — nothing secret reaches your shell history or the process table:
+**Bastions.** Add the jump hosts. Pinning the host key (`--fingerprint`)
+makes a swapped jump host fail closed. One pin per bastion. Run without a
+password flag and you are prompted with echo off, so nothing secret reaches
+shell history or the process table:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  bastion add <staging-bastion> --host <jump.staging.example> --ssh-user <tunnel-user> \
+mwsqlctl bastion add <staging-bastion> --host <jump.staging.example> --ssh-user <tunnel-user> \
   --fingerprint ssh-ed25519:<sha256-b64>
-# bastion password: ‹typed, hidden›
+# bastion password: (typed, hidden)
 
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  bastion add <prod-bastion> --host <jump.prod.example> --ssh-user <prod-tunnel-user> \
+mwsqlctl bastion add <prod-bastion> --host <jump.prod.example> --ssh-user <prod-tunnel-user> \
   --fingerprint ssh-ed25519:<sha256-b64>
 ```
 
-For unattended/CI use only, pass `--password-stdin` and feed the secret in on
-stdin from a file or fd — never an inline literal, which would land in shell
-history. See [Scripting credential setup](#scripting-credential-setup).
+For CI, `--password-stdin` reads the secret from stdin instead; see
+[Scripting credential setup](#scripting-credential-setup).
 
-SSH **key auth** is accepted by the CLI (`--key-file <private-key.pem>`, which
-replaces the password entirely) but is **not yet active at runtime** — the daemon
-currently returns `ssh key auth not yet wired` (Phase 7b). Use password
-bastions for now.
+SSH key auth (`--key-file`) is accepted and stored but not functional yet;
+the CLI warns when you use it. Use password bastions for now.
 
 **Credentials.** A credential is a backend database user plus its password.
-Same rule as bastions: omit the flag and the password is prompted, hidden. Add
-the one login the two staging environments will share:
+The two staging environments will share this one:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --db-user <db-user>
-# backend password: ‹typed, hidden›
+mwsqlctl cred add <staging-cred> --db-user <db-user>
+# backend password: (typed, hidden)
 ```
 
-Production uses the **same username but a different password** — that is just a
-second credential entry with the same `--user` value:
+Production uses the same username with a different password. That is simply a
+second credential:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <prod-cred> --db-user <db-user>
+mwsqlctl cred add <prod-cred> --db-user <db-user>
 ```
 
 And the local Docker database's login:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <local-cred> --db-user <db-user>
+mwsqlctl cred add <local-cred> --db-user <db-user>
 ```
 
-**Environments.** The two staging envs name the *same* credential and the
-*same* bastion, so they share that one login and jump host; each still gets its
-own loopback port and its own client token. Rotating `<staging-cred>` updates
-both at once. (Sharing is by naming the same credential/bastion — using the
-same database username across two different credentials does *not* share them.)
+**Environments.** The two staging envs name the same credential and bastion,
+so they share that login and jump host. Each still gets its own port and its
+own client token, and rotating `<staging-cred>` updates both. Sharing is by
+name; two credentials that happen to hold the same database user are not
+shared.
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore env add <staging-1> \
+mwsqlctl env add <staging-1> \
   --engine <mysql|postgres> --backend-host <db1.staging.internal> --database <app> \
   --credential <staging-cred> --bastion <staging-bastion> --listen-port <6433>
 
-mwsqlctl --state-dir <state-dir> --file-keystore env add <staging-2> \
+mwsqlctl env add <staging-2> \
   --engine <mysql|postgres> --backend-host <db2.staging.internal> --database <app> \
   --credential <staging-cred> --bastion <staging-bastion> --listen-port <6434>
 ```
 
-Production names its own credential and its own bastion, so it stays fully
-separate from staging:
+Production names its own credential and bastion, so it stays fully separate:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore env add <prod> \
+mwsqlctl env add <prod> \
   --engine <mysql|postgres> --backend-host <db.prod.internal> --database <app> \
   --credential <prod-cred> --bastion <prod-bastion> --listen-port <6543>
 ```
 
-The local Docker database needs no jump host: omit `--bastion` and point at
-loopback, and the daemon connects to it directly.
+The local Docker database needs no jump host. Omit `--bastion` and point at
+loopback:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore env add <local> \
+mwsqlctl env add <local> \
   --engine <mysql|postgres> --backend-host 127.0.0.1 --backend-port <3306> \
   --database <app> --credential <local-cred> --listen-port <6033>
 ```
 
-`env add` validates the connection after writing it and exits non-zero if it
-can't reach the backend (the env is still saved, so a transient outage doesn't
-lose your input — fix it and run `mwsqlctl env test <env>`). Pass `--no-validate`
-to skip the probe, e.g. when provisioning an env before its database exists.
+`env add` validates the connection and exits non-zero if the backend is
+unreachable. The env is still saved, so fix the problem and re-check with
+`mwsqlctl env test <env>`. Pass `--no-validate` to skip the probe.
 
-Every env defaults to `read-only`. Pass `--policy read-write` at creation, or
-flip it later:
+Every env starts read-only. Allow writes at creation with
+`--policy read-write`, or flip it later:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore policy <env> --read-write --i-know-what-im-doing
+mwsqlctl policy <env> --read-write --i-know-what-im-doing
 ```
 
 ### Scripting credential setup
 
-The interactive prompt is the right default for a human. When you must automate
-`bastion add` / `cred add` (CI, provisioning), pass `--password-stdin` and feed
-the secret in **without** writing it on the command line — an inline
-`printf '...secret...' | ...` puts the literal in your shell history.
-
-Redirect from a file you create out-of-band and then destroy:
+Interactive prompts are right for humans. For CI, pass `--password-stdin` and
+feed the secret from a file you create out-of-band and destroy after. Never
+inline the secret on the command line; it lands in shell history.
 
 ```sh
-# Linux / macOS — tmpfs keeps it off disk; shred removes the trace.
+# Linux / macOS. tmpfs keeps it off disk; shred removes the trace.
 umask 077
-printf '%s' "$SECRET_FROM_VAULT" > /dev/shm/pw   # $SECRET injected by your CI secret store
-mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --db-user <db-user> --password-stdin < /dev/shm/pw
+printf '%s' "$SECRET_FROM_VAULT" > /dev/shm/pw   # injected by your CI secret store
+mwsqlctl cred add <staging-cred> --db-user <db-user> --password-stdin < /dev/shm/pw
 shred -u /dev/shm/pw
 ```
 
 ```powershell
 # Windows (PowerShell 7+). On Windows PowerShell 5.1 wrap in: cmd /c "mwsqlctl ... < pw.txt"
 $env:SECRET_FROM_VAULT | Out-File -NoNewline -Encoding ascii pw.txt
-mwsqlctl --state-dir <state-dir> --file-keystore `
+mwsqlctl `
   cred add <staging-cred> --db-user <db-user> --password-stdin < pw.txt
 Remove-Item pw.txt
 ```
 
-`--password-stdin` keeps the secret out of the process table (`ps`,
-`/proc/<pid>/cmdline`); reading from a file/fd instead of an inline literal
-keeps it out of shell history. Do both.
+`--password-stdin` keeps the secret out of the process table; the file keeps
+it out of shell history. Do both.
 
 ### Handing out access
 
-Each env has a token — the only thing the caller ever holds. Mint one for
-whoever needs that env; rotating it kills the old one:
+Each env has one token, and the token is all a caller ever holds. Mint it for
+whoever needs the env; rotating it kills the old one:
 
 ```sh
-mwsqlctl --state-dir <state-dir> --file-keystore grant <staging-1>
+mwsqlctl grant <staging-1>
 ```
 
-That prints the token once, plus the DBeaver-style field list and a paste-ready
-connection URL (see [Running queries](#running-queries)).
+This prints the token once, plus the exact fields for a GUI client and a
+paste-ready connection URL.
 
 ### Running queries
 
-Start the daemon (foreground, or as the service above):
+Start the daemon (foreground, or as the service):
 
 ```sh
 mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-Connect with any client. When you `env add` or `grant`, middleWHERE prints the
-exact fields to paste into a GUI client and a ready-to-use connection URL, so you
-never have to translate anything:
+Connect with any client. `env add` and `grant` print the fields, so nothing
+needs translating:
 
 ```
   DBeaver / any SQL client — enter these fields:
@@ -382,55 +340,49 @@ never have to translate anything:
     postgresql://staging-1:<token>@127.0.0.1:6433/app?sslmode=disable
 ```
 
-The local port has no TLS (it only listens on loopback), so turn SSL **off** in
-the client and log in with the environment name as the username and the token as
-the password. With `psql` against a Postgres env:
+With `psql`:
 
 ```sh
 PGPASSWORD=<token> psql -h 127.0.0.1 -p <6433> -U <staging-1> -d <app> -c 'SELECT 1'
 ```
 
-Or the MySQL wrapper, which remembers the token for you:
+Or the MySQL wrapper, which remembers the token:
 
 ```sh
 mwsql login <staging-1> --port <6433>
 mwsql <staging-1> -e "SELECT count(*) FROM <table>"
 ```
 
-Under the default read-only policy a write comes back as a denied query, not a
-modified row, and the denial is recorded in the audit log.
+Under read-only policy a write comes back denied, not executed, and the
+denial lands in the audit log.
 
 ## State directory
 
-`mwsqlctl init` creates it. Only the audit log is readable plaintext, and it
+Created by `mwsqlctl init`. Only the audit log is readable plaintext, and it
 holds no secrets.
 
 | File | Contents |
 | --- | --- |
 | `config.sealed` | All credentials, bastion keys, and environment definitions, sealed with ChaCha20-Poly1305. |
 | `config.sealed.bak` | The previous sealed copy, kept for atomic writes. |
-| `master.key` | Present with the file keystore (the default, and what service mode always uses), locked to the owner. With `--user` the key lives in the OS keychain and there is no file. |
+| `master.key` | Present with the file keystore (the service default), locked to the owner. With `--user` the key lives in the OS keychain and there is no file. |
 | `audit/audit.jsonl.YYYY-MM-DD` | One JSON line per query: decision, statement hash, row count, duration. No statement text, no secrets. |
 
 ## Running as a service
 
-The one-command path is `mwsqlctl init` (see
-[Getting started](#getting-started)): on Linux it self-elevates, creates a fixed
-`mwsqld` system user, seeds the config, writes a hardened `User=mwsqld` systemd
-unit, and runs `systemctl enable --now` for you, then offers to run the wizard to
-configure connections. `mwsqlctl wizard` configures an already-installed
-deployment and restarts the service to apply the changes.
-
-To run by hand in the foreground instead:
+`mwsqlctl init` is the one-command path; see
+[Getting started](#getting-started). To run in the foreground instead:
 
 ```sh
 sudo mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-To generate the unit without the wizard, `mwsqlctl install-service` *generates*
-the platform file (a systemd unit with `DynamicUser=yes`, a launchd plist, or a
-Windows PowerShell script) — it never escalates, enables it, or creates accounts
-itself. You apply it. On Linux:
+For full control, `mwsqlctl install-service` generates the platform file (a
+systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows PowerShell
+script) and you apply it yourself. It never escalates or enables anything on
+its own.
+
+Linux:
 
 ```sh
 # 1. Generate the unit (prints to stdout; --write needs an already-elevated shell):
@@ -445,9 +397,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now mwsqld
 sudo systemctl status mwsqld
 ```
-
-macOS and Windows follow the same two-step shape — `install-service` emits the
-platform artifact for the OS you run it on, you apply it.
 
 macOS (launchd):
 
@@ -466,7 +415,7 @@ sudo install -m0644 com.middlewhere.mwsqld.plist \
 sudo launchctl load -w /Library/LaunchDaemons/com.middlewhere.mwsqld.plist
 ```
 
-Windows (SCM) — run in an elevated (Administrator) PowerShell:
+Windows, in an elevated PowerShell:
 
 ```powershell
 # 1. Generate the install script (on the target host):
@@ -477,26 +426,43 @@ mwsqlctl install-service `
   --write install-mwsqld.ps1
 
 # 2. Run it elevated. It registers the service under the NT SERVICE\mwsqld
-#    virtual account, locks the state dir to that account + Administrators
-#    (your client user is denied by omission), and sets auto-start + restart-on-fail:
+#    virtual account, locks the state dir to that account + Administrators,
+#    and sets auto-start + restart-on-fail:
 .\install-mwsqld.ps1
 sc.exe start mwsqld
 ```
 
-On Windows the sealed config must be initialized **as the service account** (or
-pre-seeded) before first start, since the daemon account has no login session —
-the generated script prints the exact `mwsqlctl ... init` line to run.
+On Windows the sealed config must be initialized as the service account (or
+pre-seeded) before first start; the generated script prints the exact
+`mwsqlctl ... init` line to run.
 
-The daemon then runs as an account your client user cannot read, so the master
-key and sealed config stay out of reach. The reference files and the reasoning
-are in `installers/`.
+The daemon then runs as an account your client user cannot read, so the
+master key and sealed config stay out of reach. The reference files and the
+reasoning live in `installers/`.
 
-Service mode must use `--file-keystore`: the dedicated daemon account has no
-login session, so the OS keyring is unreachable; the master key lives in a
+### Admin control channel
+
+`mwsqlctl` applies config changes through a local admin channel the daemon
+exposes: a Unix socket (`/run/middlewhere/mwsqld.sock`, `/var/run/…` on
+macOS) or a Windows named pipe (`\\.\pipe\middlewhere-mwsqld-control`). The
+daemon owns the master key, so it re-seals and applies each change itself.
+The CLI never elevates, and no config file is left root-owned.
+
+Callers are authorized by kernel peer credentials: `SO_PEERCRED` on Linux,
+`getpeereid` on macOS, `ImpersonateNamedPipeClient` plus
+`CheckTokenMembership` on Windows. Access is limited to root/Administrators,
+the service account, and the `middlewhere-admins` group; everyone else is
+denied at the door. Every mutation, denial, and read is written to the audit
+log with the peer's OS identity. The channel is local-only; there is no
+remote administration. When the daemon is stopped, `mwsqlctl --offline` edits
+the sealed config directly from an elevated shell.
+
+Service mode must use `--file-keystore`: the daemon account has no login
+session, so the OS keyring is unreachable. The master key lives in a
 `0700`/ACL-locked state dir instead.
 
-For a non-loopback PostgreSQL bind the daemon refuses cleartext auth unless you
-set `MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1`. Use a tunnel instead.
+For a non-loopback PostgreSQL bind the daemon refuses cleartext auth unless
+you set `MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1`. Use a tunnel instead.
 
 ## Build and test
 
@@ -516,30 +482,40 @@ cargo test --workspace
 ```
 
 Two host settings are pinned in `.cargo/config.toml`:
-`http.check-revoke = false` because Windows schannel cannot reach the
-revocation endpoints here, and `AWS_LC_SYS_PREBUILT_NASM = 1` so the crypto
-dependency builds without a NASM assembler installed.
+`http.check-revoke = false` (Windows schannel cannot reach the revocation
+endpoints here) and `AWS_LC_SYS_PREBUILT_NASM = 1` (builds the crypto
+dependency without a NASM install).
 
 ## Versioning
 
-One version in `Cargo.toml` covers all three binaries, and `--version` reports
+One version in `Cargo.toml` covers all three binaries; `--version` reports
 it. Before 1.0, minor versions may break compatibility and patch versions are
 fixes only. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Good to know
 
-- PostgreSQL prepared statements and parameters work. They are run by inlining
-  the parameters and going through the simple-query path, so there are no
-  server-side cursors (`maxRows` is ignored, the whole result comes back) and
-  no `COPY`.
-- MySQL handles normal queries; there are no server-side prepared statements,
-  but client-side prepared statements (the Connector/J default) work.
-- The local port has no TLS because it is loopback only. Turn SSL off client
+- PostgreSQL prepared statements and parameters work. Parameters are inlined
+  and run through the simple-query path, so there are no server-side cursors
+  (`maxRows` is ignored, the whole result comes back) and no `COPY`.
+- MySQL handles normal queries. No server-side prepared statements; client-side
+  prepared statements (the Connector/J default) work.
+- The local port has no TLS because it is loopback-only. Turn SSL off client
   side.
-- Read-only is the default and is enforced for every client regardless of what
-  the backend account can do.
-- A config change needs a daemon restart; the admin tool is offline.
-- SSH bastions use password auth today; key auth and auto-reconnect are not
+- Read-only is the default and is enforced for every client, whatever the
+  backend account can do.
+- Config changes from `mwsqlctl` or the standalone wizard apply live over the
+  admin channel, no restart. The wizard inside `init` applies its changes with
+  one service restart at the end. `--user`/`--offline` edit the sealed config
+  file directly.
+- Re-pinning a bastion's host key takes effect without a restart: the daemon
+  forgets the cached SSH session, so new connections reconnect under the new
+  pin. Sessions already running finish on the old tunnel. If an environment
+  cannot reconnect under the new pin it is stopped rather than left on the old
+  one, and the command tells you which went offline.
+- Idle backend connections are dropped after 5 minutes of no activity (per-env
+  `idle_timeout_secs`, default 300s; `mwsqld run --idle-timeout-secs <N>`
+  overrides every env, `0` disables). An in-flight query is never interrupted.
+- SSH bastions use password auth today. Key auth and auto-reconnect are not
   wired yet.
 
 ## License

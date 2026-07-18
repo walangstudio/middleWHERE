@@ -115,14 +115,11 @@ pub fn offline_privilege_ok(offline: bool, target_needs_root: bool, privileged: 
 // ---------------------------------------------------------------------------
 
 /// Build an [`AddBastion`](Request::AddBastion) payload from the CLI's bastion
-/// input plus the already-resolved auth secret (prompted/read locally). Parses
-/// the first pinned fingerprint, mirroring the offline `ops::add_bastion`.
+/// input plus the already-resolved auth secret (prompted/read locally). Shares
+/// `ops::single_fingerprint` with the offline path so both reject a second pin
+/// instead of one silently keeping the first.
 pub fn bastion_dto(input: &ops::BastionInput, auth: BastionAuthInput) -> Result<BastionInputDto> {
-    let fingerprint = input
-        .fingerprints
-        .first()
-        .map(|s| ops::parse_fingerprint(s))
-        .transpose()?;
+    let fingerprint = ops::single_fingerprint(&input.fingerprints)?;
     Ok(BastionInputDto {
         name: input.name.clone(),
         host: input.host.clone(),

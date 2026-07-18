@@ -277,7 +277,7 @@ fn should_use_legacy_user_dir(
 // permission-denied — the common case when the default state dir lives under
 // /var/lib and init was run unprivileged — translate the raw OS error into an
 // actionable hint instead of a bare "Permission denied".
-fn create_dir_secure(dir: &Path) -> Result<()> {
+pub(crate) fn create_dir_secure(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             anyhow!(
@@ -295,6 +295,13 @@ fn create_dir_secure(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("lock {} to 0700", dir.display()))?;
     }
+    // No Windows branch on purpose. Locking the DACL here needs the principal
+    // set for the deployment - above all the service account the daemon runs as
+    // (`NT SERVICE\<svc>`), which this crate has no way to know. Setting an
+    // owner-only ACL from here strips the installer's inherited grant and the
+    // service can never read its own master key. The Windows install script
+    // (installers/windows/install-service.ps1) owns this lock; it knows the
+    // account because it just created the service.
     Ok(())
 }
 

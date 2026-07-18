@@ -54,8 +54,19 @@ struct RunArgs {
     execute: Option<String>,
 }
 
+/// Bare `mwsql <env> ...` defaults to the `run` subcommand.
+fn default_to_run(argv: &mut Vec<std::ffi::OsString>) {
+    if let Some(first) = argv.get(1).and_then(|s| s.to_str()) {
+        if !first.starts_with('-') && !["login", "logout", "run", "help"].contains(&first) {
+            argv.insert(1, "run".into());
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    default_to_run(&mut argv);
+    let cli = Cli::parse_from(argv);
     let store = OsClientStore::new();
 
     match cli.cmd {
@@ -105,4 +116,54 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewritten(args: &[&str]) -> Vec<String> {
+        let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        default_to_run(&mut argv);
+        argv.into_iter().map(|s| s.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn bare_env_gets_run_inserted() {
+        assert_eq!(
+            rewritten(&["mwsql", "stage1", "-e", "SELECT 1"]),
+            ["mwsql", "run", "stage1", "-e", "SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn subcommands_flags_and_empty_are_untouched() {
+        for args in [
+            vec!["mwsql", "login", "stage1", "--port", "6433"],
+            vec!["mwsql", "logout", "stage1"],
+            vec!["mwsql", "run", "stage1", "-e", "SELECT 1"],
+            vec!["mwsql", "help"],
+            vec!["mwsql", "--help"],
+            vec!["mwsql"],
+        ] {
+            assert_eq!(rewritten(&args), args);
+        }
+    }
+
+    #[test]
+    fn rewritten_bare_env_parses_as_run() {
+        let mut argv: Vec<std::ffi::OsString> = ["mwsql", "stage1", "-e", "SELECT 1"]
+            .iter()
+            .map(Into::into)
+            .collect();
+        default_to_run(&mut argv);
+        let cli = Cli::try_parse_from(argv).expect("bare env must parse");
+        match cli.cmd {
+            Cmd::Run(a) => {
+                assert_eq!(a.env, "stage1");
+                assert_eq!(a.execute.as_deref(), Some("SELECT 1"));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
 }
