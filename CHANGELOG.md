@@ -60,7 +60,7 @@ versions are fixes only.
   keeping the first and discarding the rest. One pin per bastion is what the
   config and control channel actually carry; the silent drop only surfaced
   later as an unexplained connection refusal.
-- `mwsqlctl audit` no longer writes its own audit entry on success. Reading the
+- `mwsqlctl audit-tail` no longer writes its own audit entry on success. Reading the
   log used to push the mutations and denials being investigated out of the tail
   window it had just been asked to show.
 - Loading `master.key` warns when the file is group/world accessible (a widened

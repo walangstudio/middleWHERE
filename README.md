@@ -135,12 +135,14 @@ mwsqld   --user run        # run the daemon yourself
 ### Uninstall
 
 `uninstall` is the inverse of `init`: it stops and removes the service and
-wipes the sealed config, master key, and audit log. It confirms first;
-`--yes` skips the prompt in scripts.
+wipes the sealed config and master key. It confirms first; `--yes` skips the
+prompt in scripts. The audit log is **kept** by default, for compliance and
+forensics; `--purge-audit` deletes that too.
 
 ```sh
-mwsqlctl uninstall            # service deployment (self-elevates)
-mwsqlctl --user uninstall     # per-user deployment
+mwsqlctl uninstall              # service deployment (self-elevates)
+mwsqlctl --user uninstall       # per-user deployment
+mwsqlctl uninstall --purge-audit  # also delete the audit log
 ```
 
 ### The manual way
@@ -301,6 +303,49 @@ Every env starts read-only. Allow writes at creation with
 mwsqlctl policy <env> --read-write --i-know-what-im-doing
 ```
 
+### Seeing and changing what you added
+
+List what is configured. Secrets are never printed:
+
+```sh
+mwsqlctl env list        # name, backend, engine, policy, bastion, credential, port
+mwsqlctl cred list       # name and backend username only
+mwsqlctl bastion list    # name, ssh endpoint, auth kind, number of pinned keys
+```
+
+Remove things. A bastion or credential still referenced by an environment is
+refused, so remove the environment first:
+
+```sh
+mwsqlctl env rm <env>
+mwsqlctl cred rm <credential>
+mwsqlctl bastion rm <bastion>
+```
+
+Read the audit log. Every query decision and every admin action is one JSON
+line; this prints the tail:
+
+```sh
+mwsqlctl audit-tail            # last 20 events
+mwsqlctl audit-tail -n 200     # last 200
+```
+
+In service mode the log lives in a root-owned directory, so `audit-tail` asks
+the daemon for it rather than reading the file itself. That means it works
+without `sudo`.
+
+### Migrating an existing deployment
+
+If you already run a `.env` plus `secrets/` layout, import it in one step
+instead of re-entering everything:
+
+```sh
+mwsqlctl import --from-dir /path/to/deployment
+```
+
+Import refuses to overwrite: a name or listen port that already exists is an
+error, so clear the target first or rename.
+
 ### Scripting credential setup
 
 Interactive prompts are right for humans. For CI, pass `--password-stdin` and
@@ -373,7 +418,12 @@ Or the MySQL wrapper, which remembers the token:
 ```sh
 mwsql login <staging-1> --port <6433>
 mwsql <staging-1> -e "SELECT count(*) FROM <table>"
+mwsql logout <staging-1>          # forget the stored token
 ```
+
+`mwsql login` reads the token interactively; `--token-stdin` takes it on stdin
+for scripts. `mwsql <env>` is shorthand for `mwsql run <env>`, and with no `-e`
+it reads one statement from stdin.
 
 Under read-only policy a write comes back denied, not executed, and the
 denial lands in the audit log.
@@ -398,6 +448,14 @@ holds no secrets.
 ```sh
 sudo mwsqld --state-dir <state-dir> --file-keystore run
 ```
+
+`run` takes three optional flags:
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--listen-host <addr>` | `127.0.0.1` | Address the env listeners bind. Loopback is the safe default; a non-loopback bind exposes tokens on the wire and is refused for PostgreSQL unless you set `MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1`. |
+| `--allow-tofu` | off | Accept an unpinned bastion's host key on first use instead of refusing. Convenient for capturing a fingerprint to pin; insecure to leave on, since it is exactly the moment a machine-in-the-middle would be accepted. |
+| `--idle-timeout-secs <n>` | per-env, 300 | Override every env's idle backend timeout. `0` disables reaping. An in-flight query is never interrupted. |
 
 For full control, `mwsqlctl install-service` generates the platform file (a
 systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows PowerShell
