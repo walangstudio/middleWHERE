@@ -110,13 +110,13 @@ async fn init_load_bind_shutdown_no_backend() {
     let ks = build_state(tmp.path(), "stage_w9", port, None);
 
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false, ks)
         .await
         .unwrap();
-    assert_eq!(daemon.bound.len(), 1);
+    assert_eq!(daemon.env_count().await, 1);
 
     let (tx, rx) = broadcast::channel(1);
-    let h = tokio::spawn(daemon.run(rx));
+    let h = tokio::spawn(std::sync::Arc::new(daemon).run(rx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     tx.send(()).unwrap();
     // Shutdown should complete within a reasonable window even with no traffic.
@@ -143,11 +143,11 @@ async fn end_to_end_through_real_backend() {
     let _audit = mwsqld::install_audit(tmp.path()).unwrap();
 
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false, ks)
         .await
         .unwrap();
     let (tx, rx) = broadcast::channel(1);
-    let h = tokio::spawn(daemon.run(rx));
+    let h = tokio::spawn(std::sync::Arc::new(daemon).run(rx));
 
     // Wait briefly for the accept loop to be ready.
     tokio::time::sleep(Duration::from_millis(50)).await;

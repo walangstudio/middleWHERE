@@ -24,14 +24,19 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Installed here rather than via rustsec/audit-check, which runs an
+      # unlocked `cargo install` and so resolves cargo-audit's deps to whatever
+      # is newest - kstring 2.0.4 now requires rustc 1.96 and fails to compile
+      # against the toolchain this job pins. `--locked` builds cargo-audit from
+      # its own lockfile, which stays within our pinned toolchain.
+      #
+      # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel): no patched version
+      # exists; pulled in transitively by russh for SSH bastion key auth. Not
+      # actionable until russh/ssh-key migrate off the rsa crate.
       - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel): no patched
-          # version exists; pulled in transitively by russh for SSH bastion key
-          # auth. Not actionable until russh/ssh-key migrate off the rsa crate.
-          ignore: RUSTSEC-2023-0071
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --ignore RUSTSEC-2023-0071
 
   workflow-guards:
     name: workflow + build-script guards

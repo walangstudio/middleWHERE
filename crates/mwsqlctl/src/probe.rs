@@ -18,9 +18,17 @@ use crate::ops;
 
 /// Collapsed result of a probe run: the daemon's exit code is authoritative for
 /// `ok`; `reason` is the first failing env's message, for the human only.
+/// `unsupported` carries a note when the run passed solely because every
+/// non-connecting env was an engine with no probe path (mssql) — a soft skip,
+/// not a real connection.
 pub struct ProbeOutcome {
     pub ok: bool,
     pub reason: String,
+    pub unsupported: Option<String>,
+    /// The daemon reported zero configured envs (`--all` on an env-less config):
+    /// an empty set is not "all connected", so the caller must not read it as a
+    /// pass. Distinguished by the daemon's `{"envs":0}` marker line.
+    pub empty: bool,
 }
 
 /// Build the argv for `mwsqld test`. Pure so it can be unit-tested without
@@ -65,7 +73,19 @@ pub fn run(daemon: &Path, argv: &[OsString]) -> Result<ProbeOutcome> {
             (!err.is_empty()).then_some(err)
         })
         .unwrap_or_default();
-    Ok(ProbeOutcome { ok, reason })
+    let unsupported = unsupported_only_reason(&stdout);
+    Ok(ProbeOutcome {
+        ok,
+        reason,
+        unsupported,
+        empty: has_empty_marker(&stdout),
+    })
+}
+
+/// The daemon's zero-envs marker (`{"envs":0}`), emitted by `mwsqld test --all`
+/// when no envs are configured so this side can tell it apart from a clean pass.
+fn has_empty_marker(stdout: &str) -> bool {
+    stdout.lines().any(|l| l.trim() == "{\"envs\":0}")
 }
 
 /// Outcome of a validation attempt. `Skipped` is a soft pass: the probe could
@@ -79,9 +99,9 @@ pub enum Validation {
 
 /// Validate one env (or all if `env` is `None`): locate the `mwsqld` sibling
 /// binary and run `mwsqld test` against the same state dir + keystore the ctl
-/// resolved. Service mode reads root-owned config, so the caller must already be
-/// elevated (the wizard self-elevates; standalone `env test` is wrapped by
-/// `run_elevated_or`).
+/// resolved. This direct probe reads the config file itself, so it only serves
+/// the `--user`/`--offline` paths; service mode probes through the daemon's
+/// `Probe` control request instead.
 pub fn validate(state_dir: &Path, ks: &KeystoreChoice, env: Option<&str>) -> Validation {
     let daemon = match ops::default_daemon_path() {
         Ok(d) if d.exists() => d,
@@ -96,7 +116,11 @@ pub fn validate(state_dir: &Path, ks: &KeystoreChoice, env: Option<&str>) -> Val
     let file_keystore = matches!(ks, KeystoreChoice::File { .. });
     let argv = build_probe_argv(env, state_dir, file_keystore);
     match run(&daemon, &argv) {
-        Ok(o) if o.ok => Validation::Ok,
+        Ok(o) if o.empty => Validation::Skipped("no environments configured".to_string()),
+        Ok(o) if o.ok => match o.unsupported {
+            Some(note) => Validation::Skipped(note),
+            None => Validation::Ok,
+        },
         Ok(o) => Validation::Failed(if o.reason.is_empty() {
             "connection failed".to_string()
         } else {
@@ -106,9 +130,11 @@ pub fn validate(state_dir: &Path, ks: &KeystoreChoice, env: Option<&str>) -> Val
     }
 }
 
-/// The reason from the first `"ok":false` JSON line. The daemon emits a fixed
-/// field order — `{"ok":B,"env":"E","reason":"R"}` — so `reason` (last field)
-/// runs to the closing `"}` regardless of its content.
+/// The reason from the first genuine-failure JSON line. The daemon emits a fixed
+/// field order — `{"ok":B,"supported":B,"env":"E","reason":"R"}` — so `reason`
+/// (last field) runs to the closing `"}` regardless of its content. Lines with
+/// `"supported":false` are unsupported engines, not failures, so they are
+/// skipped.
 fn first_failure_reason(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let line = line.trim();
@@ -116,6 +142,9 @@ fn first_failure_reason(stdout: &str) -> Option<String> {
             continue;
         }
         if !line.contains("\"ok\":false") {
+            continue;
+        }
+        if line.contains("\"supported\":false") {
             continue;
         }
         let r = extract_reason(line).unwrap_or_default();
@@ -130,6 +159,33 @@ fn first_failure_reason(stdout: &str) -> Option<String> {
         );
     }
     None
+}
+
+/// A skip note when the run passed *only* because every non-connecting env was
+/// an unsupported engine — i.e. at least one `"supported":false` line and no
+/// `"ok":true` line. Returns `None` the moment any env actually connected, so a
+/// mix of working + unsupported envs still reads as a plain success.
+fn unsupported_only_reason(stdout: &str) -> Option<String> {
+    let mut note: Option<String> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if line.contains("\"ok\":true") {
+            return None;
+        }
+        if line.contains("\"supported\":false") && note.is_none() {
+            note = Some(extract_reason(line).unwrap_or_default());
+        }
+    }
+    note.map(|r| {
+        if r.is_empty() {
+            "engine not supported yet".to_string()
+        } else {
+            r
+        }
+    })
 }
 
 fn extract_reason(line: &str) -> Option<String> {
@@ -222,6 +278,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_envs_marker_detected_but_not_a_connection_line() {
+        // The daemon's `{"envs":0}` marker means no envs were probed — must read
+        // as empty (→ Skipped), never as a failure or a pass.
+        assert!(has_empty_marker("{\"envs\":0}\n"));
+        assert!(!has_empty_marker(
+            "{\"ok\":true,\"supported\":true,\"env\":\"a\",\"reason\":\"\"}\n"
+        ));
+        assert!(!has_empty_marker(""));
+        // Not a genuine failure line, so it never surfaces as one.
+        assert_eq!(first_failure_reason("{\"envs\":0}\n"), None);
+    }
+
+    #[test]
     fn parses_first_failure_reason() {
         let out = concat!(
             "{\"ok\":true,\"env\":\"a\",\"reason\":\"\"}\n",
@@ -259,5 +328,49 @@ mod tests {
     fn ignores_non_json_noise_lines() {
         let out = "warning: something\n{\"ok\":false,\"env\":\"b\",\"reason\":\"nope\"}\n";
         assert_eq!(first_failure_reason(out).as_deref(), Some("nope"));
+    }
+
+    #[test]
+    fn unsupported_line_is_not_a_failure() {
+        let out =
+            "{\"ok\":false,\"supported\":false,\"env\":\"m\",\"reason\":\"engine mssql not supported yet\"}\n";
+        assert_eq!(first_failure_reason(out), None);
+    }
+
+    #[test]
+    fn real_failure_wins_over_unsupported_line() {
+        let out = concat!(
+            "{\"ok\":false,\"supported\":false,\"env\":\"m\",\"reason\":\"engine mssql not supported yet\"}\n",
+            "{\"ok\":false,\"supported\":true,\"env\":\"b\",\"reason\":\"connection refused\"}\n",
+        );
+        assert_eq!(
+            first_failure_reason(out).as_deref(),
+            Some("connection refused")
+        );
+    }
+
+    #[test]
+    fn unsupported_only_yields_skip_note() {
+        let out =
+            "{\"ok\":false,\"supported\":false,\"env\":\"m\",\"reason\":\"engine mssql not supported yet\"}\n";
+        assert_eq!(
+            unsupported_only_reason(out).as_deref(),
+            Some("engine mssql not supported yet")
+        );
+    }
+
+    #[test]
+    fn connected_plus_unsupported_is_not_a_skip() {
+        let out = concat!(
+            "{\"ok\":true,\"supported\":true,\"env\":\"a\",\"reason\":\"\"}\n",
+            "{\"ok\":false,\"supported\":false,\"env\":\"m\",\"reason\":\"engine mssql not supported yet\"}\n",
+        );
+        assert_eq!(unsupported_only_reason(out), None);
+    }
+
+    #[test]
+    fn all_connected_has_no_skip_note() {
+        let out = "{\"ok\":true,\"supported\":true,\"env\":\"a\",\"reason\":\"\"}\n";
+        assert_eq!(unsupported_only_reason(out), None);
     }
 }

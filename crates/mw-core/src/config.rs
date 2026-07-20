@@ -210,7 +210,6 @@ pub enum Policy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolSettings {
-    pub min_idle: u32,
     pub max_size: u32,
     pub idle_timeout_secs: u32,
 }
@@ -218,7 +217,6 @@ pub struct PoolSettings {
 impl Default for PoolSettings {
     fn default() -> Self {
         Self {
-            min_idle: 0,
             max_size: 16,
             idle_timeout_secs: 300,
         }

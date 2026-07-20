@@ -332,7 +332,7 @@ fn env_rotate_token_invalidates_old() {
     )
     .unwrap();
     let old = out.token.expose().to_string();
-    let new = envs::rotate_token(tmp.path(), &ks, "e").unwrap();
+    let new = envs::grant(tmp.path(), &ks, "e").unwrap().token;
     assert_ne!(new.expose(), old);
 
     let cfg = load(tmp.path(), &ks);

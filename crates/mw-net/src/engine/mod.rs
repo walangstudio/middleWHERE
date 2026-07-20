@@ -7,6 +7,7 @@
 //! engines bring their own server/client modules.
 
 use std::any::Any;
+use std::time::Duration;
 
 use tokio::net::TcpStream;
 
@@ -45,6 +46,15 @@ pub enum EngineError {
 /// their concrete type via `as_any` so MySQL keeps its zero-recode fast path.
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    /// Close pooled backend connections idle longer than `idle_timeout`,
+    /// returning how many were closed and released back to the server. Only
+    /// touches connections currently sitting idle in the pool, so an in-flight
+    /// query is never interrupted. Engines without a poolable backend (or with
+    /// a zero timeout) return 0.
+    fn reap_idle(&self, _idle_timeout: Duration) -> usize {
+        0
+    }
 }
 
 #[async_trait::async_trait]

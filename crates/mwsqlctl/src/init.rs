@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use mw_core::state::{default_state_dir, resolve_cli_target};
+use mw_core::state::{default_state_dir, resolve_service_install_target};
 
 use crate::ops::{self, Target};
 use crate::prompt::confirm;
@@ -36,20 +36,10 @@ pub struct InitOpts {
 }
 
 pub fn run(opts: InitOpts) -> Result<()> {
-    // The Windows elevated child runs in a throwaway console that vanishes on
-    // exit — pause on the way out (success or error) so its output, including
-    // the one-time token, stays readable. Only when there's a real console to
-    // read Enter from, so a piped/non-interactive `--uac` run never hangs.
-    let uac = cfg!(windows) && opts.uac;
-    let result = run_inner(opts);
-    if uac && std::io::stdin().is_terminal() {
-        if let Err(e) = &result {
-            eprintln!("\nError: {e:#}");
-        }
-        let _ = crate::prompt::read_line("\nDone. Press Enter to close this window:");
-        return Ok(());
-    }
-    result
+    // The elevated child's stdout/stderr and exit code are mirrored back to the
+    // original terminal by the relaunch helper, so there is no throwaway console
+    // to pause for here.
+    run_inner(opts)
 }
 
 fn run_inner(opts: InitOpts) -> Result<()> {
@@ -76,7 +66,10 @@ fn run_inner(opts: InitOpts) -> Result<()> {
         return service::elevate_for_service("init", &forward, &reason);
     }
 
-    let (state_dir, ks) = resolve_cli_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
+    // Service install must never adopt a v0.2.x legacy per-user config: the
+    // service account can't reach the installing user's OS keychain to unseal it.
+    let (state_dir, ks) =
+        resolve_service_install_target(opts.state_dir.clone(), opts.user, opts.file_keystore);
     let t = Target::new(&state_dir, &ks);
 
     if !service {
@@ -94,6 +87,14 @@ fn run_inner(opts: InitOpts) -> Result<()> {
 
     if cfg!(target_os = "linux") && service::is_root() {
         service::ensure_service_user(&opts.service_name)?;
+        service::ensure_admins_group()?;
+        // $SUDO_USER is the human who ran `sudo mwsqlctl init`; add them to the
+        // admins group so they reach the control socket without sudo. Raw root
+        // (no SUDO_USER) falls back to a printed manual command.
+        let operator = std::env::var("SUDO_USER")
+            .ok()
+            .filter(|u| !u.is_empty() && u != "root");
+        service::add_operator_to_admins(operator.as_deref())?;
     }
 
     seed_if_needed(t, &state_dir)?;
@@ -106,7 +107,11 @@ fn run_inner(opts: InitOpts) -> Result<()> {
 
     service::install_and_enable_service(&opts.service_name, opts.exec_path.as_deref(), &state_dir)?;
 
-    offer_configure(t, &opts.service_name, &state_dir)?;
+    // The Windows UAC child redirects stdout to a temp file, so its interactive
+    // prompts would be invisible — skip the inline wizard there and point at the
+    // separate `wizard` command instead.
+    let interactive = std::io::stdin().is_terminal() && !(cfg!(windows) && opts.uac);
+    offer_configure(t, &opts.service_name, &state_dir, interactive)?;
     Ok(())
 }
 
@@ -128,13 +133,24 @@ fn seed_if_needed(t: Target, state_dir: &Path) -> Result<()> {
 /// While still elevated, offer to configure connections inline (no second
 /// sudo). Skipped when there's no terminal — init can run headless for the
 /// service install alone.
-fn offer_configure(t: Target, service_name: &str, state_dir: &Path) -> Result<()> {
-    if std::io::stdin().is_terminal() && confirm("\nConfigure connections now?", true)? {
+fn offer_configure(
+    t: Target,
+    service_name: &str,
+    state_dir: &Path,
+    interactive: bool,
+) -> Result<()> {
+    if interactive && confirm("\nConfigure connections now?", true)? {
         let changed = wizard::run_config(t)?;
         wizard::finalize_service_config(service_name, state_dir, changed)?;
     } else {
         println!("\nNext: configure connections with");
-        println!("  mwsqlctl wizard");
+        if cfg!(windows) {
+            // The wizard needs admin and won't auto-elevate (its prompts can't
+            // show in a redirected UAC child), so it must be run already-elevated.
+            println!("  mwsqlctl wizard      # from an elevated PowerShell (Run as administrator)");
+        } else {
+            println!("  mwsqlctl wizard");
+        }
     }
     Ok(())
 }

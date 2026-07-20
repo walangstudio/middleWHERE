@@ -5,7 +5,100 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
-## [0.3.0] - 2026-06-10
+## [0.4.0] - 2026-07-18
+
+### Changed
+
+- **Config commands no longer elevate - the running daemon applies them.**
+  `env`/`cred`/`bastion`/`policy`/`grant`/`import` and the standalone
+  `mwsqlctl wizard` now send the change to the running `mwsqld` over a local
+  control channel; the daemon (which already owns the master key and the sealed
+  config) validates, re-seals, and applies it **live** to just the affected
+  env - no `sudo`/UAC, no service restart, no root-owned config files. (The
+  wizard offered inside `init`'s "Configure connections now?" prompt still runs
+  in the elevated direct path and restarts the service at the end.) This
+  replaces the 0.3.0 auto-elevation of config commands, which a security review
+  found could target the wrong deployment (data loss), rotate a token the
+  running service never saw (a revocation no-op), or leave `config.sealed`
+  root-owned so the service user could not read it (crash loop).
+  `init`/`uninstall` still elevate - they install/remove the OS service.
+- **`mwsql <env> -e "SQL"` now works as documented.** A bare env name defaults
+  to the `run` subcommand; `mwsql run <env>` still works.
+
+### Added
+
+- **`env add --url <connection-string>`** sets up a connection in one command.
+  `mwsqlctl env add staging1 --url 'postgresql://appuser@db.internal:5432/app'`
+  derives the engine, host, port, and database, stores the login as a credential
+  named after the env, and mints the token - replacing a `cred add` plus an
+  `env add` with five flags. Percent-encoded userinfo is decoded, so a password
+  containing `@` or `/` survives. Omit the password to be prompted (a password
+  in the URL is used but warned about, since it is already in your shell
+  history), or pass `--password-stdin` for unattended runs. `--url` and
+  `--credential` are mutually exclusive: the URL brings its own login, while
+  `--credential` reuses one you already added.
+- **Re-pinning a bastion fingerprint now takes effect without a restart.**
+  `bastion set-fingerprint` forgets the daemon's cached SSH session and rebuilds
+  every env using that bastion, so the next tunnel re-checks the host key
+  against the new pin. Previously the old (possibly TOFU-accepted) session kept
+  serving until a daemon restart. Graceful while the reconnect succeeds:
+  in-flight sessions finish on the old tunnel, new connections get the
+  re-checked one. If an env cannot reconnect under the new pin it is **stopped**
+  rather than left serving through the tunnel that was just declared untrusted,
+  and the CLI says which envs went offline and why. `bastion rm` also forgets
+  the cached session, so a later bastion reusing the name cannot inherit the
+  removed one's tunnel.
+- **Successful admin reads are audited too.** `list`/`audit`/`env test` over
+  the control channel now leave an audit line with the peer's OS identity, not
+  just mutations and denials.
+
+### Fixed
+
+- `mwsqlctl bastion add --key-file` warns that SSH key auth is stored but not
+  functional yet, instead of failing silently at first connect.
+- `bastion add` now refuses a second `--fingerprint` instead of silently
+  keeping the first and discarding the rest. One pin per bastion is what the
+  config and control channel actually carry; the silent drop only surfaced
+  later as an unexplained connection refusal.
+- `mwsqlctl audit-tail` no longer writes its own audit entry on success. Reading the
+  log used to push the mutations and denials being investigated out of the tail
+  window it had just been asked to show.
+- Loading `master.key` warns when the file is group/world accessible (a widened
+  backup/restore copy should not be trusted silently).
+- Removed the unused `min_idle` pool setting; it was never read by either
+  engine's pool builder. Existing sealed configs load unchanged.
+
+### Added
+
+- **Local control channel on the daemon.** A Unix socket
+  (`/run/middlewhere/<svc>.sock`, `/var/run/…` on macOS) or Windows named pipe
+  (`\\.\pipe\middlewhere-<svc>-control`), authorized by **kernel
+  peer-credentials** — `SO_PEERCRED` (Linux) / `getpeereid` (macOS) /
+  `ImpersonateNamedPipeClient` + `CheckTokenMembership` (Windows). Access is
+  granted to `root`/`Administrators` or members of the new **`middlewhere-admins`**
+  group (created and joined at `init`); every other caller is denied at the door.
+  The channel is loopback + local-peer only by design.
+- **Live per-env config apply (no restart).** Adding an env binds its listener;
+  removing one stops just that listener; a token/policy swap takes effect for new
+  connections while existing sessions keep serving; a credential/bastion change
+  rebuilds only that env's backend pool. Other envs' active sessions are never
+  disturbed.
+- **Admin-action audit.** Every config mutation and every denied control request
+  is written to the same audit log as query decisions, with the peer's OS
+  identity (uid/gid/user or SID).
+- **`mwsqlctl --offline`** edits the sealed config directly (requires an already
+  elevated process) as a recovery path when the service is not running.
+
+### Notes
+
+- v1 scope (deliberate deferrals): loopback + local-peer only (no remote
+  control), and a single `middlewhere-admins` group (no read-only vs read-write
+  admin roles).
+- A credential/bastion rotation is graceful: in-flight sessions keep serving on
+  their existing backend pool and SSH tunnels until they end, and only new
+  connections pick up the rotated secret - no mid-session break.
+
+## [0.3.0] - 2026-07-09
 
 ### Added
 
@@ -20,11 +113,12 @@ versions are fixes only.
   elevation) and leaves configuration to you.
 - **`mwsqlctl uninstall` removes a deployment — the inverse of `init`.** Service
   mode self-elevates, stops and deletes the OS service, then wipes the sealed
-  config, master key (file keystore or OS keychain entry), and audit log;
-  `--user` removes the per-user deployment with no elevation. Destructive and
-  irreversible, so it confirms first and refuses to run unattended unless `--yes`
-  is given. Idempotent: an already-absent service or state dir is reported, not
-  an error.
+  config and master key (file keystore or OS keychain entry); `--user` removes
+  the per-user deployment with no elevation. The append-only audit log is
+  **preserved by default** (`--purge-audit` removes it too). Destructive and
+  irreversible, so it confirms first — before elevating, so the prompt is never
+  hidden in a UAC child — and refuses to run unattended unless `--yes` is given.
+  Idempotent: an already-absent service or state dir is reported, not an error.
 - **`mwsqlctl wizard` (alias `setup`) configures an already-installed
   deployment.** Guided, masked prompts for bastions / credentials / environments,
   then it restarts the service so the daemon binds the new loopback listeners
@@ -51,6 +145,12 @@ versions are fixes only.
   and a ready-to-use engine URL (`postgresql://…?sslmode=disable`, `mysql://…`)
   alongside the token, so a non-technical operator never has to translate the
   terse one-liner into a client's connection dialog.
+- **Idle backend-connection timeout.** A pooled backend connection with no
+  activity for `idle_timeout_secs` (per-env config, default **300s**) is closed
+  and its server-side connection released, so the gateway does not hold idle
+  connections open. A periodic reaper sweeps only idle pooled connections — an
+  in-flight query is never interrupted, and any use resets the timer. `mwsqld
+  run --idle-timeout-secs <N>` overrides every env (0 disables reaping).
 
 ### Changed
 
@@ -64,7 +164,11 @@ versions are fixes only.
   (`/var/lib/middlewhere`, etc.) and the **file** keystore, because the common
   deployment is a managed service. Pass `--user` for the per-user dir + OS
   keychain (the previous default). The shared resolution lives in
-  `mw_core::state::resolve_cli_target`.
+  `mw_core::state::resolve_cli_target`. An existing v0.2.x per-user deployment
+  is still honored: when no explicit target is given and the system dir is
+  unseeded, resolution falls back to the legacy per-user dir (its keystore
+  detected from `master.key` presence) with a one-line deprecation warning, so
+  upgrades don't orphan existing envs and credentials.
 
 ### Removed
 
@@ -84,10 +188,64 @@ versions are fixes only.
   conflict.
 - The one-time client token is printed as an **unmissable block** (env name,
   token, port, connection details) by `env add`, `grant`, and the wizard, so it
-  can't be scrolled past — previously a single easily-missed line. On Windows the
-  Read/inspect commands (`env list`, `cred list`, `grant`, `audit-tail`) and
-  service-mode `init` / `wizard` self-elevate via UAC instead of failing against
-  the admin-locked state dir.
+  can't be scrolled past. The block goes to **stderr**; stdout still carries
+  exactly one line — the bare token — so `token=$(mwsqlctl grant dev)` keeps
+  working (the 0.2.x scripting contract). On Windows the capture works from an
+  interactive terminal even without pre-elevating: `grant` relaunches under UAC
+  (one prompt) and mirrors the bare token back to the redirected stdout. Only a
+  fully headless call (stdin not a terminal) can't auto-elevate — run those from
+  an already-elevated context.
+- On Windows the read/inspect and config commands self-elevate via UAC instead
+  of failing against the admin-locked state dir. The relaunch **waits** for the
+  elevated child, mirrors its output back into the calling terminal, and
+  propagates its exit code (UAC cancel and a child that fails to launch both
+  surface as non-zero, never a false success). The elevated command is delivered
+  as an encoded script so argument values survive intact, the token round-trips
+  without corruption, and the child's output temp files are created with a
+  random name and fail-if-exists semantics so a same-user process can't pre-plant
+  them. With stdin or stdout redirected the relaunch refuses and asks for an
+  elevated terminal instead of silently detaching — so `grant > token.txt` can't
+  produce an empty file and piped `--password-stdin` can't hang. Interactive
+  flows (`wizard`, `bastion add --key-file`) ask for an elevated terminal rather
+  than prompting invisibly inside the UAC child.
+- The Windows service registered by `init --state-dir <custom>` now reads that
+  state dir — `mwsqld` previously ignored the baked-in `--state-dir` and loaded
+  the default location, leaving custom-dir installs with a service that saw
+  none of the configured envs.
+- macOS service-mode `init` / `wizard` / `uninstall` self-elevate via `sudo`
+  like Linux — previously they never elevated and died with a raw
+  "Permission denied" creating the system state dir.
+- `env add --engine mssql` no longer exits non-zero on a successful add:
+  engines the probe can't test yet report **validation skipped** (exit 0), and
+  `env test` marks them SKIP without failing an `--all` run.
+- The wizard no longer produces an unusable env when the bastion host-key
+  fingerprint is left blank: it warns that connections will be refused until a
+  key is pinned (with a `ssh-keyscan` hint), and the edit-&-retry loop can pin
+  a fingerprint in place. Probes and generated service units still never use
+  TOFU.
+- The Windows README install snippet verifies the archive's SHA-256 against
+  `SHA256SUMS` (parity with the removed `install.ps1` and the Linux snippet).
+- **Config commands auto-elevate on Linux/macOS too, not just Windows.** With the
+  service-first default, a flagless `env add` / `cred add` / `grant` targets the
+  root-owned system dir; it now `sudo` re-execs (elevate-first, secrets only
+  entered in the elevated process) instead of dying with a bare "Permission
+  denied". `--user` and an already-elevated process still run without elevating.
+- Non-interactive `init` (and `uninstall --yes`) that cannot elevate now exit
+  **non-zero** after printing the manual `sudo` command, instead of returning
+  success without doing anything — so provisioning scripts detect the no-op.
+- `uninstall` classifies a system deployment correctly when `HOME` / `XDG_STATE_HOME`
+  are unset (systemd unit, cron, container): it no longer misreads the system dir
+  as per-user and so no longer risks deleting the master key while orphaning the
+  registered service.
+- Windows `uninstall` detects a stopped service by the numeric `sc` state code,
+  not the English word "STOPPED", so it works on localized Windows instead of
+  burning the stop-wait timeout.
+- `mwsqld test --all` on a deployment with zero configured environments reports
+  "no environments configured" instead of falsely succeeding as if connectivity
+  were verified.
+- The setup wizard unseals the sealed config once per screen instead of three
+  times, so on a `--user` / OS-keychain deployment (notably macOS) it no longer
+  triggers repeated keychain prompts for a single action.
 
 ### Security
 

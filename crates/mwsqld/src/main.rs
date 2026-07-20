@@ -46,6 +46,13 @@ enum Cmd {
         /// Without this, a bastion with no pinned host key is REFUSED.
         #[arg(long)]
         allow_tofu: bool,
+        /// Close a backend (server) connection after this many seconds of no
+        /// activity, freeing the server-side connection; activity resets the
+        /// timer. 0 disables reaping. When set, overrides every env's
+        /// configured pool idle timeout; unset, each env uses its own
+        /// (default 300).
+        #[arg(long, value_name = "SECS")]
+        idle_timeout_secs: Option<u32>,
     },
     /// Probe backend connectivity for one env (or all): open the bastion tunnel
     /// if any, force one real connect+auth, report, and exit. Reads the sealed
@@ -58,8 +65,9 @@ enum Cmd {
         /// Probe every configured env.
         #[arg(long)]
         all: bool,
-        /// Machine-readable output: one `{"ok":bool,"env":str,"reason":str}`
-        /// JSON line per env.
+        /// Machine-readable output: one
+        /// `{"ok":bool,"supported":bool,"env":str,"reason":str}` JSON line per
+        /// env. `supported` is false for engines with no probe path (mssql).
         #[arg(long)]
         json: bool,
         /// Accept an unpinned bastion host key (TOFU) during the probe. Without
@@ -96,10 +104,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // The Windows service path must run BEFORE any tokio runtime: the SCM
-    // dispatcher blocks and owns its own runtime internally.
+    // dispatcher blocks and owns its own runtime internally. Resolve the same
+    // target the binPath's `--state-dir`/`--file-keystore` flags select so the
+    // service reads what `init` seeded, not the compiled-in default.
     #[cfg(windows)]
     if let Cmd::Service = cli.cmd {
-        return mwsqld::winsvc::run();
+        let user = cli.user || env_flag("MW_USER");
+        let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+        let (state_dir, keystore) = resolve_cli_target(cli.state_dir.clone(), user, file_keystore);
+        return mwsqld::winsvc::run(state_dir, keystore);
     }
 
     let user = cli.user || env_flag("MW_USER");
@@ -117,21 +130,31 @@ fn main() -> Result<()> {
             Cmd::Run {
                 listen_host,
                 allow_tofu,
+                idle_timeout_secs,
             } => {
                 // Process owns the global subscriber + audit writer guard for
                 // its whole lifetime. Not done inside Daemon::bind on purpose.
                 let _audit = mwsqld::install_audit(&state_dir)?;
-                let cfg = load_config(&state_dir, &keystore)?;
+                let mut cfg = load_config(&state_dir, &keystore)?;
                 if cfg.envs.is_empty() {
                     eprintln!("warning: no envs configured. Use mwsqlctl to add some.");
                 }
-                let daemon = Daemon::bind(state_dir, &cfg, &listen_host, allow_tofu).await?;
+                // The flag overrides every env's configured idle timeout. Only
+                // this in-memory copy is touched; the sealed config on disk is
+                // never rewritten.
+                if let Some(secs) = idle_timeout_secs {
+                    for env in cfg.envs.values_mut() {
+                        env.pool.idle_timeout_secs = secs;
+                    }
+                }
+                let daemon =
+                    Daemon::bind(state_dir, &cfg, &listen_host, allow_tofu, keystore).await?;
                 let (tx, rx) = tokio::sync::broadcast::channel(1);
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     let _ = tx.send(());
                 });
-                daemon.run(rx).await
+                std::sync::Arc::new(daemon).run(rx).await
             }
             Cmd::Test {
                 env,
@@ -147,18 +170,37 @@ fn main() -> Result<()> {
                 };
                 let cfg = load_config(&state_dir, &keystore)?;
                 let results = mwsqld::test_envs(&cfg, which, allow_tofu).await;
+                if results.is_empty() {
+                    // Zero envs probed (e.g. `--all` on a freshly-init'd,
+                    // env-less config). An empty set is NOT "all connected":
+                    // say so plainly and exit 0 without asserting any
+                    // connectivity was verified. In JSON mode emit an explicit
+                    // marker so a caller (mwsqlctl's probe::validate) can tell
+                    // "zero envs" apart from "all envs passed" — both otherwise
+                    // print nothing and exit 0.
+                    if json {
+                        println!("{{\"envs\":0}}");
+                    } else {
+                        println!("no environments configured");
+                    }
+                    return Ok(());
+                }
                 let mut all_ok = true;
                 for r in &results {
-                    all_ok &= r.ok;
+                    // An unsupported engine is reported but never fails the run.
+                    all_ok &= r.ok || !r.supported;
                     if json {
                         println!(
-                            "{{\"ok\":{},\"env\":\"{}\",\"reason\":\"{}\"}}",
+                            "{{\"ok\":{},\"supported\":{},\"env\":\"{}\",\"reason\":\"{}\"}}",
                             r.ok,
+                            r.supported,
                             json_escape(&r.env),
                             json_escape(&r.reason)
                         );
                     } else if r.ok {
                         println!("OK   {}", r.env);
+                    } else if !r.supported {
+                        println!("SKIP {}  {}", r.env, r.reason);
                     } else {
                         println!("ERR  {}  {}", r.env, r.reason);
                     }

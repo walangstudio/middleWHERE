@@ -1,13 +1,14 @@
 //! `mwsqlctl` library. All real work lives here so tests can drive each
 //! mutation without spawning a subprocess. The bin is a thin clap wrapper.
 //!
-//! Concurrency: every public function in this crate is synchronous and
-//! reads + writes the sealed config once. Long-term, the same surface will
-//! gain an "online" counterpart that talks to a running daemon over IPC
-//! (Phase 6b in the plan); today, offline-only.
+//! Two ways to reach the sealed config: the synchronous `ops`/`envs`/… modules
+//! read + write the config file in-process (per-user, or the privileged
+//! `--offline` path); [`control_client`] speaks to a running daemon over the
+//! local control channel so service-mode config commands need no elevation.
 
 pub mod audit_tail;
 pub mod bastion;
+pub mod control_client;
 pub mod cred;
 pub mod envs;
 pub mod import_poc;
@@ -29,7 +30,12 @@ use mw_core::config::EngineKind;
 /// unnoticed. Used by `env add`, `grant`, and the wizard so the operator always
 /// sees the same prominent output. Includes a DBeaver-style field list and a
 /// paste-ready engine URI so a non-technical operator never has to translate a
-/// terse one-liner into a client's connection dialog.
+/// terse one-liner into a client's connection dialog. The whole banner goes to
+/// stderr; stdout carries exactly one line — the bare token — so
+/// `token=$(mwsqlctl grant …)` captures only the secret. On Windows from a
+/// non-elevated shell this triggers a one-time UAC prompt and then mirrors the
+/// bare token back to the (redirected) stdout, so the capture still works — it
+/// just needs stdin to be a terminal.
 pub fn print_token_block(
     env: &str,
     port: u16,
@@ -38,29 +44,58 @@ pub fn print_token_block(
     database: Option<&str>,
 ) {
     let bar = "=".repeat(70);
-    println!("\n{bar}");
-    println!("  CLIENT TOKEN  —  SAVE NOW (shown only once)");
-    println!("{bar}");
-    println!("  env:     {env}");
-    println!("  token:   {token}");
-    println!("  connect: mwsql login {env} --port {port}");
-    println!();
-    println!("  DBeaver / any SQL client — enter these fields:");
-    println!("    Host:      127.0.0.1");
-    println!("    Port:      {port}");
-    println!(
+    eprintln!("\n{bar}");
+    eprintln!("  CLIENT TOKEN  —  SAVE NOW (shown only once)");
+    eprintln!("{bar}");
+    eprintln!("  env:     {env}");
+    eprintln!("  token:   {token}");
+    eprintln!("  connect: mwsql login {env} --port {port}");
+    eprintln!();
+    eprintln!("  DBeaver / any SQL client — enter these fields:");
+    eprintln!("    Host:      127.0.0.1");
+    eprintln!("    Port:      {port}");
+    eprintln!(
         "    Database:  {}",
         database.unwrap_or("(none — pick in client)")
     );
-    println!("    Username:  {env}");
-    println!("    Password:  {token}");
-    println!("    SSL:       off / disable");
+    eprintln!("    Username:  {env}");
+    eprintln!("    Password:  {token}");
+    eprintln!("    SSL:       off / disable");
     if let Some(uri) = engine_uri(engine, env, token, port, database) {
-        println!();
-        println!("  paste-ready URL (embeds the token — treat it like the password):");
-        println!("    {uri}");
+        eprintln!();
+        eprintln!("  paste-ready URL (embeds the token — treat it like the password):");
+        eprintln!("    {uri}");
     }
-    println!("{bar}\n");
+    eprintln!("{bar}\n");
+    println!("{token}");
+}
+
+/// Render a freshly minted env token from a control-channel [`NewEnvOutputDto`]:
+/// the standard token block, then — via [`render_token_note`] — the daemon's
+/// persisted-but-not-live WARNING when present. The single render point for
+/// `env add`, `grant`, and the wizard, so every path surfaces the note the same
+/// way.
+pub fn render_new_env(env: &str, out: &mw_core::control::NewEnvOutputDto) {
+    print_token_block(
+        env,
+        out.listen_port,
+        out.token.expose(),
+        out.engine,
+        out.database.as_deref(),
+    );
+    render_token_note(&out.note);
+}
+
+/// Print the daemon's persisted-but-not-live warning to stderr when present
+/// (`note` is `Some` only on the online path, when the env was saved but the live
+/// bind failed and a restart is needed). The single note-render point shared by
+/// [`render_new_env`] and the `rotate-token` arm, so the warning surfaces
+/// identically wherever a token is minted. `None` (clean success, or any
+/// direct/offline write) prints nothing.
+pub fn render_token_note(note: &Option<String>) {
+    if let Some(note) = note {
+        eprintln!("⚠ {note}");
+    }
 }
 
 /// A paste-ready client connection URI for the local proxy listener, or `None`
@@ -101,17 +136,12 @@ fn pct(s: &str) -> String {
     o
 }
 
-/// Run a config-touching `mwsqlctl` command, auto-elevating on Windows service
-/// mode so it does not just fail against the admin-locked state dir. The bin
-/// wraps its command dispatch (everything except the self-elevating `init` /
-/// `wizard`) in this.
-pub fn run_elevated_or<F: FnOnce() -> anyhow::Result<()>>(
-    service: bool,
-    uac: bool,
-    needs_config: bool,
-    run: F,
-) -> anyhow::Result<()> {
-    crate::service::run_elevated_or(service, uac, needs_config, run)
+/// Whether this process is already privileged (root on unix, Administrator on
+/// Windows). The `--offline` config path edits the root/service-owned sealed
+/// config directly, so it requires this — the CLI no longer auto-elevates for
+/// config commands.
+pub fn is_privileged() -> bool {
+    crate::service::is_root() || crate::service::is_admin()
 }
 
 #[cfg(test)]

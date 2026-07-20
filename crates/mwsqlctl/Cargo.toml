@@ -28,10 +28,19 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# `env add --url`: correct percent-decoding of userinfo. Already in the lock as
+# a transitive dep, so this adds no new supply chain.
+url = "2"
+percent-encoding = "2"
 
-# Root detection + sudo re-exec for the service-mode wizard (Linux only).
-[target.'cfg(target_os = "linux")'.dependencies]
+# Root detection (euid) + sudo re-exec for the service-mode wizard on every unix.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Crypto-random temp-file names for the Windows UAC relaunch (defeats a
+# same-user pre-plant of the redirect target). Reuses the workspace pin.
+[target.'cfg(windows)'.dependencies]
+rand.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

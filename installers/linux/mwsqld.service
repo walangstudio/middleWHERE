@@ -13,6 +13,11 @@ RestartSec=5
 DynamicUser=yes
 StateDirectory=mwsqld
 StateDirectoryMode=0700
+# Runtime dir for the group-reachable control socket; the admins group is a
+# supplementary group so the (dynamic) service can chgrp the socket to it.
+RuntimeDirectory=middlewhere
+RuntimeDirectoryMode=0710
+SupplementaryGroups=middlewhere-admins
 UMask=0077
 
 # --- sandbox ---

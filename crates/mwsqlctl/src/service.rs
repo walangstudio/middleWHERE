@@ -26,12 +26,14 @@ pub(crate) const ELEVATED_MARKER: &str = "MW_ELEVATED";
 
 // ---- root detection ----------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn is_root() -> bool {
-    // SAFETY: geteuid is always-safe and never fails.
+    // SAFETY: geteuid is always-safe and never fails. Used on every unix
+    // (Linux + macOS/BSD) — an in-process euid check, never a PATH-resolved
+    // `id` subprocess that could false-negative an elevation decision.
     unsafe { libc::geteuid() == 0 }
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub(crate) fn is_root() -> bool {
     false
 }
@@ -48,7 +50,7 @@ pub(crate) fn is_admin() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let out = Command::new("powershell")
+        let out = Command::new(windows_powershell_path())
             .args([
                 "-NoProfile",
                 "-Command",
@@ -65,10 +67,12 @@ pub(crate) fn is_admin() -> bool {
 }
 
 /// Whether a service-mode command must elevate before it can install/configure.
-/// Linux uses the `sudo` re-exec env marker; Windows uses the `--uac` flag set
-/// on the relaunched child (UAC does not forward env vars).
+/// Unix (Linux + macOS/BSD) uses the `sudo` re-exec env marker; Windows uses the
+/// `--uac` flag set on the relaunched child (UAC does not forward env vars).
+/// macOS is included so `init`/`wizard`/`uninstall` self-elevate to create the
+/// root-owned state dir instead of dying with a raw "Permission denied".
 pub(crate) fn needs_service_elevation(uac_relaunched: bool) -> bool {
-    if cfg!(target_os = "linux") {
+    if cfg!(unix) {
         !is_root() && !already_elevated()
     } else if cfg!(windows) {
         !is_admin() && !uac_relaunched
@@ -93,87 +97,216 @@ pub(crate) fn elevate_for_service(
     }
 }
 
-/// Relaunch self elevated via UAC. The elevated child runs in its own new
-/// console; we pass `--uac` so it knows not to re-elevate and to pause before
-/// closing (so the one-time token stays readable).
+/// Sentinel exit code the outer relaunch script returns when the UAC prompt is
+/// declined or the elevated process can't start (Windows `ERROR_CANCELLED`), so
+/// the parent can tell "cancelled" apart from a child that genuinely exited
+/// non-zero and must have its code mirrored.
+#[cfg(any(windows, test))]
+const ELEVATION_CANCELLED: i32 = 1223;
+
+/// Escape a string for a PowerShell single-quoted literal: only `'` is special
+/// and doubles. Pure so [`build_inner_script`] is unit-testable without spawning
+/// PowerShell.
+#[cfg(any(windows, test))]
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Absolute path to the system Windows PowerShell. Launching it by bare name
+/// resolves through the CWD / PATH first, so a `powershell.exe` planted in
+/// either — then run elevated via `-Verb RunAs` — would be an EoP. `%SystemRoot%`
+/// is admin-owned, so paths under it are trustworthy.
+#[cfg(any(windows, test))]
+fn windows_powershell_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// Whether a UAC relaunch can proceed. Only stdin must be a terminal: the
+/// elevated child is a separate process, so a piped parent stdin can't feed it
+/// (e.g. `--password-stdin`) and we bail honestly. A redirected *stdout* is fine
+/// — the parent mirrors the child's captured output to its own stdout, so
+/// `mwsqlctl init > log` and `token=$(mwsqlctl grant …)` still work.
+#[cfg(any(windows, test))]
+fn can_relaunch_elevated(stdin_tty: bool) -> bool {
+    stdin_tty
+}
+
+/// Decode a child temp file. Windows PowerShell 5.1 `1>`/`2>` write UTF-16LE
+/// with a BOM; PowerShell 7 writes UTF-8. Sniff the BOM (`FF FE` = UTF-16LE) and
+/// decode accordingly, otherwise treat the bytes as UTF-8 (stripping a UTF-8 BOM
+/// if present). This is display text, so invalid sequences are replaced rather
+/// than erroring — the previous `read_to_string` returned `Err` on the BOM and
+/// silently dropped a one-time token. PowerShell's redirect also rewrites the
+/// child's `\n` as `\r\n`, so we undo that: otherwise `token=$(mwsqlctl grant …)`
+/// would capture a trailing CR that a POSIX `$()` doesn't strip.
+#[cfg(any(windows, test))]
+fn decode_child_output(bytes: &[u8]) -> String {
+    let text = if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    text.replace("\r\n", "\n")
+}
+
+/// base64(UTF-16LE) encode a PowerShell script for `-EncodedCommand`: the bytes
+/// are opaque to `CommandLineToArgvW`, so no argv re-split can corrupt the exe
+/// path or its arguments. Pure + unit-tested.
+#[cfg(any(windows, test))]
+fn encode_powershell_command(script: &str) -> String {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+/// The script the *elevated* child runs. It creates both redirect targets with
+/// `CreateNew` (fails if the name already exists — including a symlink/junction
+/// a same-user attacker pre-planted — and never traverses a reparse point),
+/// then runs the exe with output redirected to those now-real files. A child
+/// that never launched (moved/quarantined exe, or a null `$LASTEXITCODE`)
+/// reports a non-zero code instead of a false success.
+#[cfg(any(windows, test))]
+fn build_inner_script(exe: &str, args: &[String], out: &Path, err: &Path) -> String {
+    let out_q = ps_single_quote(&out.to_string_lossy());
+    let err_q = ps_single_quote(&err.to_string_lossy());
+    let mut invoke = format!("& {}", ps_single_quote(exe));
+    for a in args {
+        invoke.push(' ');
+        invoke.push_str(&ps_single_quote(a));
+    }
+    // No `$ErrorActionPreference = 'Stop'`: under Stop, Windows PowerShell turns
+    // the exe's own stderr writes into a thrown NativeCommandError, so a
+    // *successful* command that prints to stderr (every token banner does) would
+    // be misreported as a failure. The `.NET` CreateNew calls throw regardless
+    // (method exceptions are always terminating), and a missing/again-launchable
+    // exe still throws CommandNotFoundException — both caught below.
+    //
+    // ponytail: a same-user attacker can still win a delete-and-relink race
+    // between CreateNew and the redirect (residual TOCTOU); the ceiling if that
+    // ever matters is a named pipe instead of a temp file.
+    //
+    // `2>` wraps the exe's native stderr as PowerShell error records (the
+    // "<exe> : … NativeCommandError" noise), so the forwarded stderr banner is
+    // cosmetically messy; stdout (the token) is clean. Upgrade path if that
+    // matters: capture via System.Diagnostics.Process with StandardOutputEncoding
+    // = UTF8 for raw, unwrapped output.
+    format!(
+        "$code = 1; \
+         try {{ \
+           [System.IO.File]::Open({out_q}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read).Close(); \
+           [System.IO.File]::Open({err_q}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read).Close() \
+         }} catch {{ exit 1 }}; \
+         try {{ {invoke} 1> {out_q} 2> {err_q}; $code = $LASTEXITCODE }} \
+         catch {{ [System.IO.File]::AppendAllText({err_q}, ($_ | Out-String)); $code = 1 }}; \
+         if ($null -eq $code) {{ $code = 1 }}; exit $code"
+    )
+}
+
+/// The outer script the unprivileged parent runs (itself via `-EncodedCommand`).
+/// It launches the elevated child carrying `inner_b64` as a single opaque
+/// `-EncodedCommand` argument, waits, and mirrors the child's exit code — a
+/// declined UAC prompt (Start-Process throws) becomes [`ELEVATION_CANCELLED`].
+#[cfg(any(windows, test))]
+fn build_outer_script(inner_b64: &str) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         try {{ \
+           $p = Start-Process {ps} -Verb RunAs -Wait -PassThru \
+             -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand',{b64}; \
+           $code = $p.ExitCode; if ($null -eq $code) {{ $code = 1 }}; exit $code \
+         }} catch {{ exit {cancelled} }}",
+        ps = ps_single_quote(&windows_powershell_path()),
+        b64 = ps_single_quote(inner_b64),
+        cancelled = ELEVATION_CANCELLED,
+    )
+}
+
+/// Relaunch `me <args>` elevated and block until it finishes, then mirror the
+/// child's stdout/stderr and exit code into this process. Gated on an interactive
+/// stdin (see [`can_relaunch_elevated`]) so a piped-stdin invocation fails with a
+/// clear message instead of a child that can't read its input; a redirected
+/// stdout is fine — its captured output is mirrored back. Does not return on the
+/// success path — it exits the process with the child's code.
 #[cfg(windows)]
-fn relaunch_elevated_windows(subcommand: &str, forward: &[OsString]) -> Result<()> {
-    let me = std::env::current_exe().context("resolve current exe")?;
-    // PowerShell single-quoted array: '<sub>','<arg>',…,'--uac'.
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let mut parts: Vec<String> = vec![quote(subcommand)];
-    parts.extend(forward.iter().map(|a| quote(&a.to_string_lossy())));
-    parts.push(quote("--uac"));
-    let script = format!(
-        "Start-Process -FilePath {} -Verb RunAs -ArgumentList {}",
-        quote(&me.to_string_lossy()),
-        parts.join(",")
-    );
-    println!("Requesting administrator privileges (a UAC prompt will appear)…");
-    println!("Setup continues in a new elevated window.");
-    let status = run_powershell(&script).context("launch elevated process via PowerShell")?;
-    if !status.success() {
+fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
+    use rand::RngCore;
+    use std::io::Write;
+
+    if !can_relaunch_elevated(std::io::stdin().is_terminal()) {
         bail!(
-            "elevation was cancelled or failed. Re-run from an elevated PowerShell, \
-             or run the printed service script as Administrator."
+            "administrator privileges are required, and stdin is piped/redirected so \
+             input can't reach the elevated child. Re-run this command from an \
+             elevated terminal (Run as administrator), or pass --user for a per-user \
+             setup that needs no elevation."
         );
     }
-    Ok(())
+
+    let me = std::env::current_exe().context("resolve current exe")?;
+    // Crypto-random name so a same-user process can't predict (and pre-plant) the
+    // path; the elevated child then creates it with CreateNew (see build_inner_script).
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let base = std::env::temp_dir().join(format!("mwsqlctl-elev-{nonce}"));
+    let out_tmp = base.with_extension("out");
+    let err_tmp = base.with_extension("err");
+
+    let inner = build_inner_script(&me.to_string_lossy(), args, &out_tmp, &err_tmp);
+    let script = build_outer_script(&encode_powershell_command(&inner));
+    println!("Requesting administrator privileges (a UAC prompt will appear)…");
+    let status = run_powershell(&script).context("relaunch elevated via PowerShell")?;
+    let code = status.code().unwrap_or(1);
+
+    // shortcut: the elevated child's stdout/stderr transit a user-temp file;
+    // upgrade to a named pipe if that round-trip is ever unacceptable. Read as
+    // bytes and decode (WinPS 5.1 writes UTF-16LE+BOM) then delete on every path,
+    // so a cancelled run leaves nothing behind and a token is never lost.
+    let out = std::fs::read(&out_tmp)
+        .map(|b| decode_child_output(&b))
+        .unwrap_or_default();
+    let err = std::fs::read(&err_tmp)
+        .map(|b| decode_child_output(&b))
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&out_tmp);
+    let _ = std::fs::remove_file(&err_tmp);
+
+    if code == ELEVATION_CANCELLED {
+        bail!("elevation was cancelled or could not start; run this from an elevated PowerShell instead.");
+    }
+
+    if !out.is_empty() {
+        print!("{out}");
+        std::io::stdout().flush().ok();
+    }
+    if !err.is_empty() {
+        eprint!("{err}");
+        std::io::stderr().flush().ok();
+    }
+    std::process::exit(code);
+}
+
+/// Relaunch self elevated via UAC for a service-install subcommand: `<sub>
+/// <forward…> --uac`. Blocks on the child and mirrors its output + exit code.
+#[cfg(windows)]
+fn relaunch_elevated_windows(subcommand: &str, forward: &[OsString]) -> Result<()> {
+    let mut args: Vec<String> = vec![subcommand.to_string()];
+    args.extend(forward.iter().map(|a| a.to_string_lossy().into_owned()));
+    args.push("--uac".to_string());
+    relaunch_elevated_and_wait(&args)
 }
 #[cfg(not(windows))]
 fn relaunch_elevated_windows(_subcommand: &str, _forward: &[OsString]) -> Result<()> {
     Ok(())
-}
-
-/// Relaunch the *exact* current command elevated (verbatim argv + `--uac`). Used
-/// by the non-interactive config commands (`env list`, `grant`, …) that would
-/// otherwise just fail reading the admin-locked state dir. Output appears (and
-/// is paused) in the elevated console — see [`run_elevated_or`].
-#[cfg(windows)]
-pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
-    let me = std::env::current_exe().context("resolve current exe")?;
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let mut parts: Vec<String> = std::env::args().skip(1).map(|a| quote(&a)).collect();
-    parts.push(quote("--uac"));
-    let script = format!(
-        "Start-Process -FilePath {} -Verb RunAs -ArgumentList {}",
-        quote(&me.to_string_lossy()),
-        parts.join(",")
-    );
-    println!("Requesting administrator privileges (a UAC prompt will appear)…");
-    let status = run_powershell(&script).context("relaunch elevated")?;
-    if !status.success() {
-        bail!("elevation was cancelled or failed; run this from an elevated PowerShell instead.");
-    }
-    Ok(())
-}
-#[cfg(not(windows))]
-pub(crate) fn relaunch_self_elevated_windows() -> Result<()> {
-    Ok(())
-}
-
-/// Wrap a config-touching command: on Windows service mode, relaunch elevated if
-/// needed (the command then re-runs verbatim in an admin console); otherwise run
-/// it, pausing afterward when we are the elevated child so its output (incl. a
-/// one-time `grant` token) stays readable before the throwaway console closes.
-pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
-    service: bool,
-    uac: bool,
-    needs_config: bool,
-    run: F,
-) -> Result<()> {
-    if service && cfg!(windows) && needs_config && needs_service_elevation(uac) {
-        return relaunch_self_elevated_windows();
-    }
-    let result = run();
-    if cfg!(windows) && uac && std::io::stdin().is_terminal() {
-        if let Err(e) = &result {
-            eprintln!("\nError: {e:#}");
-        }
-        let _ = prompt::read_line("\nDone. Press Enter to close this window:");
-        return Ok(());
-    }
-    result
 }
 
 /// Run a PowerShell script via `-EncodedCommand` (base64 UTF-16LE). Avoids
@@ -182,13 +315,8 @@ pub(crate) fn run_elevated_or<F: FnOnce() -> Result<()>>(
 /// temp dir before it runs elevated.
 #[cfg(windows)]
 fn run_powershell(script: &str) -> std::io::Result<std::process::ExitStatus> {
-    use base64::Engine as _;
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    Command::new("powershell")
+    let encoded = encode_powershell_command(script);
+    Command::new(windows_powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
         .status()
 }
@@ -247,10 +375,17 @@ pub(crate) fn elevate_or_print(subcommand: &str, forward: &[OsString], reason: &
     }
 
     // Can't prompt for the sudo confirmation without a terminal — print the
-    // exact command and stop, rather than failing half-way.
+    // exact command, then fail (non-zero). Returning Ok here would report success
+    // having seeded/installed NOTHING, so a CI/Ansible/Docker run sees `init`
+    // "succeed" and only trips on the next command against an unconfigured state
+    // dir. An operation that did nothing must not report success.
     if !std::io::stdin().is_terminal() {
         print_manual(&me, subcommand, forward);
-        return Ok(());
+        bail!(
+            "cannot elevate for `{subcommand}`: root is required but stdin is not a \
+             terminal to confirm the sudo re-exec. Nothing was changed — run the \
+             printed command under sudo."
+        );
     }
 
     println!("{reason}");
@@ -335,6 +470,78 @@ pub(crate) fn chown_state_dir(dir: &Path, name: &str) -> Result<()> {
 }
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn chown_state_dir(_dir: &Path, _name: &str) -> Result<()> {
+    Ok(())
+}
+
+// ---- admins group + operator membership (linux) ------------------------
+
+/// Create the `middlewhere-admins` system group idempotently. The daemon
+/// group-owns its control socket to this group and both systemd units list it
+/// under `SupplementaryGroups=`, so it must exist before the unit starts.
+/// Mirrors [`ensure_service_user`]: getent-guarded, and a lost `groupadd` race
+/// (exit 9 = "group already in use") is treated as success.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_admins_group() -> Result<()> {
+    let group = crate::installer::ADMIN_GROUP;
+    let exists = Command::new("getent")
+        .arg("group")
+        .arg(group)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if exists {
+        return Ok(());
+    }
+    let status = Command::new("groupadd")
+        .args(["--system", group])
+        .status()
+        .context("run groupadd")?;
+    // exit 9 == "group name already in use": lost a race with getent (or a
+    // concurrent init). Idempotent, not an error.
+    if !status.success() && status.code() != Some(9) {
+        bail!("groupadd {group} failed (exit {:?})", status.code());
+    }
+    println!("Created system group {group}");
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ensure_admins_group() -> Result<()> {
+    Ok(())
+}
+
+/// Add the human operator (`$SUDO_USER` — whoever ran `sudo mwsqlctl init`) to
+/// `middlewhere-admins` so they can drive the control channel without sudo. Run
+/// as raw root (`operator` is `None`) it prints the manual command instead.
+/// Either way the operator must re-login for the new group to take effect.
+#[cfg(target_os = "linux")]
+pub(crate) fn add_operator_to_admins(operator: Option<&str>) -> Result<()> {
+    let group = crate::installer::ADMIN_GROUP;
+    match operator {
+        Some(user) => {
+            let status = Command::new("usermod")
+                .args(["-aG", group, user])
+                .status()
+                .context("run usermod")?;
+            if !status.success() {
+                bail!(
+                    "usermod -aG {group} {user} failed (exit {:?})",
+                    status.code()
+                );
+            }
+            println!("Added {user} to {group} — log out and back in for it to take effect.");
+        }
+        None => {
+            println!(
+                "\nRan as root with no SUDO_USER, so no login account was added to \
+                 {group}.\nTo reach the control channel without sudo, run then re-login:\n  \
+                 sudo usermod -aG {group} <your-user>"
+            );
+        }
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn add_operator_to_admins(_operator: Option<&str>) -> Result<()> {
     Ok(())
 }
 
@@ -429,8 +636,11 @@ pub(crate) fn restart_service(name: &str) -> Result<()> {
         run_cmd("systemctl", &["restart", name])?;
         println!("Restarted {name} to apply the new configuration.");
     } else if cfg!(windows) && is_admin() {
-        // sc.exe has no atomic restart; stop (ignore "not running") then start.
+        // sc.exe has no atomic restart; stop (ignore "not running"), wait for the
+        // service to actually exit, then start — `sc stop` only signals a stop, so
+        // starting immediately races the pending stop ("service is stopping").
         let _ = Command::new("sc.exe").args(["stop", name]).status();
+        wait_for_service_stopped(name);
         run_cmd("sc.exe", &["start", name])?;
         println!("Restarted {name} to apply the new configuration.");
     }
@@ -490,6 +700,9 @@ pub(crate) fn uninstall_service(service_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Locale-independent service-state code from `sc query`: 1 = STOPPED.
+const SERVICE_STATE_STOPPED: u32 = 1;
+
 /// Poll until the service reports STOPPED or no longer exists (bounded, ~7.5s).
 /// Used after `sc.exe stop` so the daemon has released its file handles on the
 /// state dir before we delete the service and remove that dir. Compiled on all
@@ -502,12 +715,32 @@ fn wait_for_service_stopped(service_name: &str) {
         {
             // Non-zero exit means the service is already gone.
             Ok(o) if !o.status.success() => return,
-            Ok(o) if String::from_utf8_lossy(&o.stdout).contains("STOPPED") => return,
+            Ok(o)
+                if parse_sc_state(&String::from_utf8_lossy(&o.stdout))
+                    == Some(SERVICE_STATE_STOPPED) =>
+            {
+                return
+            }
             Ok(_) => {}
             Err(_) => return,
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+}
+
+/// Parse the numeric service-state code from `sc query` stdout. The state line
+/// reads `STATE : <N>  <WORD>`; `N` is a stable code (1 = STOPPED, 4 = RUNNING)
+/// while `<WORD>` is *localized* on non-English Windows — so match the number,
+/// not the word (the old `contains("STOPPED")` never fired on a localized box and
+/// burned the full poll timeout). Returns None when no state line is present.
+fn parse_sc_state(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        if !label.trim().eq_ignore_ascii_case("STATE") {
+            return None;
+        }
+        value.split_whitespace().next()?.parse::<u32>().ok()
+    })
 }
 
 pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
@@ -570,5 +803,157 @@ mod tests {
         // The subcommand is a parameter, not hardcoded.
         let wiz = build_sudo_argv(&me, "wizard", &fwd);
         assert_eq!(wiz[2], OsString::from("wizard"));
+    }
+
+    #[test]
+    fn ps_single_quote_handles_quotes_spaces_and_empty() {
+        assert_eq!(ps_single_quote(""), "''");
+        assert_eq!(ps_single_quote("plain"), "'plain'");
+        assert_eq!(ps_single_quote("my db"), "'my db'");
+        assert_eq!(ps_single_quote("it's"), "'it''s'");
+        assert_eq!(ps_single_quote("a'b'c"), "'a''b''c'");
+    }
+
+    #[test]
+    fn gate_requires_stdin_terminal_only() {
+        // Redirected stdout is fine (the parent mirrors output back); only a piped
+        // stdin — which can't reach the elevated child — blocks the relaunch.
+        assert!(can_relaunch_elevated(true));
+        assert!(!can_relaunch_elevated(false));
+    }
+
+    #[test]
+    fn powershell_path_is_absolute_under_system32() {
+        let p = windows_powershell_path();
+        assert!(
+            p.ends_with(r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "must be the absolute System32 powershell, got {p}"
+        );
+        assert!(
+            p.contains(":\\"),
+            "must be an absolute path (drive-rooted), got {p}"
+        );
+    }
+
+    #[test]
+    fn decode_child_output_handles_utf16_utf8_bom_and_empty() {
+        // F1: WinPS 5.1 writes UTF-16LE + BOM; the old read_to_string dropped it.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for u in "tok-42".encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_child_output(&utf16), "tok-42");
+        assert_eq!(decode_child_output(b"plain utf8"), "plain utf8");
+        assert_eq!(decode_child_output(b"\xEF\xBB\xBFwith-bom"), "with-bom");
+        assert_eq!(decode_child_output(b""), "");
+        // PowerShell's `1>` rewrites the child's \n as \r\n; undo it so a captured
+        // token isn't left with a trailing CR.
+        let mut crlf = vec![0xFF, 0xFE];
+        for u in "tok\r\n".encode_utf16() {
+            crlf.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_child_output(&crlf), "tok\n");
+    }
+
+    #[test]
+    fn encode_powershell_command_is_base64_utf16le() {
+        // "AB" as UTF-16LE = 41 00 42 00; base64 of that is "QQBCAA==".
+        assert_eq!(encode_powershell_command("AB"), "QQBCAA==");
+    }
+
+    #[test]
+    fn inner_script_quotes_args_creates_files_and_guards_exit() {
+        let out = Path::new("C:\\Temp\\e.out");
+        let err = Path::new("C:\\Temp\\e.err");
+        let args = vec![
+            "grant".to_string(),
+            "--database".to_string(),
+            "my db".to_string(),
+        ];
+        let s = build_inner_script("C:\\Program Files\\mw\\mwsqlctl.exe", &args, out, err);
+        // A space-containing arg stays one single-quoted token.
+        assert!(
+            s.contains("'my db'"),
+            "arg with space must stay one token:\n{s}"
+        );
+        // CreateNew defeats a pre-planted symlink at the redirect target.
+        assert!(
+            s.contains("[IO.FileMode]::CreateNew"),
+            "must create with CreateNew"
+        );
+        assert!(
+            s.contains("1> ") && s.contains("2> "),
+            "redirects both streams"
+        );
+        // F6: a child that never launched reports failure, not exit 0.
+        assert!(
+            s.contains("if ($null -eq $code) { $code = 1 }"),
+            "null exit guard"
+        );
+        assert!(s.contains("catch"), "launch failure is caught");
+        assert!(s.contains("exit $code"));
+    }
+
+    #[test]
+    fn outer_script_uses_encodedcommand_waits_and_guards() {
+        let s = build_outer_script("QQBCAA==");
+        assert!(
+            s.contains("-EncodedCommand"),
+            "child gets one opaque encoded arg"
+        );
+        assert!(
+            s.contains("'QQBCAA=='"),
+            "encoded inner is a single quoted token"
+        );
+        assert!(s.contains("-Verb RunAs") && s.contains("-Wait") && s.contains("-PassThru"));
+        // R3-F3: the elevated child is the absolute System32 powershell, not a
+        // bare name that could resolve to a planted binary.
+        assert!(
+            s.contains(r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "must launch the absolute powershell path:\n{s}"
+        );
+        assert!(s.contains("$p.ExitCode"), "mirrors child exit code");
+        assert!(
+            s.contains("if ($null -eq $code) { $code = 1 }"),
+            "null exit guard"
+        );
+        assert!(
+            s.contains(&ELEVATION_CANCELLED.to_string()),
+            "cancel sentinel present"
+        );
+    }
+
+    #[test]
+    fn non_interactive_elevate_returns_err_not_ok() {
+        // R-F2: with no terminal to confirm the sudo re-exec, elevate must FAIL
+        // (non-zero) rather than report success having seeded/installed nothing —
+        // otherwise a CI/Ansible/Docker `init` "succeeds" then trips on the next
+        // command against an unconfigured state dir. `cargo test` runs with a
+        // non-terminal stdin, so this hits the no-tty branch; skip if a runner
+        // happens to attach a TTY (that branch needs none of this).
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        assert!(
+            elevate_or_print("init", &[], "needs root").is_err(),
+            "non-interactive elevate must return Err, not a no-op Ok"
+        );
+    }
+
+    #[test]
+    fn parse_sc_state_reads_numeric_code_regardless_of_locale() {
+        // R-F5: match the numeric STATE code, not the localized word.
+        let running = "SERVICE_NAME: mwsqld\n    TYPE               : 10  WIN32_OWN_PROCESS\n    STATE              : 4  RUNNING\n";
+        let stopped = "    STATE              : 1  STOPPED\n";
+        // Same code, German word — still parses as stopped (the whole point).
+        let stopped_localized = "    STATE              : 1  BEENDET\n";
+        assert_eq!(parse_sc_state(running), Some(4));
+        assert_eq!(parse_sc_state(stopped), Some(SERVICE_STATE_STOPPED));
+        assert_eq!(
+            parse_sc_state(stopped_localized),
+            Some(SERVICE_STATE_STOPPED),
+            "a localized state word must still parse as stopped by its code"
+        );
+        assert_eq!(parse_sc_state("no state line here"), None);
     }
 }

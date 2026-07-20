@@ -1,19 +1,5 @@
-//! Load → mutate → save harness. Used by every CRUD subcommand so the
-//! atomic-write + validation + backup behaviour is enforced uniformly.
+//! Load → mutate → save harness. Promoted to [`mw_core::state::with_config`] so
+//! the daemon shares one implementation; re-exported here for the CLI's
+//! existing `crate::store::with_config` call sites.
 
-use std::path::Path;
-
-use anyhow::Result;
-
-use mw_core::config::Config;
-use mw_core::state::{load_config, save_config, KeystoreChoice};
-
-pub fn with_config<F, R>(state_dir: &Path, ks: &KeystoreChoice, mutate: F) -> Result<R>
-where
-    F: FnOnce(&mut Config) -> Result<R>,
-{
-    let mut cfg = load_config(state_dir, ks)?;
-    let out = mutate(&mut cfg)?;
-    save_config(state_dir, ks, &cfg)?;
-    Ok(out)
-}
+pub use mw_core::state::with_config;

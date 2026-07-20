@@ -31,14 +31,31 @@ clap.workspace = true
 tracing-appender.workspace = true
 rand.workspace = true
 
+# Peer-credential authz on the control channel (SO_PEERCRED/getpeereid,
+# getpwuid/getgrnam group resolution) + the Unix-domain control socket.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+# Named-pipe peer authz (ImpersonateNamedPipeClient + CheckTokenMembership) and
+# the explicit-DACL pipe security descriptor for the control channel.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` powers the reaper's paused-time tests (start_paused + advance).
+# Declared here rather than relied on via workspace feature unification.
+tokio = { workspace = true, features = ["test-util"] }
 mysql_async.workspace = true
 tokio-postgres.workspace = true
 russh.workspace = true

@@ -103,13 +103,13 @@ async fn pg_bind_shutdown_no_backend() {
     let ks = build_pg_state(tmp.path(), "pg_env", port, None);
 
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false, ks)
         .await
         .unwrap();
-    assert_eq!(daemon.bound.len(), 1);
+    assert_eq!(daemon.env_count().await, 1);
 
     let (tx, rx) = broadcast::channel(1);
-    let h = tokio::spawn(daemon.run(rx));
+    let h = tokio::spawn(std::sync::Arc::new(daemon).run(rx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), h)
@@ -129,11 +129,11 @@ async fn pg_end_to_end_through_real_backend() {
     let port = pick_free_port().await;
     let ks = build_pg_state(tmp.path(), "pg_env", port, Some(&url));
     let cfg = mwsqld::load_config(tmp.path(), &ks).unwrap();
-    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false)
+    let daemon = Daemon::bind(tmp.path().to_path_buf(), &cfg, "127.0.0.1", false, ks)
         .await
         .unwrap();
     let (tx, rx) = broadcast::channel(1);
-    let h = tokio::spawn(daemon.run(rx));
+    let h = tokio::spawn(std::sync::Arc::new(daemon).run(rx));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Happy path: connect with the env name as user and the token as

@@ -107,6 +107,25 @@ impl MasterKeyStore for FileStore {
     fn load(&self) -> Result<MasterKey, KeyringError> {
         match std::fs::read(&self.path) {
             Ok(bytes) => {
+                // A key file widened by a backup/restore or a misconfigured
+                // deployment should not be trusted silently. Warn, don't
+                // refuse: refusing would brick a running deployment on the
+                // exact restore path where the operator most needs it up.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(md) = std::fs::metadata(&self.path) {
+                        let wide = md.permissions().mode() & 0o077;
+                        if wide != 0 {
+                            tracing::warn!(
+                                path = %self.path.display(),
+                                mode = format!("{:o}", md.permissions().mode() & 0o777),
+                                "master key file is group/world accessible - \
+                                 chmod it to 0400 and rotate if exposure is possible"
+                            );
+                        }
+                    }
+                }
                 let arr: [u8; KEY_LEN] = bytes
                     .as_slice()
                     .try_into()
@@ -151,7 +170,9 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // NTFS ACLs are the real defense here; FileStore on Windows is a fallback
-    // path mostly for tests. Production Windows installs use OsStore (DPAPI).
+    // The file inherits the state dir's ACL, which the Windows install script
+    // locks to the service account + Administrators. Deliberately NOT set here:
+    // this crate does not know the service principal, so any ACL it applied
+    // would drop the daemon's own access to the key. See create_dir_secure.
     std::fs::write(path, bytes)
 }

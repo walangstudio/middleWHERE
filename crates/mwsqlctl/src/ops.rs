@@ -57,27 +57,58 @@ pub struct BastionInput {
     pub fingerprints: Vec<String>,
 }
 
-pub fn add_bastion(t: Target, input: BastionInput) -> Result<()> {
-    let auth = if let Some(path) = &input.key_file {
+/// Only one pinned key per bastion is wired end to end today: the mutation and
+/// the control DTO both carry a single fingerprint. Accepting several and
+/// keeping `.first()` would silently drop the rest, and the drop only surfaces
+/// much later as a hard connection refusal when the unpinned host answers.
+pub fn single_fingerprint(fingerprints: &[String]) -> Result<Option<HostKeyFingerprint>> {
+    if fingerprints.len() > 1 {
+        bail!(
+            "only one --fingerprint is supported per bastion (got {}); \
+             pin the key the bastion presents today",
+            fingerprints.len()
+        );
+    }
+    fingerprints
+        .first()
+        .map(|s| parse_fingerprint(s))
+        .transpose()
+}
+
+/// Resolve a bastion's auth secret in-process: read the PEM key file (prompting
+/// for a passphrase) or prompt for the SSH password. Shared by the offline
+/// [`add_bastion`] and the online control-channel path so both prompt
+/// identically before the secret is sealed / sent.
+pub fn resolve_bastion_auth(input: &BastionInput) -> Result<bastion::BastionAuthInput> {
+    if let Some(path) = &input.key_file {
+        // The key is validated, sealed, and stored, but the daemon cannot USE
+        // it yet (mw-net's BastionSession only speaks password auth until
+        // Phase 7b). Storing silently would strand the operator at first
+        // connect with no hint of why.
+        eprintln!(
+            "warning: SSH key auth is stored but NOT functional yet - every \
+             connection through this bastion will fail until key auth ships; \
+             use password auth for a working tunnel"
+        );
         let pem = std::fs::read(path).with_context(|| format!("read key {}", path.display()))?;
         let passphrase = if read_yes_no("key has a passphrase? [y/N]: ")? {
             Some(SecretStr::new(read_secret("key passphrase: ", false)?))
         } else {
             None
         };
-        bastion::BastionAuthInput::Key {
+        Ok(bastion::BastionAuthInput::Key {
             pem: SecretBytes::new(pem),
             passphrase,
-        }
+        })
     } else {
         let pw = read_secret("bastion password: ", input.password_stdin)?;
-        bastion::BastionAuthInput::Password(SecretStr::new(pw))
-    };
-    let fingerprint = input
-        .fingerprints
-        .first()
-        .map(|s| parse_fingerprint(s))
-        .transpose()?;
+        Ok(bastion::BastionAuthInput::Password(SecretStr::new(pw)))
+    }
+}
+
+pub fn add_bastion(t: Target, input: BastionInput) -> Result<()> {
+    let auth = resolve_bastion_auth(&input)?;
+    let fingerprint = single_fingerprint(&input.fingerprints)?;
     bastion::add(
         t.state_dir,
         t.ks,
@@ -100,6 +131,70 @@ pub fn add_credential(t: Target, name: &str, user: &str, password_stdin: bool) -
 pub fn rotate_credential(t: Target, name: &str, password_stdin: bool) -> Result<()> {
     let pw = read_secret("new backend password: ", password_stdin)?;
     cred::rotate(t.state_dir, t.ks, name, SecretStr::new(pw))
+}
+
+/// A backend connection string, split into the pieces `env add` needs.
+/// Everything a hosted database hands you (Supabase, Neon, RDS, a
+/// docker-compose file) is already in this shape, so accepting it directly
+/// saves inventing a credential name and retyping five flags.
+#[derive(Debug)]
+pub struct ParsedUrl {
+    pub engine: EngineKind,
+    pub host: String,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub db_user: String,
+    /// Present only when the URL carried one. Prompted for otherwise, which is
+    /// the better habit: a password in the URL lands in shell history and, on
+    /// most systems, the process table.
+    pub password: Option<SecretStr>,
+}
+
+/// Parse `postgres://user:pass@host:5432/db` (or `mysql://…`) into env fields.
+/// Percent-encoded userinfo is decoded, so a password with `@` or `/` in it
+/// survives the round trip.
+pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
+    let url = url::Url::parse(raw).with_context(|| format!("parse connection url {raw:?}"))?;
+    let engine = match url.scheme() {
+        "postgres" | "postgresql" => EngineKind::Postgres,
+        "mysql" | "mariadb" => EngineKind::MySql,
+        other => bail!(
+            "unsupported url scheme {other:?}; use postgres:// or mysql:// \
+             (mssql is not implemented yet)"
+        ),
+    };
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("connection url has no host"))?
+        .to_string();
+    let db_user = percent_decode(url.username());
+    if db_user.is_empty() {
+        bail!(
+            "connection url has no username; add one (postgres://<user>@host/db) \
+             or use --credential to reuse a login you already added"
+        );
+    }
+    let database = match url.path().trim_start_matches('/') {
+        "" => None,
+        db => Some(percent_decode(db)),
+    };
+    Ok(ParsedUrl {
+        engine,
+        host,
+        port: url.port(),
+        database,
+        db_user,
+        password: url.password().map(|p| SecretStr::new(percent_decode(p))),
+    })
+}
+
+/// `url` only percent-decodes lazily, and its decoder yields bytes; userinfo is
+/// UTF-8 in practice, so a lossy decode is enough and cannot fail on input.
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// Non-secret inputs for adding an env. `backend_port` defaults to the engine's
@@ -252,6 +347,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_connection_url_splits_a_postgres_url() {
+        let p = parse_connection_url("postgresql://appuser@db.internal:5432/app").unwrap();
+        assert!(matches!(p.engine, EngineKind::Postgres));
+        assert_eq!(p.host, "db.internal");
+        assert_eq!(p.port, Some(5432));
+        assert_eq!(p.database.as_deref(), Some("app"));
+        assert_eq!(p.db_user, "appuser");
+        assert!(p.password.is_none(), "no password means prompt for one");
+    }
+
+    /// The reason this uses a real url parser: a password with reserved
+    /// characters must survive, or the daemon authenticates with the wrong one.
+    #[test]
+    fn parse_connection_url_decodes_percent_encoded_userinfo() {
+        let p = parse_connection_url("mysql://a%40b:p%2Fw%40rd@h:3307/d").unwrap();
+        assert!(matches!(p.engine, EngineKind::MySql));
+        assert_eq!(p.db_user, "a@b");
+        assert_eq!(p.password.unwrap().expose(), "p/w@rd");
+        assert_eq!(p.port, Some(3307));
+    }
+
+    #[test]
+    fn parse_connection_url_defaults_and_rejections() {
+        // No port and no database: both optional, filled in downstream.
+        let p = parse_connection_url("mysql://u@h").unwrap();
+        assert_eq!(p.port, None);
+        assert_eq!(p.database, None);
+
+        for (raw, want) in [
+            ("mssql://u@h/d", "unsupported url scheme"),
+            ("postgres://h/d", "no username"),
+            ("not a url", "parse connection url"),
+        ] {
+            let err = parse_connection_url(raw).unwrap_err().to_string();
+            assert!(err.contains(want), "{raw}: got {err}");
+        }
+    }
+
+    /// Silently keeping only the first pin is the dangerous outcome: the drop
+    /// surfaces later as an unexplained connection refusal.
+    #[test]
+    fn single_fingerprint_rejects_a_second_pin() {
+        assert!(single_fingerprint(&[]).unwrap().is_none());
+
+        let one = ["ssh-ed25519:AAAA".to_string()];
+        assert_eq!(
+            single_fingerprint(&one).unwrap().unwrap().sha256_b64,
+            "AAAA"
+        );
+
+        let two = [
+            "ssh-ed25519:AAAA".to_string(),
+            "ssh-ed25519:BBBB".to_string(),
+        ];
+        let err = single_fingerprint(&two).unwrap_err().to_string();
+        assert!(err.contains("only one --fingerprint"), "{err}");
+    }
+
+    #[test]
     fn is_initialized_tracks_init() {
         let (tmp, ks) = target_dir();
         let t = Target::new(tmp.path(), &ks);
@@ -320,6 +474,17 @@ mod tests {
         assert_eq!(envs[0].bastion.as_deref(), Some("jump"));
         // default backend port followed the engine.
         assert_eq!(envs[0].backend, "db:3306");
+
+        // Single-unseal path (what the wizard's "show current" uses): all three
+        // lists built from one loaded config match the per-list unseals.
+        let cfg = mw_core::state::load_config(tmp.path(), &ks).unwrap();
+        let (br, cr, er) = (bastion::rows(&cfg), cred::rows(&cfg), envs::rows(&cfg));
+        assert_eq!(br.len(), 1);
+        assert_eq!(br[0].name, "jump");
+        assert_eq!(cr.len(), 1);
+        assert_eq!(cr[0].name, "ro");
+        assert_eq!(er.len(), 1);
+        assert_eq!(er[0].name, "stage");
     }
 
     #[test]

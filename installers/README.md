@@ -35,12 +35,14 @@ owned by it at mode 0700. The unit also applies the standard sandbox
 `SystemCallFilter=@system-service`, `MemoryDenyWriteExecute`, ...). Only high
 ports (≥6033) are bound, so no capabilities are needed.
 
+    sudo groupadd --system middlewhere-admins   # required: the unit lists it in SupplementaryGroups
     sudo install -m0644 mwsqld.service /etc/systemd/system/mwsqld.service
     sudo systemctl daemon-reload
-    sudo systemctl start mwsqld        # creates StateDirectory
+    sudo systemctl start mwsqld        # creates StateDirectory + RuntimeDirectory
     sudo /usr/local/bin/mwsqld --state-dir /var/lib/middlewhere --file-keystore init
     # add bastions/creds/envs with mwsqlctl against the same state dir, then:
     sudo systemctl enable --now mwsqld
+    sudo usermod -aG middlewhere-admins "$USER"   # reach the control socket without sudo; re-login to apply
 
 ## macOS (launchd)
 

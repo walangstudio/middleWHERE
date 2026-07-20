@@ -168,6 +168,79 @@ pub fn resolve_cli_target(
     user: bool,
     file_keystore: bool,
 ) -> (PathBuf, KeystoreChoice) {
+    resolve_target(state_dir, user, file_keystore, true)
+}
+
+/// Resolve for **installing a fresh system service** (`init`, service install).
+/// Same rules as [`resolve_cli_target`] except it never adopts a v0.2.x per-user
+/// deployment: the service runs as its own account (LocalSystem / a service
+/// user) and cannot reach the installing user's OS keychain to unseal a
+/// per-user config, so adopting it would register a service that fails every
+/// start. When a legacy per-user config is present it is left untouched and only
+/// noted, and a fresh system config is seeded instead.
+pub fn resolve_service_install_target(
+    state_dir: Option<PathBuf>,
+    user: bool,
+    file_keystore: bool,
+) -> (PathBuf, KeystoreChoice) {
+    resolve_target(state_dir, user, file_keystore, false)
+}
+
+fn resolve_target(
+    state_dir: Option<PathBuf>,
+    user: bool,
+    file_keystore: bool,
+    allow_legacy_fallback: bool,
+) -> (PathBuf, KeystoreChoice) {
+    // Upgrade guard for v0.2.x, whose flagless default was the per-user dir. This
+    // branch flips the flagless default to the system dir + file keystore, so
+    // without this a flagless read/config invocation over an existing per-user
+    // install would read an empty system store (envs/creds appear to vanish).
+    // When no explicit target is given and only the legacy per-user dir already
+    // holds a sealed config, stay on it and point the user at the new default.
+    // The install path (`allow_legacy_fallback = false`) must NOT adopt it —
+    // see `resolve_service_install_target` — so it only notes the legacy dir and
+    // seeds a fresh system config.
+    if state_dir.is_none() && !user {
+        let system = default_state_dir();
+        let legacy = default_user_state_dir();
+        if should_use_legacy_user_dir(
+            &system,
+            system.join(CONFIG_FILE_NAME).exists(),
+            &legacy,
+            legacy.join(CONFIG_FILE_NAME).exists(),
+        ) {
+            if allow_legacy_fallback {
+                eprintln!(
+                    "warning: using legacy per-user state dir {} (the v0.2.x \
+                     default); the default is now {}. Pass --user or --state-dir \
+                     {} to pin it, or move config.sealed into the system dir to \
+                     adopt the new default.",
+                    legacy.display(),
+                    system.display(),
+                    legacy.display(),
+                );
+                // Pick the keystore the legacy deployment used: `master.key`
+                // present means the file store, its absence means the OS keychain
+                // that v0.2.x defaulted to.
+                let ks = if legacy.join(FILE_MASTER_KEY_NAME).exists() {
+                    KeystoreChoice::default_file(&legacy)
+                } else {
+                    KeystoreChoice::default_os()
+                };
+                return (legacy, ks);
+            }
+            eprintln!(
+                "note: detected an existing per-user deployment at {}; leaving it \
+                 untouched and seeding a fresh system service config at {}. Its \
+                 envs/credentials will not carry over — re-add them, or run with \
+                 --user to keep using the per-user deployment.",
+                legacy.display(),
+                system.display(),
+            );
+        }
+    }
+
     let dir = state_dir.unwrap_or_else(|| {
         if user {
             default_user_state_dir()
@@ -183,13 +256,28 @@ pub fn resolve_cli_target(
     (dir, ks)
 }
 
+/// Pure core of the [`resolve_cli_target`] legacy-dir fallback, split out so the
+/// decision is unit-testable without touching real system paths (the system dir
+/// is unwritable in tests and, on Linux, not even env-overridable). A flagless
+/// invocation should stay on the legacy per-user dir only when it, and not the
+/// new system dir, already holds a sealed config — and never when the two
+/// resolve to the same path (no home dir), which would just warn about itself.
+fn should_use_legacy_user_dir(
+    system_dir: &Path,
+    system_has_config: bool,
+    legacy_dir: &Path,
+    legacy_has_config: bool,
+) -> bool {
+    legacy_dir != system_dir && !system_has_config && legacy_has_config
+}
+
 /// First-time setup: state dirs, fresh master key in the chosen keystore,
 /// sealed empty `Config`. Refuses to overwrite an existing sealed blob.
 // Create a directory (and parents) and lock it to the owner. On a
 // permission-denied — the common case when the default state dir lives under
 // /var/lib and init was run unprivileged — translate the raw OS error into an
 // actionable hint instead of a bare "Permission denied".
-fn create_dir_secure(dir: &Path) -> Result<()> {
+pub(crate) fn create_dir_secure(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             anyhow!(
@@ -207,6 +295,13 @@ fn create_dir_secure(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("lock {} to 0700", dir.display()))?;
     }
+    // No Windows branch on purpose. Locking the DACL here needs the principal
+    // set for the deployment - above all the service account the daemon runs as
+    // (`NT SERVICE\<svc>`), which this crate has no way to know. Setting an
+    // owner-only ACL from here strips the installer's inherited grant and the
+    // service can never read its own master key. The Windows install script
+    // (installers/windows/install-service.ps1) owns this lock; it knows the
+    // account because it just created the service.
     Ok(())
 }
 
@@ -261,6 +356,19 @@ pub fn save_config(state_dir: &Path, keystore: &KeystoreChoice, cfg: &Config) ->
     }
     write_atomic(&sealed, &blob)?;
     Ok(())
+}
+
+/// Load → mutate → save harness. Every config-touching mutation funnels through
+/// this so the atomic-write + validation + backup behaviour is enforced
+/// uniformly, whether it runs offline in the CLI or online in the daemon.
+pub fn with_config<F, R>(state_dir: &Path, keystore: &KeystoreChoice, mutate: F) -> Result<R>
+where
+    F: FnOnce(&mut Config) -> Result<R>,
+{
+    let mut cfg = load_config(state_dir, keystore)?;
+    let out = mutate(&mut cfg)?;
+    save_config(state_dir, keystore, &cfg)?;
+    Ok(out)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -393,27 +501,104 @@ mod tests {
         }
     }
 
+    // Point the per-user dir at `dir` for the platform whose env
+    // `default_user_state_dir` consults, returning (key, previous) to restore.
+    fn set_user_dir_env(dir: &Path) -> (&'static str, Option<std::ffi::OsString>) {
+        #[cfg(windows)]
+        let key = "LOCALAPPDATA";
+        #[cfg(target_os = "macos")]
+        let key = "HOME";
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let key = "XDG_STATE_HOME";
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, dir);
+        (key, prev)
+    }
+
     #[test]
     fn resolve_target_is_service_first() {
         let _g = env_lock();
-        // Flagless: service dir + file keystore.
+        // Empty per-user dir so the legacy-deployment fallback (which stats
+        // config.sealed there) can't fire on a box that has a real v0.2.x install.
+        let tmp = TempDir::new().unwrap();
+        let (key, prev) = set_user_dir_env(tmp.path());
+
         let (dir, ks) = resolve_cli_target(None, false, false);
-        assert_eq!(dir, default_state_dir());
-        assert!(matches!(ks, KeystoreChoice::File { .. }));
-
-        // --user: per-user dir + OS keychain.
         let (udir, uks) = resolve_cli_target(None, true, false);
-        assert_eq!(udir, default_user_state_dir());
-        assert!(matches!(uks, KeystoreChoice::Os { .. }));
-
-        // --user --file-keystore: per-user dir but file keystore.
         let (_, fks) = resolve_cli_target(None, true, true);
-        assert!(matches!(fks, KeystoreChoice::File { .. }));
-
-        // Explicit --state-dir wins over the mode default.
         let custom = PathBuf::from("/srv/mw");
         let (cdir, _) = resolve_cli_target(Some(custom.clone()), false, false);
+
+        let want_service = default_state_dir();
+        let want_user = default_user_state_dir();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        // Flagless: service dir + file keystore.
+        assert_eq!(dir, want_service);
+        assert!(matches!(ks, KeystoreChoice::File { .. }));
+        // --user: per-user dir + OS keychain.
+        assert_eq!(udir, want_user);
+        assert!(matches!(uks, KeystoreChoice::Os { .. }));
+        // --user --file-keystore: per-user dir but file keystore.
+        assert!(matches!(fks, KeystoreChoice::File { .. }));
+        // Explicit --state-dir wins over the mode default.
         assert_eq!(cdir, custom);
+    }
+
+    #[test]
+    fn legacy_user_dir_fallback_decision() {
+        let sys = Path::new("/system");
+        let legacy = Path::new("/legacy");
+        // Only the legacy dir has a sealed config: fall back to it.
+        assert!(should_use_legacy_user_dir(sys, false, legacy, true));
+        // System already seeded (migrated): never fall back.
+        assert!(!should_use_legacy_user_dir(sys, true, legacy, true));
+        // Fresh install, nothing anywhere.
+        assert!(!should_use_legacy_user_dir(sys, false, legacy, false));
+        // Only the system dir has config.
+        assert!(!should_use_legacy_user_dir(sys, true, legacy, false));
+        // No home resolved: dirs coincide, don't warn about self.
+        assert!(!should_use_legacy_user_dir(sys, false, sys, true));
+    }
+
+    // Drives the real fallback end-to-end. Only Linux lets us keep the system
+    // dir empty without root (it is the hardcoded /var/lib/middlewhere, assumed
+    // absent in CI) while overriding the per-user dir via XDG_STATE_HOME.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn flagless_falls_back_to_legacy_user_deployment() {
+        let _g = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let (key, prev) = set_user_dir_env(tmp.path());
+        let legacy = default_user_state_dir();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(CONFIG_FILE_NAME), b"sealed").unwrap();
+
+        // No master.key -> OS keychain (v0.2.x flagless default).
+        let (os_dir, os_ks) = resolve_cli_target(None, false, false);
+        // Same inputs, install intent: must NOT adopt the legacy dir.
+        let (install_dir, install_ks) = resolve_service_install_target(None, false, false);
+        // master.key present -> file store (v0.2.x --file-keystore deployment).
+        std::fs::write(legacy.join(FILE_MASTER_KEY_NAME), b"k").unwrap();
+        let (file_dir, file_ks) = resolve_cli_target(None, false, false);
+
+        let system = default_state_dir();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        // Read/config path adopts the legacy deployment (finding 4).
+        assert_eq!(os_dir, legacy);
+        assert!(matches!(os_ks, KeystoreChoice::Os { .. }));
+        assert_eq!(file_dir, legacy);
+        assert!(matches!(file_ks, KeystoreChoice::File { .. }));
+        // Install path seeds a fresh system config instead (finding F3).
+        assert_eq!(install_dir, system);
+        assert!(matches!(install_ks, KeystoreChoice::File { .. }));
     }
 
     #[test]
