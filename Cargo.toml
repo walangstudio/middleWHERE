@@ -52,7 +52,7 @@ mysql_common   = { version = "0.37", default-features = false }
 deadpool       = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 sqlparser      = { version = "0.52", features = ["visitor"] }
 async-trait    = "0.1"
-russh          = "0.60"
+russh          = "0.61"
 base64         = "0.22"
 
 [profile.release]
