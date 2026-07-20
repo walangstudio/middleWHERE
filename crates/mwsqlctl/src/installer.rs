@@ -92,6 +92,84 @@ WantedBy=multi-user.target
     )
 }
 
+/// systemd unit bound to a **fixed** system user (`User={svc}`) that the
+/// installer creates and that owns the state dir. Unlike [`systemd_unit`]'s
+/// `DynamicUser`, the identity and ownership are stable, so "seed the config as
+/// root, then `enable --now`" is predictable and inspectable with `ls -l` — the
+/// model the wizard uses. Same sandbox; `ReadWritePaths` grants write to the
+/// state dir under `ProtectSystem=strict`.
+pub fn systemd_unit_fixed_user(p: &InstallParams) -> String {
+    format!(
+        r#"[Unit]
+Description=middleWHERE secure SQL gateway daemon ({svc})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exe} run --state-dir {state} --file-keystore
+Restart=on-failure
+RestartSec=5
+
+# --- dedicated unprivileged identity (created by the installer/wizard) ---
+User={svc}
+Group={svc}
+ReadWritePaths={state}
+UMask=0077
+
+# --- sandbox ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        svc = p.service_name,
+        exe = p.exec_path,
+        state = p.state_dir,
+    )
+}
+
+/// Operator steps for the fixed-user systemd unit. The wizard runs the
+/// equivalent itself when elevated; this is the copy-paste fallback when the
+/// operator declines elevation or runs on a host the wizard can't drive.
+pub fn linux_operator_steps_fixed_user(p: &InstallParams) -> String {
+    format!(
+        r#"# Linux (systemd) — run as root:
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin {svc} 2>/dev/null || true
+sudo {exe} --state-dir {state} --file-keystore init   # if not yet initialized
+sudo chown -R {svc}:{svc} {state}
+sudo install -m0644 {svc}.service /etc/systemd/system/{svc}.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now {svc}
+journalctl -u {svc} -f
+"#,
+        svc = p.service_name,
+        exe = p.exec_path,
+        state = p.state_dir
+    )
+}
+
 /// macOS LaunchDaemon plist. Runs as a dedicated `_middlewhere` daemon user
 /// (the operator creates it; see [`macos_account_steps`]).
 pub fn launchd_plist(p: &InstallParams) -> String {
@@ -239,6 +317,70 @@ mod tests {
                 "systemd unit missing {needle:?}\n---\n{u}"
             );
         }
+    }
+
+    #[test]
+    fn systemd_fixed_user_uses_named_account_not_dynamic() {
+        let u = systemd_unit_fixed_user(&params());
+        assert!(u.contains("User=mwsqld"), "missing User=\n{u}");
+        assert!(u.contains("Group=mwsqld"), "missing Group=\n{u}");
+        assert!(
+            u.contains("ReadWritePaths=/var/lib/middlewhere"),
+            "missing ReadWritePaths\n{u}"
+        );
+        assert!(
+            !u.contains("DynamicUser"),
+            "fixed-user unit must not use DynamicUser\n{u}"
+        );
+        assert!(
+            !u.contains("StateDirectory"),
+            "fixed-user unit owns its dir directly, no StateDirectory\n{u}"
+        );
+        // Same hardening sandbox as the dynamic variant.
+        for needle in [
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "CapabilityBoundingSet=",
+            "MemoryDenyWriteExecute=true",
+            "ExecStart=/usr/local/bin/mwsqld run --state-dir /var/lib/middlewhere --file-keystore",
+        ] {
+            assert!(
+                u.contains(needle),
+                "fixed-user unit missing {needle:?}\n{u}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_units_share_the_same_sandbox() {
+        // The hardening sandbox is security-critical and duplicated across the
+        // two unit generators. Assert every sandbox directive in the dynamic
+        // unit also appears in the fixed-user unit, so they can't drift apart.
+        let p = params();
+        let dynamic = systemd_unit(&p);
+        let fixed = systemd_unit_fixed_user(&p);
+        let sandbox = dynamic
+            .split("# --- sandbox ---")
+            .nth(1)
+            .expect("sandbox marker present");
+        for line in sandbox
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('['))
+        {
+            assert!(
+                fixed.contains(line),
+                "fixed-user unit is missing hardening directive {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_user_steps_create_account_and_chown() {
+        let s = linux_operator_steps_fixed_user(&params());
+        assert!(s.contains("useradd --system"));
+        assert!(s.contains("chown -R mwsqld:mwsqld /var/lib/middlewhere"));
+        assert!(s.contains("systemctl enable --now mwsqld"));
     }
 
     #[test]

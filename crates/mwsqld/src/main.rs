@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use mwsqld::{default_user_state_dir, init as init_state, load_config, Daemon, KeystoreChoice};
+use mwsqld::{env_flag, init as init_state, load_config, resolve_cli_target, Daemon};
 
 #[derive(Parser)]
 #[command(
@@ -12,12 +12,20 @@ use mwsqld::{default_user_state_dir, init as init_state, load_config, Daemon, Ke
     about = "middleWHERE secure SQL gateway daemon"
 )]
 struct Cli {
-    /// State directory (config.sealed + audit/).
-    #[arg(long, global = true)]
+    /// State directory (config.sealed + audit/). Defaults to the system
+    /// service dir; `--user` switches to the per-user dir.
+    #[arg(long, global = true, env = "MW_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
+    /// Per-user deployment: store under the home dir and use the OS keychain.
+    /// Without it, the default targets the system service dir + file keystore.
+    /// Also set by MW_USER=1.
+    #[arg(long, global = true)]
+    user: bool,
+
     /// Use a file-backed master key instead of the OS keystore.
-    /// Recommended only for headless Linux without D-Bus.
+    /// Recommended only for headless Linux without D-Bus. Also set by
+    /// MW_FILE_KEYSTORE=1.
     #[arg(long, global = true)]
     file_keystore: bool,
 
@@ -39,11 +47,49 @@ enum Cmd {
         #[arg(long)]
         allow_tofu: bool,
     },
+    /// Probe backend connectivity for one env (or all): open the bastion tunnel
+    /// if any, force one real connect+auth, report, and exit. Reads the sealed
+    /// config from disk; never starts a listener. `mwsqlctl` shells out to this
+    /// to validate a connection at add time.
+    Test {
+        /// Probe this env. Mutually exclusive with --all.
+        #[arg(long, conflicts_with = "all")]
+        env: Option<String>,
+        /// Probe every configured env.
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output: one `{"ok":bool,"env":str,"reason":str}`
+        /// JSON line per env.
+        #[arg(long)]
+        json: bool,
+        /// Accept an unpinned bastion host key (TOFU) during the probe. Without
+        /// it, a bastion with no pinned host key is refused.
+        #[arg(long)]
+        allow_tofu: bool,
+    },
     /// Internal: launched by the Windows Service Control Manager. Not for
     /// interactive use.
     #[cfg(windows)]
     #[command(hide = true)]
     Service,
+}
+
+/// Minimal JSON string escaping for the `test --json` emitter (env names are
+/// already `[a-z0-9_-]`, but a probe reason can carry quotes/newlines).
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 fn main() -> Result<()> {
@@ -56,12 +102,9 @@ fn main() -> Result<()> {
         return mwsqld::winsvc::run();
     }
 
-    let state_dir = cli.state_dir.unwrap_or_else(default_user_state_dir);
-    let keystore = if cli.file_keystore {
-        KeystoreChoice::default_file(&state_dir)
-    } else {
-        KeystoreChoice::default_os()
-    };
+    let user = cli.user || env_flag("MW_USER");
+    let file_keystore = cli.file_keystore || env_flag("MW_FILE_KEYSTORE");
+    let (state_dir, keystore) = resolve_cli_target(cli.state_dir, user, file_keystore);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -90,8 +133,67 @@ fn main() -> Result<()> {
                 });
                 daemon.run(rx).await
             }
+            Cmd::Test {
+                env,
+                all,
+                json,
+                allow_tofu,
+            } => {
+                let which = match (env, all) {
+                    (Some(e), false) => mwsqld::Probe::One(e),
+                    (None, true) => mwsqld::Probe::All,
+                    (None, false) => bail!("specify --env <name> or --all"),
+                    (Some(_), true) => unreachable!("clap conflicts_with prevents this"),
+                };
+                let cfg = load_config(&state_dir, &keystore)?;
+                let results = mwsqld::test_envs(&cfg, which, allow_tofu).await;
+                let mut all_ok = true;
+                for r in &results {
+                    all_ok &= r.ok;
+                    if json {
+                        println!(
+                            "{{\"ok\":{},\"env\":\"{}\",\"reason\":\"{}\"}}",
+                            r.ok,
+                            json_escape(&r.env),
+                            json_escape(&r.reason)
+                        );
+                    } else if r.ok {
+                        println!("OK   {}", r.env);
+                    } else {
+                        println!("ERR  {}  {}", r.env, r.reason);
+                    }
+                }
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                if all_ok {
+                    Ok(())
+                } else {
+                    // Non-zero exit without an extra anyhow error line (the
+                    // per-env output above already says what failed).
+                    std::process::exit(1);
+                }
+            }
             #[cfg(windows)]
             Cmd::Service => unreachable!("handled before runtime"),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // Catches arg-definition conflicts (e.g. a `test` subcommand flag colliding
+    // with a global one, or a stale `conflicts_with` target) at test time.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_and_control_chars() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("line1\nline2"), "line1\\nline2");
+    }
 }

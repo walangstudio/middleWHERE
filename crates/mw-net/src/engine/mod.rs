@@ -68,6 +68,13 @@ pub trait Engine: Send + Sync + 'static {
         max_size: u32,
     ) -> Result<Box<dyn Backend>, EngineError>;
 
+    /// Force one real connect+auth handshake against the backend, then release
+    /// it. The pool is lazy — `build_backend` opens nothing — so this is what
+    /// actually proves the credential / host / bastion path works. Off the hot
+    /// path; used only by `mwsqld test`. The error's `Display` carries the
+    /// underlying reason (auth denied, connection refused, timeout).
+    async fn probe(&self, backend: &dyn Backend) -> Result<(), EngineError>;
+
     /// Post-auth command loop in this engine's wire protocol. Firewalls each
     /// statement, forwards allowed ones, streams results back. Returns when
     /// the client disconnects.

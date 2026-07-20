@@ -45,6 +45,10 @@ impl Engine for MsSqlEngine {
         Err(EngineError::Unsupported)
     }
 
+    async fn probe(&self, _backend: &dyn Backend) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     async fn serve(
         &self,
         _stream: &mut TcpStream,

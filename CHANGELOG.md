@@ -5,6 +5,98 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.3.0] - 2026-06-10
+
+### Added
+
+- **`mwsqlctl init` installs middleWHERE as a managed service in one step.** On
+  Linux it self-elevates with `sudo` (elevate-first, so secrets are only ever
+  entered in the root process — none crosses the sudo boundary; `current_exe()`
+  is absolute, so the binary's extract location is irrelevant), creates the fixed
+  `mwsqld` system user, seeds the sealed config, writes a hardened `User=mwsqld`
+  unit, and runs `systemctl enable --now`. The daemon starts idle. `init` then
+  offers **Configure connections now?** and runs the wizard inline while still
+  elevated. `--user` seeds a per-user config (OS keychain, no service, no
+  elevation) and leaves configuration to you.
+- **`mwsqlctl uninstall` removes a deployment — the inverse of `init`.** Service
+  mode self-elevates, stops and deletes the OS service, then wipes the sealed
+  config, master key (file keystore or OS keychain entry), and audit log;
+  `--user` removes the per-user deployment with no elevation. Destructive and
+  irreversible, so it confirms first and refuses to run unattended unless `--yes`
+  is given. Idempotent: an already-absent service or state dir is reported, not
+  an error.
+- **`mwsqlctl wizard` (alias `setup`) configures an already-installed
+  deployment.** Guided, masked prompts for bastions / credentials / environments,
+  then it restarts the service so the daemon binds the new loopback listeners
+  (the daemon reads config once at startup — there is no hot reload). Re-running
+  offers add-more / show-current. Requires `init` to have run first.
+- A fixed-system-user systemd unit variant (`User=mwsqld` + `ReadWritePaths`)
+  alongside the existing `DynamicUser` one. Ownership is stable and inspectable
+  with `ls -l`, so "seed as root, then `enable --now`" is predictable — the model
+  `init` uses. `install-service` still emits the `DynamicUser` unit.
+- `MW_STATE_DIR`, `MW_FILE_KEYSTORE`, and `MW_USER` environment variables back
+  the corresponding global flags on `mwsqld` / `mwsqlctl`, so a service operator
+  exports them once instead of repeating `--state-dir … --file-keystore`.
+- **Connection validation on add.** Adding an environment now opens the bastion
+  tunnel (if any) and forces a real connect+auth against the backend, so a wrong
+  host / password / unreachable bastion is caught at setup, not at first query.
+  The wizard reports the failure and offers keep / edit & retry / discard; the
+  scripted `mwsqlctl env add` validates by default, keeps the env, and exits
+  non-zero on failure (`--no-validate` skips it). New `mwsqld test --env <name>
+  | --all [--json]` does the probe; new `mwsqlctl env test <env> | --all`
+  re-checks an existing env. The probe lives in the daemon (which already has the
+  SSH + DB stack); `mwsqlctl` shells out to it and stays networking-dependency-free.
+- **Paste-ready connection output.** `env add` / `grant` / the wizard now print a
+  DBeaver-style field list (host / port / database / user / password / SSL off)
+  and a ready-to-use engine URL (`postgresql://…?sslmode=disable`, `mysql://…`)
+  alongside the token, so a non-technical operator never has to translate the
+  terse one-liner into a client's connection dialog.
+
+### Changed
+
+- **Setup is now two clear steps** — `init` installs the service, `wizard`
+  configures it — instead of one all-in-one command, so each step's privileges
+  and purpose are obvious. The shared elevation + service-management code lives in
+  `mwsqlctl::service`; the elevation re-exec is generalized to forward any
+  subcommand.
+- **Service-first defaults (reverts the 0.2.2 per-user default).** A flagless
+  `mwsqld` / `mwsqlctl` now targets the **system service** dir
+  (`/var/lib/middlewhere`, etc.) and the **file** keystore, because the common
+  deployment is a managed service. Pass `--user` for the per-user dir + OS
+  keychain (the previous default). The shared resolution lives in
+  `mw_core::state::resolve_cli_target`.
+
+### Removed
+
+- The `install.sh` / `install.ps1` one-line installers and their unit tests.
+  Download the release archive, verify its SHA-256 against `SHA256SUMS`, and
+  extract the binaries yourself; `mwsqlctl init` installs the service from
+  wherever you put them. This drops the auto-install-into-`~/.local/bin` step
+  whose result was not visible to the later `sudo`, which was the original cause
+  of the broken service install.
+
+### Fixed
+
+- **`cred add --user` paniced** (clap "could not downcast to bool ... String"):
+  the credential's backend-user flag collided with the global `--user`
+  deployment flag added this release. Renamed to **`--db-user`**. A
+  `Cli::command().debug_assert()` test now guards against this class of arg
+  conflict.
+- The one-time client token is printed as an **unmissable block** (env name,
+  token, port, connection details) by `env add`, `grant`, and the wizard, so it
+  can't be scrolled past — previously a single easily-missed line. On Windows the
+  Read/inspect commands (`env list`, `cred list`, `grant`, `audit-tail`) and
+  service-mode `init` / `wizard` self-elevate via UAC instead of failing against
+  the admin-locked state dir.
+
+### Security
+
+- Bumped `tokio-postgres` to 0.7.18 and `postgres-protocol` to 0.6.12 to pick up
+  RUSTSEC-2026-0178/0179/0180 — malicious/MITM-server denial-of-service fixes
+  (DataRow/hstore decode panics and unbounded SCRAM iteration). middleWHERE only
+  connects to operator-configured backends, so exposure is limited, but the
+  gateway tunnels to those backends and the fix is free.
+
 ## [0.2.2] - 2026-05-29
 
 ### Changed

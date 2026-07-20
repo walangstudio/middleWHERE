@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-149%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-188%20passing-brightgreen)
 
 middleWHERE sits between whoever is running queries and your real database. The
 caller connects to a local port, logs in with a name and a token, and runs SQL.
@@ -65,69 +65,148 @@ Three binaries, no extra runtime, no DLLs:
 
 ## Install
 
-Prebuilt binaries (`mwsqld`, `mwsqlctl`, `mwsql`) for Linux, macOS, and Windows
-are published on the [Releases](https://github.com/walangstudio/middleWHERE/releases)
-page. The installers download the archive, verify its SHA-256, and install all
-three; re-running upgrades in place.
+Download the archive for your platform from the
+[Releases](https://github.com/walangstudio/middleWHERE/releases) page, verify its
+SHA-256 against the published `SHA256SUMS`, and extract the three binaries
+(`mwsqld`, `mwsqlctl`, `mwsql`) wherever you like. Extracting them yourself keeps
+the binary at a path you chose and can see under `sudo` — `mwsqlctl init` then
+installs the service from there (it re-execs its own absolute path under `sudo`,
+so the extract location does not matter).
 
 Linux / macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.sh | sh
-# specific version:  ... | sh -s -- --version v0.2.0
-# uninstall:         ... | sh -s -- --uninstall
+ver=v0.3.0; target=x86_64-unknown-linux-gnu      # or aarch64-…, x86_64-apple-darwin, aarch64-apple-darwin
+curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/middlewhere-${ver}-${target}.tar.gz"
+curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS         # macOS: shasum -a 256 -c SHA256SUMS
+tar -xzf "middlewhere-${ver}-${target}.tar.gz" -C /opt/middlewhere   # or any dir on your PATH
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1 | iex
-# specific version:  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1))) -Version v0.2.0
-# uninstall:         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/walangstudio/middleWHERE/main/install.ps1))) -Uninstall
+$ver = 'v0.3.0'; $target = 'x86_64-pc-windows-msvc'
+$asset = "middlewhere-$ver-$target.zip"
+irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/$asset" -OutFile $asset
+irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/SHA256SUMS" -OutFile SHA256SUMS
+# verify, then extract:
+Expand-Archive $asset -DestinationPath C:\middlewhere -Force
 ```
 
-The installers place **only the binaries** — they do not register or start a
-service. You run `mwsqld run` yourself, or opt into a managed service; see
-[Running as a service](#running-as-a-service).
+The archive holds **only the binaries** — nothing is registered or started yet.
+Run `mwsqlctl init` to install the managed service (see
+[Getting started](#getting-started)), or `mwsqld run` to run it by hand.
 
 Or build from source (see [Build and test](#build-and-test)). Windows release
 binaries are unsigned; SmartScreen may warn until reputation accrues.
 
 ## Getting started
 
-Pick a state directory. The daemon and the admin tool both point at it. These
-examples use `--file-keystore`, which keeps the master key in a locked file in
-the state directory; drop it to use the OS keychain instead when you have a
-real login session.
+### The guided way (recommended)
 
-`init` creates the directory (and its `audit/` subdir), and locks it to
-`0700` (owner-only) so nobody else can read the audit log or file names — no
-`mkdir` or `chmod` first.
-
-You don't have to pass `--state-dir`. Omit it and both the daemon and `mwsqlctl`
-default to a **per-user** dir — `~/.local/state/middlewhere` on Linux (honors
-`$XDG_STATE_HOME`), `~/Library/Application Support/middlewhere` on macOS,
-`%LOCALAPPDATA%\middlewhere` on Windows. No elevation:
+Two steps: install the service, then configure connections.
 
 ```sh
-mwsqlctl --file-keystore init
+./mwsqlctl init
 ```
 
-This matches where the binaries install by default, so the common case needs no
-`sudo`. Point `--state-dir` elsewhere if you want a shared location.
+`init` installs middleWHERE as a service. It self-elevates with `sudo`
+(confirming first), creates the `mwsqld` system account, seeds the sealed config,
+writes a hardened `User=mwsqld` systemd unit, and runs `systemctl enable --now`.
+The daemon comes up idle (no environments yet, so it binds nothing). `init` then
+asks **Configure connections now?** — answer yes and it walks you straight into
+the wizard while still elevated.
+
+The wizard adds bastions, credentials, and environments — passwords are prompted
+and masked, never on the command line — then restarts the service so the new
+loopback listeners bind. After you add an environment it **validates the
+connection** (opens the bastion tunnel, then connects and authenticates to the
+real database); if it can't reach the backend it tells you why and offers to keep
+it, edit and retry, or discard. Run it again any time to add or change
+connections:
+
+```sh
+mwsqlctl wizard
+```
+
+Re-check a connection at any time:
+
+```sh
+mwsqlctl env test <env>      # or --all
+```
+
+For a per-user deployment with no service and no elevation (handy for local
+dev), use `--user` — you configure and run it yourself:
+
+```sh
+mwsqlctl --user init       # seed a per-user config (OS keychain, no service)
+mwsqlctl --user wizard     # add bastions / credentials / environments
+mwsqld   --user run        # then run it
+```
+
+To tear it all down, `uninstall` is the inverse of `init` — it stops and removes
+the service and wipes the sealed config, master key, and audit log (self-elevates
+the same way). It is destructive, so it confirms first; pass `--yes` to skip the
+prompt in a script. Re-run `init` afterwards for a clean slate.
+
+```sh
+mwsqlctl uninstall            # service deployment (self-elevates, asks to confirm)
+mwsqlctl --user uninstall     # per-user deployment (no elevation)
+```
+
+The rest of this section covers the manual commands the wizard runs, for when you
+want to script them or understand the moving parts.
+
+### The manual way
+
+`init` is the one privileged step; the `bastion add` / `cred add` / `env add`
+commands below are exactly what the wizard runs to configure, so you can script
+them instead. Both the daemon and the admin tool point at one state directory.
+Service deployments use `--file-keystore`, which keeps the master key in a locked
+file in the state directory (a daemon account has no login session to reach an OS
+keychain); a `--user` install gets the OS keychain instead.
+
+The flagless default targets the **system service** dir — `/var/lib/middlewhere`
+(Linux), `/Library/Application Support/middlewhere` (macOS),
+`C:\ProgramData\middlewhere` (Windows) — with the file keystore, because the
+common deployment is a managed service. `init` seeds that dir (locked to `0700`,
+owner-only — no `mkdir`/`chmod` first), installs the systemd unit, and starts it:
+
+```sh
+./mwsqlctl init           # self-elevates; installs + starts the mwsqld service
+```
+
+Because the state dir is then root-owned, the configure commands below run under
+`sudo` too, and a change needs a restart to take effect:
+
+```sh
+sudo systemctl restart mwsqld
+```
+
+Pass `--user` for the per-user dir (`~/.local/state/middlewhere` on Linux,
+honoring `$XDG_STATE_HOME`; `~/Library/Application Support/middlewhere` on macOS;
+`%LOCALAPPDATA%\middlewhere` on Windows) and the OS keychain — no elevation, no
+service:
+
+```sh
+mwsqlctl --user init
+```
 
 That generates a master key, seals an empty config, and creates the directory
 layout. Nothing is exposed in plaintext except the audit log. `init` refuses to
-overwrite an existing `config.sealed`, so re-running is safe.
+overwrite an existing `config.sealed`, so re-running `--user init` is safe; in
+service mode a re-run reuses the existing config and just reinstalls the unit.
+
+To skip repeating the flags on every command, export them once:
+
+```sh
+export MW_STATE_DIR=/var/lib/middlewhere MW_FILE_KEYSTORE=1
+```
 
 Whichever path you use, the daemon and `mwsqlctl` must resolve the **same** one
-— so either omit `--state-dir` on both (default), or pass the same value to
-both.
-
-For a system-wide service (one shared store owned by a dedicated daemon
-account), use the machine-wide path instead — `/var/lib/middlewhere` and
-friends. That needs root and is wired up by `install-service`; see
-[Running as a service](#running-as-a-service).
+— so either rely on the same default on both, set the same `MW_STATE_DIR`, or
+pass the same `--state-dir` to both.
 
 ### A worked example
 
@@ -170,7 +249,7 @@ the one login the two staging environments will share:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --user <db-user>
+  cred add <staging-cred> --db-user <db-user>
 # backend password: ‹typed, hidden›
 ```
 
@@ -179,14 +258,14 @@ second credential entry with the same `--user` value:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <prod-cred> --user <db-user>
+  cred add <prod-cred> --db-user <db-user>
 ```
 
 And the local Docker database's login:
 
 ```sh
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <local-cred> --user <db-user>
+  cred add <local-cred> --db-user <db-user>
 ```
 
 **Environments.** The two staging envs name the *same* credential and the
@@ -223,6 +302,11 @@ mwsqlctl --state-dir <state-dir> --file-keystore env add <local> \
   --database <app> --credential <local-cred> --listen-port <6033>
 ```
 
+`env add` validates the connection after writing it and exits non-zero if it
+can't reach the backend (the env is still saved, so a transient outage doesn't
+lose your input — fix it and run `mwsqlctl env test <env>`). Pass `--no-validate`
+to skip the probe, e.g. when provisioning an env before its database exists.
+
 Every env defaults to `read-only`. Pass `--policy read-write` at creation, or
 flip it later:
 
@@ -244,7 +328,7 @@ Redirect from a file you create out-of-band and then destroy:
 umask 077
 printf '%s' "$SECRET_FROM_VAULT" > /dev/shm/pw   # $SECRET injected by your CI secret store
 mwsqlctl --state-dir <state-dir> --file-keystore \
-  cred add <staging-cred> --user <db-user> --password-stdin < /dev/shm/pw
+  cred add <staging-cred> --db-user <db-user> --password-stdin < /dev/shm/pw
 shred -u /dev/shm/pw
 ```
 
@@ -252,7 +336,7 @@ shred -u /dev/shm/pw
 # Windows (PowerShell 7+). On Windows PowerShell 5.1 wrap in: cmd /c "mwsqlctl ... < pw.txt"
 $env:SECRET_FROM_VAULT | Out-File -NoNewline -Encoding ascii pw.txt
 mwsqlctl --state-dir <state-dir> --file-keystore `
-  cred add <staging-cred> --user <db-user> --password-stdin < pw.txt
+  cred add <staging-cred> --db-user <db-user> --password-stdin < pw.txt
 Remove-Item pw.txt
 ```
 
@@ -269,7 +353,8 @@ whoever needs that env; rotating it kills the old one:
 mwsqlctl --state-dir <state-dir> --file-keystore grant <staging-1>
 ```
 
-That prints the connection line and the token.
+That prints the token once, plus the DBeaver-style field list and a paste-ready
+connection URL (see [Running queries](#running-queries)).
 
 ### Running queries
 
@@ -279,7 +364,26 @@ Start the daemon (foreground, or as the service above):
 mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-Connect with any client. With `psql` against a Postgres env:
+Connect with any client. When you `env add` or `grant`, middleWHERE prints the
+exact fields to paste into a GUI client and a ready-to-use connection URL, so you
+never have to translate anything:
+
+```
+  DBeaver / any SQL client — enter these fields:
+    Host:      127.0.0.1
+    Port:      6433
+    Database:  app
+    Username:  staging-1
+    Password:  <token>
+    SSL:       off / disable
+
+  paste-ready URL (embeds the token — treat it like the password):
+    postgresql://staging-1:<token>@127.0.0.1:6433/app?sslmode=disable
+```
+
+The local port has no TLS (it only listens on loopback), so turn SSL **off** in
+the client and log in with the environment name as the username and the token as
+the password. With `psql` against a Postgres env:
 
 ```sh
 PGPASSWORD=<token> psql -h 127.0.0.1 -p <6433> -U <staging-1> -d <app> -c 'SELECT 1'
@@ -304,21 +408,27 @@ holds no secrets.
 | --- | --- |
 | `config.sealed` | All credentials, bastion keys, and environment definitions, sealed with ChaCha20-Poly1305. |
 | `config.sealed.bak` | The previous sealed copy, kept for atomic writes. |
-| `master.key` | Only with `--file-keystore`, locked to the owner. Otherwise the key lives in the OS keychain and there is no file. |
+| `master.key` | Present with the file keystore (the default, and what service mode always uses), locked to the owner. With `--user` the key lives in the OS keychain and there is no file. |
 | `audit/audit.jsonl.YYYY-MM-DD` | One JSON line per query: decision, statement hash, row count, duration. No statement text, no secrets. |
 
 ## Running as a service
 
-There is no auto-installed service. The simplest way to run is in the
-foreground:
+The one-command path is `mwsqlctl init` (see
+[Getting started](#getting-started)): on Linux it self-elevates, creates a fixed
+`mwsqld` system user, seeds the config, writes a hardened `User=mwsqld` systemd
+unit, and runs `systemctl enable --now` for you, then offers to run the wizard to
+configure connections. `mwsqlctl wizard` configures an already-installed
+deployment and restarts the service to apply the changes.
+
+To run by hand in the foreground instead:
 
 ```sh
-mwsqld --state-dir <state-dir> --file-keystore run
+sudo mwsqld --state-dir <state-dir> --file-keystore run
 ```
 
-For a managed service, `mwsqlctl install-service` *generates* the platform file
-(a systemd unit with `DynamicUser=yes`, a launchd plist, or a Windows
-PowerShell script) — it never escalates, enables it, or creates accounts
+To generate the unit without the wizard, `mwsqlctl install-service` *generates*
+the platform file (a systemd unit with `DynamicUser=yes`, a launchd plist, or a
+Windows PowerShell script) — it never escalates, enables it, or creates accounts
 itself. You apply it. On Linux:
 
 ```sh
