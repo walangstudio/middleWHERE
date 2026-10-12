@@ -69,9 +69,10 @@ versions are fixes only.
 
 - `env add --url` rejects a URL that requires TLS (`sslmode=require`,
   `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, or any other
-  `ssl*`/`tls*` parameter such as `ssl-ca` or `sslrootcert`) and says why. Before, the setting
-  was dropped and the connection went unencrypted. Backend TLS is not
-  supported yet; reach such hosts through a bastion.
+  `ssl*`/`tls*` parameter such as `ssl-ca` or `sslrootcert`) and says why. Before, the setting was dropped and the
+  connection went unencrypted. Backend TLS is not supported yet; reach such
+  hosts through a bastion. Parse errors no longer echo the URL, which may
+  hold the password.
 - Postgres simple-query statements with no result set (`SET`, `BEGIN`) no
   longer send an extended-protocol `NoData` message, which made clients such
   as tokio-postgres fail with "unexpected message". A zero-row `SELECT` still
@@ -87,9 +88,15 @@ versions are fixes only.
   keys under a writable policy.
 - `SET autocommit` must use a plain value (`0`/`1`/`ON`/`OFF`); the proxy
   reports the autocommit state to the client from it. MySQL backend sessions
-  start with autocommit on, and a SET may change autocommit only once. A
-  Postgres batch of several statements may not contain
-  BEGIN/COMMIT/ROLLBACK/`SET autocommit`; send those on their own.
+  start with autocommit on. A SET may change autocommit once, and not next
+  to a value that may read a table (a subquery or function call). A Postgres
+  batch of several statements may not contain BEGIN/COMMIT/ROLLBACK/`SET
+  autocommit`; send those on their own. Under MySQL `autocommit=0`, plain
+  `EXPLAIN`, `DESCRIBE`, `SHOW COLUMNS`, and any `SET`/`SHOW` with a subquery
+  or function call count as opening a transaction, as they do on the server.
+- Postgres backend failures and an unreachable backend are audited as
+  `error` with the server's SQLSTATE and message, as on MySQL. They were
+  audited as `deny`, or not at all.
 - MySQL requests may carry only one statement, whatever the policy. The proxy
   relays one result set, so a later statement's error was lost and a failed
   write in a batch was reported as success.

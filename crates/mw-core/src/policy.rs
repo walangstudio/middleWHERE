@@ -497,18 +497,26 @@ pub enum TxnEffect {
 }
 
 fn txn_effect(stmt: &Statement) -> TxnEffect {
+    match base_txn_effect(stmt) {
+        // SET or SHOW ... WHERE with a subquery or function call opens a
+        // transaction too.
+        TxnEffect::Other if may_read_table(stmt) => TxnEffect::Work,
+        e => e,
+    }
+}
+
+fn base_txn_effect(stmt: &Statement) -> TxnEffect {
     use Statement::*;
     match stmt {
-        // EXPLAIN ANALYZE runs the statement. Plain EXPLAIN still opens a
-        // transaction (and metadata locks) under autocommit=0.
+        // EXPLAIN ANALYZE runs the statement. Plain EXPLAIN, DESCRIBE and
+        // SHOW COLUMNS still hold a metadata lock until the transaction ends
+        // under autocommit=0.
         Explain {
             analyze: true,
             statement,
             ..
         } => txn_effect(statement),
-        Explain { .. } => TxnEffect::Work,
-        // A SET whose value reads a table opens a transaction too.
-        SetVariable { value, .. } if value.iter().any(reads_table) => TxnEffect::Work,
+        Explain { .. } | ExplainTable { .. } | ShowColumns { .. } => TxnEffect::Work,
         StartTransaction { .. } => TxnEffect::Begin,
         Commit { chain }
         | Rollback {
@@ -522,7 +530,6 @@ fn txn_effect(stmt: &Statement) -> TxnEffect {
             variables, value, ..
         } => assignments(variables, value)
             .into_iter()
-            .rev()
             .find(|(n, _)| var_key(n) == "autocommit")
             .and_then(|(_, v)| v.and_then(autocommit_value))
             .map_or(TxnEffect::Other, TxnEffect::Autocommit),
@@ -548,15 +555,25 @@ fn txn_effect(stmt: &Statement) -> TxnEffect {
     }
 }
 
-fn reads_table(e: &Expr) -> bool {
+/// A subquery, or a function call (a stored function can run one).
+// ponytail: built-ins count too, so `SET x = CONCAT(..)` under autocommit=0
+// over-reports a transaction; tell built-ins apart if that bites.
+fn may_read_table<T: Visit>(node: &T) -> bool {
     struct Finder;
     impl Visitor for Finder {
         type Break = ();
         fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
             ControlFlow::Break(())
         }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if matches!(e, Expr::Function(_)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
     }
-    e.visit(&mut Finder).is_break()
+    node.visit(&mut Finder).is_break()
 }
 
 fn autocommit_value(e: &Expr) -> Option<bool> {
@@ -825,15 +842,17 @@ fn check_set(
         return Decision::Deny("SET LOCAL not allowed by policy");
     }
     let assigned = assignments(vars, values);
-    // MySQL applies each in order, and an off-then-on pair commits; the
-    // proxy models one change per statement.
-    if assigned
+    // MySQL applies each in order: an off-then-on pair commits, and another
+    // value that reads a table opens a transaction. The proxy models one
+    // transaction effect per statement.
+    // Raw values, not assigned's: an odd shape (`a = 1 OR EXISTS(...)`) has
+    // no plain value there.
+    let autocommits = assigned
         .iter()
         .filter(|(n, _)| var_key(n) == "autocommit")
-        .count()
-        > 1
-    {
-        return Decision::Deny("set autocommit at most once per statement");
+        .count();
+    if autocommits > 1 || (autocommits == 1 && values.iter().any(may_read_table)) {
+        return Decision::Deny("set autocommit once, without values that read tables");
     }
     for (n, value) in assigned {
         let full = n.to_string().to_ascii_lowercase();
@@ -1319,10 +1338,6 @@ mod tests {
         m.after("ALTER TABLE missing ADD c INT", false, my);
         assert!(!m.in_txn, "a failed DDL already committed");
 
-        let mut m = TxnState::default();
-        m.after("SET autocommit = 0, autocommit = 1", true, my);
-        assert!(m.autocommit, "the last assignment wins");
-
         let mut p = TxnState::default();
         let (_, effects) = check("BEGIN; SELECT 1", &Policy::ReadWrite, &PG_PROFILE);
         p.apply(&effects, true, &PG_PROFILE);
@@ -1406,6 +1421,32 @@ mod tests {
         );
         assert!(pg("SELECT 1; INSERT INTO t VALUES (1)", &ddl).is_allow());
         deny("SET autocommit=0, autocommit=1");
+        assert_eq!(
+            evaluate(
+                "SET autocommit = 0, time_zone = (SELECT tz FROM t LIMIT 1)",
+                &Policy::ReadWrite
+            ),
+            Decision::Deny("set autocommit once, without values that read tables")
+        );
+        assert_eq!(
+            evaluate(
+                "SET autocommit = 0, sql_select_limit = 1 OR EXISTS(SELECT 1 FROM t)",
+                &Policy::ReadWrite
+            ),
+            Decision::Deny("set autocommit once, without values that read tables")
+        );
+        let mut m = TxnState::default();
+        m.after("SET autocommit = 0", true, &MYSQL_PROFILE);
+        m.after("SET time_zone = f()", true, &MYSQL_PROFILE);
+        assert!(m.in_txn, "a stored function can read a table");
+        let mut m = TxnState::default();
+        m.after("SET autocommit = 0", true, &MYSQL_PROFILE);
+        m.after(
+            "SHOW VARIABLES WHERE Variable_name = (SELECT n FROM t)",
+            true,
+            &MYSQL_PROFILE,
+        );
+        assert!(m.in_txn, "SHOW ... WHERE can read a table");
 
         let my = &MYSQL_PROFILE;
         let mut m = TxnState::default();
@@ -1416,6 +1457,12 @@ mod tests {
         m.after("SET autocommit = 0", true, my);
         m.after("EXPLAIN SELECT * FROM t", true, my);
         assert!(m.in_txn);
+        for sql in ["DESCRIBE t", "SHOW COLUMNS FROM t"] {
+            let mut m = TxnState::default();
+            m.after("SET autocommit = 0", true, my);
+            m.after(sql, true, my);
+            assert!(m.in_txn, "{sql} holds a metadata lock until commit");
+        }
     }
 
     #[test]

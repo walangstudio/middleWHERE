@@ -573,7 +573,6 @@ fn rfq_status(t: &TxnState) -> u8 {
 
 type ResultSet = (Vec<String>, Vec<Vec<Option<Vec<u8>>>>, String);
 
-/// Run already-firewalled SQL on the backend, collecting the full result.
 /// The statement ran, but a value in its result isn't UTF-8 (a SQL_ASCII
 /// database), which tokio-postgres can't hand over. Not a statement failure:
 /// the backend did the work.
@@ -704,6 +703,16 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend unavailable");
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Error,
+                Some(format!("pool: {e}")),
+                None,
+                started.elapsed(),
+            )
+            .emit();
             proto::write_raw(
                 stream,
                 &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
@@ -731,6 +740,16 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
             (cols, rows, tag)
         }
         Ok(Err(Undecodable)) => {
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Allow,
+                Some("result not valid UTF-8".into()),
+                None,
+                started.elapsed(),
+            )
+            .emit();
             // Say it ran: "query failed" would invite a retry that repeats
             // a write.
             proto::write_raw(
@@ -749,8 +768,12 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 env_name,
                 client_user,
                 sql,
-                AuditDecision::Deny,
-                Some("backend error".into()),
+                AuditDecision::Error,
+                // Display on a server error says only "db error".
+                Some(match e.as_db_error() {
+                    Some(db) => format!("backend: {} {}", db.code().code(), db.message()),
+                    None => format!("backend: {e}"),
+                }),
                 None,
                 started.elapsed(),
             )

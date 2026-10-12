@@ -122,12 +122,21 @@ impl Manager for BackendManager {
     async fn create(&self) -> Result<Conn, BackendError> {
         let mut conn = Conn::new(self.opts.to_opts()).await?;
         pin_session(&mut conn).await?;
-        let rollback: Option<i64> = conn
-            .query_first("SELECT @@GLOBAL.innodb_rollback_on_timeout")
+        // Option<String>: query_first panics on a value it can't convert, and
+        // a proxy may answer NULL or "ON".
+        match conn
+            .query_first::<Option<String>, _>("SELECT @@GLOBAL.innodb_rollback_on_timeout")
             .await
-            .unwrap_or(None);
-        self.rollback_on_timeout
-            .store(rollback == Some(1), std::sync::atomic::Ordering::Relaxed);
+        {
+            Ok(Some(Some(v))) => self.rollback_on_timeout.store(
+                v == "1" || v.eq_ignore_ascii_case("on"),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
+            Err(e @ mysql_async::Error::Io(_)) => return Err(e.into()),
+            // A server, or a proxy in front of one, that refuses the probe
+            // keeps what an earlier connection saw. Only tunes rollback tracking.
+            Ok(_) | Err(_) => {}
+        }
         Ok(conn)
     }
 
