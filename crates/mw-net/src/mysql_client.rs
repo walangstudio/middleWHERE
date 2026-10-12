@@ -48,11 +48,17 @@ impl BackendOpts {
 
 pub struct BackendManager {
     opts: BackendOpts,
+    /// The server's `innodb_rollback_on_timeout` (global, read-only), seen at
+    /// connect. When on, a lock wait timeout rolls back the whole transaction.
+    pub rollback_on_timeout: std::sync::atomic::AtomicBool,
 }
 
 impl BackendManager {
     pub fn new(opts: BackendOpts) -> Self {
-        Self { opts }
+        Self {
+            opts,
+            rollback_on_timeout: Default::default(),
+        }
     }
 }
 
@@ -116,6 +122,12 @@ impl Manager for BackendManager {
     async fn create(&self) -> Result<Conn, BackendError> {
         let mut conn = Conn::new(self.opts.to_opts()).await?;
         pin_session(&mut conn).await?;
+        let rollback: Option<i64> = conn
+            .query_first("SELECT @@GLOBAL.innodb_rollback_on_timeout")
+            .await
+            .unwrap_or(None);
+        self.rollback_on_timeout
+            .store(rollback == Some(1), std::sync::atomic::Ordering::Relaxed);
         Ok(conn)
     }
 

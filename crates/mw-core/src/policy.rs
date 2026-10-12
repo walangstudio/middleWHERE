@@ -44,6 +44,10 @@ pub struct PolicyProfile {
     /// InnoDB SERIALIZABLE turns plain SELECTs in a transaction into shared
     /// locking reads; Postgres SERIALIZABLE (SSI) takes no blocking locks.
     serializable_locks: bool,
+    /// Whether one request may carry several statements. The MySQL proxy
+    /// relays a single result set, so a later statement's error or rows would
+    /// be lost; Postgres's simple query reports the whole batch.
+    batches: bool,
 }
 
 /// MySQL runs code sqlparser treats as a comment:
@@ -272,6 +276,7 @@ pub static MYSQL_PROFILE: PolicyProfile = PolicyProfile {
     error_aborts_txn: false,
     ddl_commits: true,
     serializable_locks: true,
+    batches: false,
 };
 
 pub static PG_PROFILE: PolicyProfile = PolicyProfile {
@@ -284,6 +289,7 @@ pub static PG_PROFILE: PolicyProfile = PolicyProfile {
     error_aborts_txn: true,
     ddl_commits: false,
     serializable_locks: false,
+    batches: true,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,7 +367,7 @@ fn decide(stmts: &[Statement], policy: &Policy, profile: &PolicyProfile) -> Deci
             allow_admin,
         } => (*allow_dml, *allow_ddl, *allow_admin),
     };
-    if stmts.len() > 1 && !(allow_dml && allow_ddl) {
+    if stmts.len() > 1 && !(profile.batches && allow_dml && allow_ddl) {
         return Decision::Deny("multiple statements per request not allowed");
     }
     // One whole-tree pass. Every statement node at any depth must pass the
@@ -493,12 +499,16 @@ pub enum TxnEffect {
 fn txn_effect(stmt: &Statement) -> TxnEffect {
     use Statement::*;
     match stmt {
-        // EXPLAIN ANALYZE runs the statement; plain EXPLAIN doesn't.
+        // EXPLAIN ANALYZE runs the statement. Plain EXPLAIN still opens a
+        // transaction (and metadata locks) under autocommit=0.
         Explain {
             analyze: true,
             statement,
             ..
         } => txn_effect(statement),
+        Explain { .. } => TxnEffect::Work,
+        // A SET whose value reads a table opens a transaction too.
+        SetVariable { value, .. } if value.iter().any(reads_table) => TxnEffect::Work,
         StartTransaction { .. } => TxnEffect::Begin,
         Commit { chain }
         | Rollback {
@@ -536,6 +546,17 @@ fn txn_effect(stmt: &Statement) -> TxnEffect {
         | Revoke { .. } => TxnEffect::Ddl,
         _ => TxnEffect::Other,
     }
+}
+
+fn reads_table(e: &Expr) -> bool {
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+    }
+    e.visit(&mut Finder).is_break()
 }
 
 fn autocommit_value(e: &Expr) -> Option<bool> {
@@ -803,7 +824,18 @@ fn check_set(
     if local {
         return Decision::Deny("SET LOCAL not allowed by policy");
     }
-    for (n, value) in assignments(vars, values) {
+    let assigned = assignments(vars, values);
+    // MySQL applies each in order, and an off-then-on pair commits; the
+    // proxy models one change per statement.
+    if assigned
+        .iter()
+        .filter(|(n, _)| var_key(n) == "autocommit")
+        .count()
+        > 1
+    {
+        return Decision::Deny("set autocommit at most once per statement");
+    }
+    for (n, value) in assigned {
         let full = n.to_string().to_ascii_lowercase();
         // Reject GLOBAL scope and user-defined variables outright.
         if full.contains("@@global") || full.contains("global.") {
@@ -1358,6 +1390,32 @@ mod tests {
         };
         assert!(pg("CREATE TABLE a (x int); CREATE INDEX ai ON a (x)", &ddl).is_allow());
         assert!(!evaluate("CREATE TABLE a (x int); CREATE INDEX ai ON a (x)", &ddl).is_allow());
+    }
+
+    #[test]
+    fn round6_cases() {
+        let ddl = Policy::Custom {
+            allow_dml: true,
+            allow_ddl: true,
+            allow_admin: false,
+        };
+        assert_eq!(
+            evaluate("SELECT 1; INSERT INTO t VALUES (1)", &ddl),
+            Decision::Deny("multiple statements per request not allowed"),
+            "MySQL relays one result set, so no batches"
+        );
+        assert!(pg("SELECT 1; INSERT INTO t VALUES (1)", &ddl).is_allow());
+        deny("SET autocommit=0, autocommit=1");
+
+        let my = &MYSQL_PROFILE;
+        let mut m = TxnState::default();
+        m.after("SET autocommit = 0", true, my);
+        m.after("SET time_zone = (SELECT tz FROM t LIMIT 1)", true, my);
+        assert!(m.in_txn, "a SET that reads a table opens the transaction");
+        let mut m = TxnState::default();
+        m.after("SET autocommit = 0", true, my);
+        m.after("EXPLAIN SELECT * FROM t", true, my);
+        assert!(m.in_txn);
     }
 
     #[test]

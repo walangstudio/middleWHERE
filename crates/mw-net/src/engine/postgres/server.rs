@@ -27,6 +27,7 @@ const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_INTERNAL: &str = "58000";
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+const SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 
 pub struct PgSession {
     pub user_seen: String,
@@ -573,15 +574,23 @@ fn rfq_status(t: &TxnState) -> u8 {
 type ResultSet = (Vec<String>, Vec<Vec<Option<Vec<u8>>>>, String);
 
 /// Run already-firewalled SQL on the backend, collecting the full result.
+/// The statement ran, but a value in its result isn't UTF-8 (a SQL_ASCII
+/// database), which tokio-postgres can't hand over. Not a statement failure:
+/// the backend did the work.
+struct Undecodable;
+
+/// Run already-firewalled SQL on the backend, collecting the full result. The
+/// outer error is the backend's (the statement failed).
 async fn run_query(
     client: &tokio_postgres::Client,
     sql: &str,
-) -> Result<ResultSet, tokio_postgres::Error> {
+) -> Result<Result<ResultSet, Undecodable>, tokio_postgres::Error> {
     use tokio_postgres::SimpleQueryMessage;
     let msgs = client.simple_query(sql).await?;
     let mut cols: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     let mut affected: u64 = 0;
+    let mut undecodable = false;
     for m in msgs {
         match m {
             // Sent even for zero rows, so an empty SELECT keeps its columns.
@@ -592,13 +601,15 @@ async fn run_query(
                 if cols.is_empty() {
                     cols = r.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                rows.push(
-                    (0..r.columns().len())
-                        // try_get, not get: get panics on a value that isn't
-                        // UTF-8, and a release build aborts the whole daemon.
-                        .map(|i| Ok(r.try_get(i)?.map(|s| s.as_bytes().to_vec())))
-                        .collect::<Result<_, tokio_postgres::Error>>()?,
-                );
+                // try_get, not get: get panics on a value that isn't UTF-8,
+                // and a release build aborts the whole daemon.
+                let row: Result<Vec<_>, _> = (0..r.columns().len())
+                    .map(|i| r.try_get(i).map(|v| v.map(|s| s.as_bytes().to_vec())))
+                    .collect();
+                match row {
+                    Ok(row) => rows.push(row),
+                    Err(_) => undecodable = true,
+                }
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
             _ => {}
@@ -609,7 +620,10 @@ async fn run_query(
     } else {
         command_tag(sql, rows.len())
     };
-    Ok((cols, rows, tag))
+    if undecodable {
+        return Ok(Err(Undecodable));
+    }
+    Ok(Ok((cols, rows, tag)))
 }
 
 async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
@@ -704,19 +718,31 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
     // The tag otherwise comes from the SQL text, which would claim "COMMIT".
     let committed_failed =
         backend.txn.failed && matches!(effects.as_slice(), [TxnEffect::End { .. }]);
-    let ran = ran.map(|(cols, rows, tag)| {
-        let tag = if committed_failed {
-            "ROLLBACK".to_string()
-        } else {
-            tag
-        };
-        (cols, rows, tag)
-    });
     backend
         .txn
         .apply(&effects, ran.is_ok(), &policy::PG_PROFILE);
     let rs = match ran {
-        Ok(rs) => rs,
+        Ok(Ok((cols, rows, tag))) => {
+            let tag = if committed_failed {
+                "ROLLBACK".to_string()
+            } else {
+                tag
+            };
+            (cols, rows, tag)
+        }
+        Ok(Err(Undecodable)) => {
+            // Say it ran: "query failed" would invite a retry that repeats
+            // a write.
+            proto::write_raw(
+                stream,
+                &proto::error_response(
+                    SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE,
+                    "the statement ran, but its result is not valid UTF-8",
+                ),
+            )
+            .await?;
+            return Ok(false);
+        }
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend query error");
             AuditEvent::new(

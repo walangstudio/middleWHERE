@@ -68,8 +68,8 @@ versions are fixes only.
 ### Fixed
 
 - `env add --url` rejects a URL that requires TLS (`sslmode=require`,
-  `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, `sslaccept`, ...)
-  and says why. Before, the setting
+  `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, or any other
+  `ssl*`/`tls*` parameter such as `ssl-ca` or `sslrootcert`) and says why. Before, the setting
   was dropped and the connection went unencrypted. Backend TLS is not
   supported yet; reach such hosts through a bastion.
 - Postgres simple-query statements with no result set (`SET`, `BEGIN`) no
@@ -87,8 +87,15 @@ versions are fixes only.
   keys under a writable policy.
 - `SET autocommit` must use a plain value (`0`/`1`/`ON`/`OFF`); the proxy
   reports the autocommit state to the client from it. MySQL backend sessions
-  start with autocommit on. A batch of several statements may not contain
-  BEGIN/COMMIT/ROLLBACK/DDL/`SET autocommit`; send those on their own.
+  start with autocommit on, and a SET may change autocommit only once. A
+  Postgres batch of several statements may not contain
+  BEGIN/COMMIT/ROLLBACK/`SET autocommit`; send those on their own.
+- MySQL requests may carry only one statement, whatever the policy. The proxy
+  relays one result set, so a later statement's error was lost and a failed
+  write in a batch was reported as success.
+- A Postgres result value that isn't UTF-8 (a SQL_ASCII database) is reported
+  as "the statement ran, but its result is not valid UTF-8" instead of a
+  failure, so a client doesn't retry a write that already happened.
 
 ## [0.4.0] - 2026-07-18
 

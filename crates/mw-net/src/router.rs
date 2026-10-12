@@ -34,6 +34,8 @@ const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 const ER_PARSE_ERROR: u16 = 1064;
 const ER_NOT_ALLOWED_COMMAND: u16 = 1148;
 const ER_INTERNAL: u16 = 1815;
+const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+const ER_LOCK_DEADLOCK: u16 = 1213;
 
 pub async fn serve_session<S>(
     stream: &mut S,
@@ -167,6 +169,8 @@ where
         txn,
         last_statement,
     } = backend;
+    // Read at error time: the first connect is what records the setting.
+    let manager = conn.manager();
     let conn = match conn.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -218,8 +222,19 @@ where
         }
         Err(e) => {
             txn.apply(&effects, false, &policy::MYSQL_PROFILE);
-            // ER_LOCK_DEADLOCK: the server rolled the whole transaction back.
-            if matches!(&e, mysql_async::Error::Server(se) if se.code == 1213) {
+            // The server rolled the whole transaction back: always on a
+            // deadlock, and on a lock wait timeout when it's configured to.
+            let rolled_back = match &e {
+                mysql_async::Error::Server(se) => {
+                    se.code == ER_LOCK_DEADLOCK
+                        || (se.code == ER_LOCK_WAIT_TIMEOUT
+                            && manager
+                                .rollback_on_timeout
+                                .load(std::sync::atomic::Ordering::Relaxed))
+                }
+                _ => false,
+            };
+            if rolled_back {
                 txn.rolled_back();
             }
             warn!(env = env_name, err = %e, "backend rejected query");

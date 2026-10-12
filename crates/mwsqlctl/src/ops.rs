@@ -183,15 +183,16 @@ pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
     // fail later with a generic connect error on hosts that enforce TLS).
     for (k, v) in url.query_pairs() {
         let key = k.to_ascii_lowercase().replace(['-', '_'], "");
-        let val = v.to_ascii_lowercase().replace('-', "_");
-        // Any value of a TLS parameter other than an explicit "off"/"maybe".
-        let requires_tls = matches!(
-            key.as_str(),
-            "sslmode" | "ssl" | "usessl" | "requiressl" | "tls" | "sslaccept" | "sslrootcert"
-        ) && !matches!(
-            val.as_str(),
-            "disable" | "disabled" | "allow" | "prefer" | "preferred" | "false" | "0" | "off"
-        );
+        let val = v.to_ascii_lowercase();
+        // The mode switches can say "off"; any other ssl*/tls* parameter
+        // (ssl-ca, sslcert, sslrootcert, sslaccept, ...) implies TLS.
+        let requires_tls = match key.as_str() {
+            "sslmode" | "ssl" | "usessl" | "requiressl" | "tls" => !matches!(
+                val.as_str(),
+                "disable" | "disabled" | "allow" | "prefer" | "preferred" | "false" | "0" | "off"
+            ),
+            k => k.starts_with("ssl") || k.starts_with("tls"),
+        };
         if requires_tls {
             bail!(
                 "the url asks for TLS ({k}={v}), but middleWHERE does not support TLS to \
@@ -419,6 +420,8 @@ mod tests {
             ("postgres://u@h/d?ssl=require", "does not support TLS"),
             ("postgres://u@h/d?ssl=on", "does not support TLS"),
             ("postgres://u@h/d?sslaccept=strict", "does not support TLS"),
+            ("mysql://u@h/d?ssl-ca=/etc/ca.pem", "does not support TLS"),
+            ("postgres://u@h/d?sslcert=/c.pem", "does not support TLS"),
         ] {
             let err = parse_connection_url(raw).unwrap_err().to_string();
             assert!(err.contains(want), "{raw}: got {err}");

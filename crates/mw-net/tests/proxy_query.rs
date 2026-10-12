@@ -248,8 +248,17 @@ async fn backend_lexer_modes_are_neutralized() {
     // Restore the shared server's mode before any assertion can panic.
     let observed = async {
         let addr = spawn_proxy(&url, 1).await;
-        let mut c = client(addr).await;
-        let mode: String = c.query_first("SELECT @@SESSION.sql_mode").await?.unwrap();
+        // No panicking helpers in here: the restore below must always run.
+        let mut c = Conn::new(
+            OptsBuilder::default()
+                .ip_or_hostname(addr.ip().to_string())
+                .tcp_port(addr.port())
+                .user(Some("stage_w9"))
+                .pass(Some(CLIENT_TOKEN))
+                .stmt_cache_size(0),
+        )
+        .await?;
+        let mode: Option<String> = c.query_first("SELECT @@SESSION.sql_mode").await?;
         let one: Vec<mysql_async::Row> = c.query(r#"SELECT "a\" , 2 -- ""#).await?;
         Ok::<_, mysql_async::Error>((mode, one))
     }
@@ -259,6 +268,7 @@ async fn backend_lexer_modes_are_neutralized() {
         .await
         .unwrap();
     let (mode, one) = observed.unwrap();
+    let mode = mode.unwrap();
     for bad in ["ANSI_QUOTES", "NO_BACKSLASH_ESCAPES"] {
         assert!(!mode.contains(bad), "{bad} survived: {mode}");
     }

@@ -29,6 +29,10 @@ impl<'a, M: Manager> SessionConn<'a, M> {
         Ok(self.conn.as_mut().expect("just set"))
     }
 
+    pub fn manager(&self) -> &'a M {
+        self.pool.manager()
+    }
+
     /// The connection, if the session has checked one out yet.
     pub fn current(&mut self) -> Option<&mut M::Type> {
         self.conn.as_deref_mut()
