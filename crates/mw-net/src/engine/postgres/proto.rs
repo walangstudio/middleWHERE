@@ -135,8 +135,10 @@ pub fn backend_key_data(pid: i32, secret: i32) -> Vec<u8> {
 }
 
 /// `ReadyForQuery` ('Z') with transaction status 'I' (idle).
-pub fn ready_for_query() -> Vec<u8> {
-    msg(b'Z', b"I")
+/// `ReadyForQuery` with the transaction status: `I` idle, `T` in a
+/// transaction, `E` in a failed transaction.
+pub fn ready_for_query(status: u8) -> Vec<u8> {
+    msg(b'Z', &[status])
 }
 
 /// `ErrorResponse` ('E') with Severity/Code/Message fields.
@@ -347,7 +349,7 @@ mod tests {
         assert_eq!(bind_complete(), vec![b'2', 0, 0, 0, 4]);
         assert_eq!(close_complete(), vec![b'3', 0, 0, 0, 4]);
         assert_eq!(no_data(), vec![b'n', 0, 0, 0, 4]);
-        assert_eq!(ready_for_query(), vec![b'Z', 0, 0, 0, 5, b'I']);
+        assert_eq!(ready_for_query(b'I'), vec![b'Z', 0, 0, 0, 5, b'I']);
         assert_eq!(auth_ok(), vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
         assert_eq!(auth_cleartext_request(), vec![b'R', 0, 0, 0, 8, 0, 0, 0, 3]);
     }

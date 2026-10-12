@@ -1,13 +1,14 @@
-//! Idle backend-connection reaping.
+//! Idle timeouts, for both halves of a backend connection's life.
 //!
-//! The daemon periodically sweeps each env's deadpool pool and closes backend
-//! connections that have seen no activity within their idle timeout, releasing
-//! the server-side connection. `Pool::retain` only ever inspects connections
-//! sitting idle in the pool; one checked out for an in-flight query is not a
-//! candidate, so active proxying is never interrupted. `last_used` measures time
-//! since the connection was last checked out, so each checkout resets it: a
-//! backend that keeps getting used stays pooled, and only one untouched for the
-//! whole idle window is reaped.
+//! A client session pins its backend connection (see `session_conn`) and is
+//! closed by [`within_idle`] when it sends nothing for the idle timeout; that
+//! closes the connection too. Pinned connections never return to the pool.
+//!
+//! The pool itself still holds connections that no client used: the ones the
+//! env probe (`env test`, the wizard's check) opens and drops. The daemon
+//! sweeps each env's pool and closes those once idle past the timeout.
+//! `Pool::retain` only inspects connections sitting in the pool, so active
+//! proxying is never interrupted.
 
 use std::time::Duration;
 
@@ -25,9 +26,53 @@ pub fn reaper_interval(min_idle_timeout: Duration) -> Duration {
     (min_idle_timeout / 2).clamp(Duration::from_secs(1), Duration::from_secs(60))
 }
 
+/// Await `fut`, or give up after `idle` (zero waits forever). Wraps the read
+/// of a client's next command: an idle session would otherwise hold its pinned
+/// backend connection, one of max_pool, indefinitely.
+pub async fn within_idle<T>(
+    idle: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if idle.is_zero() {
+        Some(fut.await)
+    } else {
+        tokio::time::timeout(idle, fut).await.ok()
+    }
+}
+
+/// How long to wait for a client's next command. Inside a transaction the
+/// window runs from the last statement the backend ran, not the last message:
+/// pings must not keep a transaction's locks held forever.
+pub fn next_wait(idle: Duration, in_txn: bool, last_statement: std::time::Instant) -> Duration {
+    if idle.is_zero() || !in_txn {
+        return idle;
+    }
+    // Never zero: within_idle reads zero as "wait forever".
+    idle.saturating_sub(last_statement.elapsed())
+        .max(Duration::from_millis(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_in_transaction_window_runs_from_the_last_statement() {
+        let idle = Duration::from_secs(10);
+        let long_ago = std::time::Instant::now() - Duration::from_secs(60);
+        assert_eq!(
+            next_wait(idle, false, long_ago),
+            idle,
+            "outside a txn: full window"
+        );
+        assert_eq!(
+            next_wait(idle, true, long_ago),
+            Duration::from_millis(1),
+            "pings since the last statement don't extend it"
+        );
+        assert!(next_wait(idle, true, std::time::Instant::now()) > Duration::from_secs(9));
+        assert_eq!(next_wait(Duration::ZERO, true, long_ago), Duration::ZERO);
+    }
 
     #[test]
     fn recently_used_connection_is_retained() {

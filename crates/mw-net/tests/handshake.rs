@@ -97,6 +97,7 @@ async fn happy_path_auth_ok() {
             &session.client_username_seen,
             &pool,
             &Policy::ReadOnly,
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
@@ -263,3 +264,49 @@ async fn auth_switch_wrong_token_denied() {
 // (Removed `com_query_returns_err_phase2`: it asserted the deleted Phase-2
 // minimal command loop's behaviour. COM_QUERY routing is now covered
 // end-to-end against a real backend by proxy_query.rs and the daemon tests.)
+
+/// An idle session must end on its own, or it pins one of max_pool backend
+/// connections forever. Activity (COM_PING) keeps it alive.
+#[tokio::test]
+async fn idle_session_is_closed_after_timeout() {
+    let auth = ClientAuth::NativePassword {
+        double_sha1: double_sha1(b"tk"),
+    };
+    let (mut server, mut client) = pair().await;
+    let server_task = tokio::spawn(async move {
+        let session = handshake(&mut server, "stage_w9", &auth, 1).await.unwrap();
+        serve_session(
+            &mut server,
+            "stage_w9",
+            &session.client_username_seen,
+            &dead_pool(),
+            &Policy::ReadOnly,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    });
+    let (reply, _) = client_handshake_send(
+        &mut client,
+        b"stage_w9",
+        b"tk",
+        b"mysql_native_password",
+        None,
+    )
+    .await;
+    assert!(testing::is_ok_packet(&reply));
+
+    // Activity within the window keeps the session open.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut seq = SequenceCounter::default();
+    write_packet(&mut client, &mut seq, &[0x0E]).await.unwrap();
+    assert!(testing::is_ok_packet(
+        &read_packet(&mut client, &mut seq).await.unwrap()
+    ));
+
+    // Then silence: the server ends the session by itself.
+    tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+        .await
+        .expect("idle session was not closed")
+        .unwrap();
+}

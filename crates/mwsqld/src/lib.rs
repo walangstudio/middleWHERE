@@ -131,19 +131,7 @@ impl Daemon {
                 );
                 continue;
             }
-            // Postgres uses cleartext-password auth; the token would cross the
-            // wire in clear on a non-loopback bind. Refuse unless explicitly
-            // overridden.
-            if env.engine == EngineKind::Postgres
-                && !is_loopback_host(listen_host)
-                && std::env::var("MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT").is_err()
-            {
-                return Err(anyhow!(
-                    "env {env_name}: postgres cleartext auth on non-loopback bind \
-                     {listen_host:?} is refused; bind 127.0.0.1 or set \
-                     MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1"
-                ));
-            }
+            refuse_pg_cleartext(env_name, env.engine, listen_host)?;
             let runtime =
                 build_env_runtime(env_name, env, cfg, listen_host, &bastions, allow_tofu).await?;
             let listener = TcpListener::bind(runtime.listen_addr)
@@ -334,6 +322,28 @@ impl Daemon {
         handle.current.send_replace(Arc::new(next));
         Ok(())
     }
+}
+
+/// Postgres uses cleartext-password auth; the token would cross the wire in
+/// clear on a non-loopback bind. Refuse unless explicitly overridden. Checked at
+/// startup and before a live add persists, so a live add can't create an env
+/// the next restart would refuse to serve.
+pub(crate) fn refuse_pg_cleartext(
+    env_name: &str,
+    engine: EngineKind,
+    listen_host: &str,
+) -> Result<()> {
+    if engine == EngineKind::Postgres
+        && !is_loopback_host(listen_host)
+        && std::env::var("MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT").is_err()
+    {
+        return Err(anyhow!(
+            "env {env_name}: postgres cleartext auth on non-loopback bind \
+             {listen_host:?} is refused; bind 127.0.0.1 or set \
+             MIDDLEWHERE_ALLOW_INSECURE_PG_CLEARTEXT=1"
+        ));
+    }
+    Ok(())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -625,7 +635,13 @@ async fn handle_one(
     {
         Ok(session) => {
             rt.engine
-                .serve(&mut sock, &session, rt.backend.as_ref(), &rt.policy)
+                .serve(
+                    &mut sock,
+                    &session,
+                    rt.backend.as_ref(),
+                    &rt.policy,
+                    rt.idle_timeout,
+                )
                 .await?;
         }
         Err(_) => { /* accept already wrote the protocol's ERR frame */ }

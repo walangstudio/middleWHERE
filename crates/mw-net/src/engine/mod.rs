@@ -94,6 +94,7 @@ pub trait Engine: Send + Sync + 'static {
         session: &Session,
         backend: &dyn Backend,
         policy: &Policy,
+        idle_timeout: Duration,
     ) -> Result<(), EngineError>;
 }
 

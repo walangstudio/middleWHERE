@@ -3,7 +3,7 @@
 //! firewalled by [`mw_core::policy`] and then forwarded to the backend
 //! pool. Anything else gets a polite ERR.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,10 +11,12 @@ use tracing::{debug, info, warn};
 
 use mw_core::audit::{AuditEvent, Decision as AuditDecision};
 use mw_core::config::Policy;
-use mw_core::policy;
+use mw_core::policy::{self, TxnState};
 
-use crate::framing::{read_packet, write_packet, FramingError, SequenceCounter};
-use crate::mysql_client::BackendPool;
+use crate::framing::{read_packet, write_lenenc_int, write_packet, FramingError, SequenceCounter};
+use crate::idle::{next_wait, within_idle};
+use crate::mysql_client::{BackendManager, BackendPool};
+use crate::session_conn::SessionConn;
 use crate::wire;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,7 @@ pub enum RouterError {
     Backend(#[from] mysql_async::Error),
 }
 
+const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 const ER_PARSE_ERROR: u16 = 1064;
 const ER_NOT_ALLOWED_COMMAND: u16 = 1148;
@@ -38,14 +41,25 @@ pub async fn serve_session<S>(
     client_user: &str,
     pool: &BackendPool,
     pol: &Policy,
+    idle_timeout: Duration,
 ) -> Result<(), RouterError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut seq = SequenceCounter::default();
+    let mut backend = Pinned {
+        conn: SessionConn::new(pool),
+        txn: TxnState::default(),
+        last_statement: Instant::now(),
+    };
     loop {
         seq.reset();
-        let pkt = match read_packet(stream, &mut seq).await {
+        let wait = next_wait(idle_timeout, backend.txn.in_txn, backend.last_statement);
+        let Some(pkt) = within_idle(wait, read_packet(stream, &mut seq)).await else {
+            debug!(env = env_name, "closing idle session");
+            return Ok(());
+        };
+        let pkt = match pkt {
             Ok(p) => p,
             Err(FramingError::UnexpectedEof { .. }) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -63,12 +77,26 @@ where
                 return Ok(());
             }
             0x0E => {
-                write_packet(stream, &mut seq, &ok_packet()).await?;
+                write_packet(
+                    stream,
+                    &mut seq,
+                    &ok_packet(0, 0, status_flags(&backend.txn)),
+                )
+                .await?;
             }
             0x03 => {
                 let sql_bytes = &pkt[1..];
                 let sql = String::from_utf8_lossy(sql_bytes);
-                handle_com_query(stream, &mut seq, env_name, client_user, &sql, pool, pol).await?;
+                handle_com_query(
+                    stream,
+                    &mut seq,
+                    env_name,
+                    client_user,
+                    &sql,
+                    &mut backend,
+                    pol,
+                )
+                .await?;
             }
             other => {
                 warn!(
@@ -91,20 +119,28 @@ where
     }
 }
 
+/// The session's backend connection and the transaction state it is in.
+struct Pinned<'a> {
+    conn: SessionConn<'a, BackendManager>,
+    txn: TxnState,
+    /// When the backend last ran a statement; bounds idle-in-transaction.
+    last_statement: Instant,
+}
+
 async fn handle_com_query<S>(
     stream: &mut S,
     seq: &mut SequenceCounter,
     env_name: &str,
     client_user: &str,
     sql: &str,
-    pool: &BackendPool,
+    backend: &mut Pinned<'_>,
     pol: &Policy,
 ) -> Result<(), RouterError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let started = Instant::now();
-    let decision = policy::evaluate(sql, pol, &policy::MYSQL_PROFILE);
+    let (decision, effects) = policy::check(sql, pol, &policy::MYSQL_PROFILE);
     if let Some(reason) = decision.reason() {
         info!(
             env = env_name,
@@ -126,7 +162,12 @@ where
         return Ok(());
     }
 
-    let mut conn = match pool.get().await {
+    let Pinned {
+        conn,
+        txn,
+        last_statement,
+    } = backend;
+    let conn = match conn.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pool exhausted / unreachable");
@@ -153,10 +194,34 @@ where
         }
     };
 
-    let result = conn.query_iter(sql.to_string()).await;
-    let mut qr = match result {
-        Ok(qr) => qr,
+    // The OK/EOF that ends a successful result must already carry the state
+    // this statement leaves behind (e.g. IN_TRANS after BEGIN).
+    let mut on_success = *txn;
+    on_success.apply(&effects, true, &policy::MYSQL_PROFILE);
+    let outcome = forward(stream, seq, conn, sql, status_flags(&on_success)).await?;
+    *last_statement = Instant::now();
+    match outcome {
+        Ok(row_count) => {
+            *txn = on_success;
+            debug!(env = env_name, rows = row_count, "query ok");
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Allow,
+                None,
+                Some(row_count),
+                started.elapsed(),
+            )
+            .emit();
+            Ok(())
+        }
         Err(e) => {
+            txn.apply(&effects, false, &policy::MYSQL_PROFILE);
+            // ER_LOCK_DEADLOCK: the server rolled the whole transaction back.
+            if matches!(&e, mysql_async::Error::Server(se) if se.code == 1213) {
+                txn.rolled_back();
+            }
             warn!(env = env_name, err = %e, "backend rejected query");
             AuditEvent::new(
                 env_name,
@@ -168,57 +233,94 @@ where
                 started.elapsed(),
             )
             .emit();
+            // Valid at any point, including mid result set: ERR ends it.
             write_packet(
                 stream,
                 seq,
                 &err_packet(ER_INTERNAL, b"HY000", "query execution failed"),
             )
             .await?;
-            return Ok(());
+            // A server-side SQL error leaves the pinned connection usable.
+            // Anything else means it (and any transaction on it) is gone, or
+            // left unread packets behind; end the session rather than
+            // continue on a desynced or fresh connection.
+            if matches!(e, mysql_async::Error::Server(_)) {
+                Ok(())
+            } else {
+                Err(e.into())
+            }
         }
-    };
+    }
+}
 
+/// Run `sql` on the backend and relay its result. The outer error is the
+/// client socket; the inner one is the backend's, for the caller to report.
+async fn forward<S>(
+    stream: &mut S,
+    seq: &mut SequenceCounter,
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    status: u16,
+) -> Result<Result<u64, mysql_async::Error>, RouterError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut qr = match conn.query_iter(sql.to_string()).await {
+        Ok(qr) => qr,
+        Err(e) => return Ok(Err(e)),
+    };
     let columns = qr.columns().map(|arc| arc.to_vec());
-    let row_count: u64 = match columns {
+    match columns {
         Some(cols) if !cols.is_empty() => {
             write_packet(stream, seq, &wire::column_count_packet(cols.len() as u64)).await?;
             for c in &cols {
                 write_packet(stream, seq, &wire::column_def_packet(c)).await?;
             }
             let mut n: u64 = 0;
-            while let Some(row) = qr.next().await? {
-                write_packet(stream, seq, &wire::row_text_packet(&row)).await?;
-                n += 1;
+            loop {
+                match qr.next().await {
+                    Ok(Some(row)) => {
+                        write_packet(stream, seq, &wire::row_text_packet(&row)).await?;
+                        n += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Ok(Err(e)),
+                }
             }
-            write_packet(stream, seq, &wire::ok_eof_packet(0, 0)).await?;
-            n
+            write_packet(stream, seq, &wire::ok_eof_packet(0, 0, status)).await?;
+            Ok(Ok(n))
         }
         _ => {
-            let _ = qr.drop_result().await;
-            write_packet(stream, seq, &ok_packet()).await?;
-            0
+            // DML under a writable policy: ORMs check the row count
+            // (optimistic locking) and read the generated key.
+            let affected = qr.affected_rows();
+            let last_id = qr.last_insert_id().unwrap_or(0);
+            if let Err(e) = qr.drop_result().await {
+                return Ok(Err(e));
+            }
+            write_packet(stream, seq, &ok_packet(affected, last_id, status)).await?;
+            Ok(Ok(0))
         }
-    };
-    debug!(env = env_name, rows = row_count, "query ok");
-    AuditEvent::new(
-        env_name,
-        client_user,
-        sql,
-        AuditDecision::Allow,
-        None,
-        Some(row_count),
-        started.elapsed(),
-    )
-    .emit();
-    Ok(())
+    }
 }
 
-fn ok_packet() -> Vec<u8> {
-    let mut p = Vec::with_capacity(7);
+fn status_flags(t: &TxnState) -> u16 {
+    let mut f = 0;
+    if t.autocommit {
+        f |= SERVER_STATUS_AUTOCOMMIT;
+    }
+    if t.in_txn {
+        f |= SERVER_STATUS_IN_TRANS;
+    }
+    f
+}
+
+fn ok_packet(affected_rows: u64, last_insert_id: u64, status: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(23);
     p.push(0x00);
-    p.push(0x00); // affected_rows lenenc=0
-    p.push(0x00); // last_insert_id lenenc=0
-    p.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    write_lenenc_int(&mut p, affected_rows);
+    write_lenenc_int(&mut p, last_insert_id);
+    p.extend_from_slice(&status.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes());
     p
 }

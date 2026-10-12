@@ -279,8 +279,7 @@ pub fn is_reachable(state_dir: &Path) -> bool {
         const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
         let pipe = format!(r"\\.\pipe\middlewhere-{CONTROL_SERVICE_NAME}-control");
         match OpenOptions::new()
-            .read(true)
-            .write(true)
+            .access_mode(PIPE_CLIENT_ACCESS)
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(&pipe)
         {
@@ -400,6 +399,14 @@ fn unix_socket_path(state_dir: &Path, svc: &str) -> std::path::PathBuf {
     state_dir.join("control.sock")
 }
 
+/// FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+/// FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE: exactly what the
+/// daemon's DACL grants the admins group (`ADMINS_PIPE_RIGHTS` in mwsqld).
+/// GENERIC_WRITE would also ask for FILE_CREATE_PIPE_INSTANCE, which the group
+/// deliberately lacks, and be denied.
+#[cfg(windows)]
+const PIPE_CLIENT_ACCESS: u32 = 0x0012_0183;
+
 #[cfg(windows)]
 fn call_windows(service_name: &str, req: &Request) -> Result<Response, CallError> {
     use std::fs::OpenOptions;
@@ -421,8 +428,7 @@ fn call_windows(service_name: &str, req: &Request) -> Result<Response, CallError
     let mut file = None;
     for attempt in 0..10 {
         match OpenOptions::new()
-            .read(true)
-            .write(true)
+            .access_mode(PIPE_CLIENT_ACCESS)
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(&pipe)
         {
@@ -455,7 +461,103 @@ fn call_windows(service_name: &str, req: &Request) -> Result<Response, CallError
             "control pipe {pipe} stayed busy; the service is running but overloaded — retry"
         )));
     };
+    // Verify before the first byte: requests carry backend and SSH secrets.
+    {
+        use std::os::windows::io::AsRawHandle;
+        if let Err(owner) = pipe_owner_trusted(file.as_raw_handle(), service_name, true) {
+            return Err(CallError::Failed(anyhow!(
+                "refusing to send to control pipe {pipe}: it is owned by {owner}, not the \
+                 middleWHERE service. Another process may be impersonating the service."
+            )));
+        }
+    }
     finish(exchange(&mut file, req))
+}
+
+/// Whether the pipe's server side was created by the service. Any local user
+/// can create a pipe with this name while the service is down, but only the
+/// creator's token owner lands in the pipe's owner field, and an unprivileged
+/// token can't claim SYSTEM, Administrators, or `NT SERVICE\<svc>` as owner.
+/// `allow_self` also trusts our own user SID (a daemon we ran by hand); same
+/// user is not a privilege boundary. `Err` carries the owner SID.
+#[cfg(windows)]
+fn pipe_owner_trusted(
+    pipe: std::os::windows::io::RawHandle,
+    service_name: &str,
+    allow_self: bool,
+) -> Result<(), String> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, IsWellKnownSid, LookupAccountNameW, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let rc = unsafe {
+        GetSecurityInfo(
+            pipe as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 || owner.is_null() {
+        return Err(format!("<unreadable owner, error {rc}>"));
+    }
+    // Free the descriptor (which owns `owner`) on every return below.
+    struct FreeSd(PSECURITY_DESCRIPTOR);
+    impl Drop for FreeSd {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
+    let _sd = FreeSd(sd);
+
+    let well_known = unsafe {
+        IsWellKnownSid(owner, WinLocalSystemSid) != 0
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+    };
+    if well_known {
+        return Ok(());
+    }
+
+    let account: Vec<u16> = format!(r"NT SERVICE\{service_name}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sid = vec![0u8; 68]; // SECURITY_MAX_SID_SIZE
+    let mut sid_len = sid.len() as u32;
+    let mut dom = vec![0u16; 256];
+    let mut dom_len = dom.len() as u32;
+    let mut sid_use = 0;
+    let resolved = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr() as *mut c_void,
+            &mut sid_len,
+            dom.as_mut_ptr(),
+            &mut dom_len,
+            &mut sid_use,
+        )
+    } != 0;
+    if resolved && unsafe { EqualSid(owner, sid.as_mut_ptr() as PSID) } != 0 {
+        return Ok(());
+    }
+    // SAFETY: GetSecurityInfo returned a valid owner SID, freed with `_sd`.
+    let text =
+        unsafe { mw_core::winsid::sid_string(owner) }.unwrap_or_else(|| "<unknown SID>".into());
+    if allow_self && Some(&text) == mw_core::winsid::process_user_sid().as_ref() {
+        return Ok(());
+    }
+    Err(text)
 }
 
 #[cfg(test)]
@@ -463,6 +565,82 @@ mod tests {
     use super::*;
     use mw_core::config::{EngineKind, Policy};
     use mw_core::secret::SecretStr;
+
+    /// A pipe this test process creates is owned by our token's default owner:
+    /// our own user SID when not elevated (what a squatter from another account
+    /// gets, simulated with allow_self=false), or BUILTIN\Administrators when
+    /// elevated, which is always trusted.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_owner_check_rejects_unprivileged_creator() {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let name = format!(r"\\.\pipe\mwsqlctl-owner-test-{}", std::process::id());
+        let wname: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let server = unsafe {
+            CreateNamedPipeW(
+                wname.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                0,
+                1,
+                512,
+                512,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE, "create test pipe");
+        let client = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .expect("open test pipe");
+
+        let elevated = unsafe {
+            let mut tok: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok),
+                0
+            );
+            let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut n = 0;
+            let ok = GetTokenInformation(
+                tok,
+                TokenElevation,
+                &mut e as *mut _ as *mut c_void,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut n,
+            );
+            CloseHandle(tok);
+            ok != 0 && e.TokenIsElevated != 0
+        };
+
+        let as_other_user = pipe_owner_trusted(client.as_raw_handle(), "mwsqld", false);
+        let as_self = pipe_owner_trusted(client.as_raw_handle(), "mwsqld", true);
+        unsafe { CloseHandle(server) };
+        assert!(as_self.is_ok(), "own pipe must be trusted: {as_self:?}");
+        if elevated {
+            assert!(
+                as_other_user.is_ok(),
+                "admin-owned pipe is trusted: {as_other_user:?}"
+            );
+        } else {
+            let owner = as_other_user.expect_err("another user's pipe must be rejected");
+            assert_eq!(
+                Some(owner),
+                mw_core::winsid::process_user_sid(),
+                "owner should be our own user SID"
+            );
+        }
+    }
 
     fn bastion_input() -> ops::BastionInput {
         ops::BastionInput {

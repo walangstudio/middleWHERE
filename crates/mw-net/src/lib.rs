@@ -4,5 +4,6 @@ pub mod idle;
 pub mod mysql_client;
 pub mod mysql_server;
 pub mod router;
+pub mod session_conn;
 pub mod ssh;
 pub mod wire;

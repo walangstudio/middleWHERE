@@ -4,6 +4,8 @@ mod client;
 mod proto;
 mod server;
 
+use std::time::Duration;
+
 use tokio::net::TcpStream;
 
 use mw_core::config::{ClientAuth, EngineKind, Policy};
@@ -89,6 +91,7 @@ impl Engine for PgEngine {
         session: &Session,
         backend: &dyn Backend,
         policy: &Policy,
+        idle_timeout: Duration,
     ) -> Result<(), EngineError> {
         let be = backend
             .as_any()
@@ -100,6 +103,7 @@ impl Engine for PgEngine {
             &session.client_username_seen,
             &be.0,
             policy,
+            idle_timeout,
         )
         .await
     }

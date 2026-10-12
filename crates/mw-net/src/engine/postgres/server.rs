@@ -3,6 +3,7 @@
 //! is rejected without desyncing the stream.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,12 +12,16 @@ use tracing::{info, warn};
 
 use mw_core::audit::{AuditEvent, Decision as AuditDecision};
 use mw_core::config::{ClientAuth, Policy};
-use mw_core::policy::{self, Decision};
+use mw_core::policy::{self, Decision, TxnEffect, TxnState};
 use mw_core::token::verify_pg_cleartext;
 
-use super::client::PgPool;
+use super::client::{PgManager, PgPool};
 use super::proto::{self, PgProtoError, Startup};
 use crate::engine::EngineError;
+use crate::idle::{next_wait, within_idle};
+use crate::session_conn::SessionConn;
+
+type PinnedConn<'a> = SessionConn<'a, PgManager>;
 
 const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
@@ -118,7 +123,7 @@ pub async fn handshake(
         std::process::id() as i32,
         rand::random::<i32>(),
     ));
-    greeting.extend_from_slice(&proto::ready_for_query());
+    greeting.extend_from_slice(&proto::ready_for_query(b'I'));
     proto::write_raw(stream, &greeting).await?;
 
     Ok(PgSession {
@@ -555,6 +560,16 @@ fn inline_params(sql: &str, rendered: &[String]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn rfq_status(t: &TxnState) -> u8 {
+    if t.failed {
+        b'E'
+    } else if t.in_txn {
+        b'T'
+    } else {
+        b'I'
+    }
+}
+
 type ResultSet = (Vec<String>, Vec<Vec<Option<Vec<u8>>>>, String);
 
 /// Run already-firewalled SQL on the backend, collecting the full result.
@@ -569,14 +584,20 @@ async fn run_query(
     let mut affected: u64 = 0;
     for m in msgs {
         match m {
+            // Sent even for zero rows, so an empty SELECT keeps its columns.
+            SimpleQueryMessage::RowDescription(desc) => {
+                cols = desc.iter().map(|c| c.name().to_string()).collect();
+            }
             SimpleQueryMessage::Row(r) => {
                 if cols.is_empty() {
                     cols = r.columns().iter().map(|c| c.name().to_string()).collect();
                 }
                 rows.push(
                     (0..r.columns().len())
-                        .map(|i| r.get(i).map(|s| s.as_bytes().to_vec()))
-                        .collect(),
+                        // try_get, not get: get panics on a value that isn't
+                        // UTF-8, and a release build aborts the whole daemon.
+                        .map(|i| Ok(r.try_get(i)?.map(|s| s.as_bytes().to_vec())))
+                        .collect::<Result<_, tokio_postgres::Error>>()?,
                 );
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
@@ -596,9 +617,9 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
     rs: &ResultSet,
 ) -> Result<(), EngineError> {
     let (cols, rows, tag) = rs;
-    if cols.is_empty() {
-        proto::write_raw(stream, &proto::no_data()).await?;
-    } else {
+    // NoData belongs to the extended protocol; a simple-query statement with no
+    // result set (SET, BEGIN, ...) gets only CommandComplete.
+    if !cols.is_empty() {
         // Simple-query path has no type info; advertise text (OID 25).
         let typed: Vec<(String, i32)> = cols.iter().map(|n| (n.clone(), 25)).collect();
         proto::write_raw(stream, &proto::row_description(&typed)).await?;
@@ -615,10 +636,10 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
 /// for server-side prepared-statement reuse and then sends no further
 /// Describe). Returns (param type OIDs, [(col name, col type OID)]).
 async fn backend_describe(
-    pool: &PgPool,
+    conn: &mut PinnedConn<'_>,
     sql: &str,
 ) -> Result<(Vec<i32>, Vec<(String, i32)>), String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = conn.get().await.map_err(|e| e.to_string())?;
     let stmt = client.prepare(sql).await.map_err(|e| e.to_string())?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
     let cols = stmt
@@ -629,19 +650,24 @@ async fn backend_describe(
     Ok((params, cols))
 }
 
-/// Execute already-firewalled SQL and stream ONLY DataRows + CommandComplete
-/// (no RowDescription — Execute must never send it; the client got the field
-/// structure from Describe). On failure writes an ErrorResponse.
-async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
+/// Firewall + execute, writing the protocol result frames (no ReadyForQuery,
+/// no ParseComplete/BindComplete: the caller owns those). `with_description`
+/// is false for an extended-protocol Execute, which must send only DataRows +
+/// CommandComplete (the client got the field structure from Describe).
+/// Returns whether it succeeded; on deny/backend failure it has already
+/// written an ErrorResponse.
+async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     env_name: &str,
     client_user: &str,
     sql: &str,
-    pool: &PgPool,
+    backend: &mut Pinned<'_>,
     pol: &Policy,
+    with_description: bool,
 ) -> Result<bool, EngineError> {
     let started = std::time::Instant::now();
-    if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
+    let (decision, effects) = policy::check(sql, pol, &policy::PG_PROFILE);
+    if let Decision::Deny(reason) = decision {
         info!(env = env_name, reason, "pg policy DENY");
         AuditEvent::new(
             env_name,
@@ -660,7 +686,7 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         return Ok(false);
     }
-    let client = match pool.get().await {
+    let client = match backend.conn.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend unavailable");
@@ -672,7 +698,24 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(false);
         }
     };
-    let rs = match run_query(&client, sql).await {
+    let ran = run_query(client, sql).await;
+    backend.last_statement = std::time::Instant::now();
+    // COMMIT of a failed transaction is a rollback; say so, as Postgres does.
+    // The tag otherwise comes from the SQL text, which would claim "COMMIT".
+    let committed_failed =
+        backend.txn.failed && matches!(effects.as_slice(), [TxnEffect::End { .. }]);
+    let ran = ran.map(|(cols, rows, tag)| {
+        let tag = if committed_failed {
+            "ROLLBACK".to_string()
+        } else {
+            tag
+        };
+        (cols, rows, tag)
+    });
+    backend
+        .txn
+        .apply(&effects, ran.is_ok(), &policy::PG_PROFILE);
+    let rs = match ran {
         Ok(rs) => rs,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend query error");
@@ -691,13 +734,23 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
                 &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
             )
             .await?;
+            // A closed client means the pinned connection (and any open
+            // transaction) is gone; end the session rather than continue on
+            // a fresh one.
+            if client.is_closed() {
+                return Err(EngineError::Backend("backend connection lost".into()));
+            }
             return Ok(false);
         }
     };
-    for row in &rs.1 {
-        proto::write_raw(stream, &proto::data_row(row)).await?;
+    if with_description {
+        write_result_set(stream, &rs).await?;
+    } else {
+        for row in &rs.1 {
+            proto::write_raw(stream, &proto::data_row(row)).await?;
+        }
+        proto::write_raw(stream, &proto::command_complete(&rs.2)).await?;
     }
-    proto::write_raw(stream, &proto::command_complete(&rs.2)).await?;
     AuditEvent::new(
         env_name,
         client_user,
@@ -711,84 +764,12 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(true)
 }
 
-/// Firewall + execute, writing the protocol result frames (no ReadyForQuery,
-/// no ParseComplete/BindComplete — caller owns those). Returns the rendered
-/// outcome; on deny/backend failure it has already written an ErrorResponse.
-async fn firewalled_exec<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    env_name: &str,
-    client_user: &str,
-    sql: &str,
-    pool: &PgPool,
-    pol: &Policy,
-) -> Result<bool, EngineError> {
-    let started = std::time::Instant::now();
-    if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
-        info!(env = env_name, reason, "pg policy DENY");
-        AuditEvent::new(
-            env_name,
-            client_user,
-            sql,
-            AuditDecision::Deny,
-            Some(reason.to_string()),
-            None,
-            started.elapsed(),
-        )
-        .emit();
-        proto::write_raw(
-            stream,
-            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason),
-        )
-        .await?;
-        return Ok(false);
-    }
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(env = env_name, err = %e, "pg backend unavailable");
-            proto::write_raw(
-                stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
-            )
-            .await?;
-            return Ok(false);
-        }
-    };
-    let rs = match run_query(&client, sql).await {
-        Ok(rs) => rs,
-        Err(e) => {
-            warn!(env = env_name, err = %e, "pg backend query error");
-            AuditEvent::new(
-                env_name,
-                client_user,
-                sql,
-                AuditDecision::Deny,
-                Some("backend error".into()),
-                None,
-                started.elapsed(),
-            )
-            .emit();
-            proto::write_raw(
-                stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
-            )
-            .await?;
-            return Ok(false);
-        }
-    };
-    let n = rs.1.len() as u64;
-    write_result_set(stream, &rs).await?;
-    AuditEvent::new(
-        env_name,
-        client_user,
-        sql,
-        AuditDecision::Allow,
-        None,
-        Some(n),
-        started.elapsed(),
-    )
-    .emit();
-    Ok(true)
+/// The session's backend connection and the transaction state it is in.
+struct Pinned<'a> {
+    conn: PinnedConn<'a>,
+    txn: TxnState,
+    /// When the backend last ran a statement; bounds idle-in-transaction.
+    last_statement: std::time::Instant,
 }
 
 struct Prepared {
@@ -811,7 +792,13 @@ pub async fn serve(
     client_user: &str,
     pool: &PgPool,
     pol: &Policy,
+    idle_timeout: Duration,
 ) -> Result<(), EngineError> {
+    let mut backend = Pinned {
+        conn: PinnedConn::new(pool),
+        txn: TxnState::default(),
+        last_statement: std::time::Instant::now(),
+    };
     let mut prepared: HashMap<String, Prepared> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     // Set once an error occurs in an extended-protocol series; suppresses
@@ -819,7 +806,12 @@ pub async fn serve(
     let mut skip_until_sync = false;
 
     loop {
-        let (tag, body) = match proto::read_message(stream).await {
+        let wait = next_wait(idle_timeout, backend.txn.in_txn, backend.last_statement);
+        let Some(msg) = within_idle(wait, proto::read_message(stream)).await else {
+            info!(env = env_name, "closing idle session");
+            return Ok(());
+        };
+        let (tag, body) = match msg {
             Ok(m) => m,
             Err(PgProtoError::Closed) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -835,9 +827,10 @@ pub async fn serve(
                 if sql.trim().is_empty() {
                     proto::write_raw(stream, &proto::empty_query_response()).await?;
                 } else {
-                    let _ = firewalled_exec(stream, env_name, client_user, &sql, pool, pol).await?;
+                    let _ =
+                        exec(stream, env_name, client_user, &sql, &mut backend, pol, true).await?;
                 }
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
 
             // --- Extended query ---
@@ -877,7 +870,7 @@ pub async fn serve(
                 }
                 // Parse+Describe on the backend for accurate param/result
                 // metadata (pgjdbc relies on this for prepared reuse).
-                match backend_describe(pool, &m.query).await {
+                match backend_describe(&mut backend.conn, &m.query).await {
                     Ok((param_oids, col_meta)) => {
                         prepared.insert(
                             m.stmt.clone(),
@@ -890,12 +883,21 @@ pub async fn serve(
                         proto::write_raw(stream, &proto::parse_complete()).await?;
                     }
                     Err(e) => {
+                        // A failed prepare aborts an open transaction too.
+                        backend
+                            .txn
+                            .apply(&[TxnEffect::Other], false, &policy::PG_PROFILE);
                         warn!(env = env_name, err = %e, "pg backend parse failed");
                         proto::write_raw(
                             stream,
                             &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed"),
                         )
                         .await?;
+                        // Same rule as exec(): a dead pinned connection ends
+                        // the session.
+                        if backend.conn.current().is_some_and(|c| c.is_closed()) {
+                            return Err(EngineError::Backend("backend connection lost".into()));
+                        }
                         skip_until_sync = true;
                     }
                 }
@@ -1005,7 +1007,17 @@ pub async fn serve(
                 };
                 // Execute streams ONLY DataRows + CommandComplete; the client
                 // already has the field structure from Describe.
-                if !exec_rows_only(stream, env_name, client_user, &sql, pool, pol).await? {
+                if !exec(
+                    stream,
+                    env_name,
+                    client_user,
+                    &sql,
+                    &mut backend,
+                    pol,
+                    false,
+                )
+                .await?
+                {
                     skip_until_sync = true;
                 }
             }
@@ -1022,7 +1034,7 @@ pub async fn serve(
             b'H' => { /* Flush: we write eagerly, nothing buffered */ }
             b'S' => {
                 skip_until_sync = false;
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
             b'X' => return Ok(()),
             other => {
@@ -1032,7 +1044,7 @@ pub async fn serve(
                     &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "unsupported message"),
                 )
                 .await?;
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
         }
     }

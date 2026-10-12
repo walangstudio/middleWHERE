@@ -179,6 +179,27 @@ pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
         "" => None,
         db => Some(percent_decode(db)),
     };
+    // Dropping a TLS requirement would silently downgrade to plaintext (or
+    // fail later with a generic connect error on hosts that enforce TLS).
+    for (k, v) in url.query_pairs() {
+        let key = k.to_ascii_lowercase().replace(['-', '_'], "");
+        let val = v.to_ascii_lowercase().replace('-', "_");
+        // Any value of a TLS parameter other than an explicit "off"/"maybe".
+        let requires_tls = matches!(
+            key.as_str(),
+            "sslmode" | "ssl" | "usessl" | "requiressl" | "tls" | "sslaccept" | "sslrootcert"
+        ) && !matches!(
+            val.as_str(),
+            "disable" | "disabled" | "allow" | "prefer" | "preferred" | "false" | "0" | "off"
+        );
+        if requires_tls {
+            bail!(
+                "the url asks for TLS ({k}={v}), but middleWHERE does not support TLS to \
+                 the backend yet. Reach the database through a --bastion (the SSH tunnel \
+                 encrypts it) or over a trusted network, and drop {k} from the url."
+            );
+        }
+    }
     Ok(ParsedUrl {
         engine,
         host,
@@ -374,11 +395,30 @@ mod tests {
         let p = parse_connection_url("mysql://u@h").unwrap();
         assert_eq!(p.port, None);
         assert_eq!(p.database, None);
+        for ok in [
+            "postgres://u@h/d?sslmode=disable",
+            "postgres://u@h/d?sslmode=prefer",
+            "mysql://u@h/d?ssl-mode=PREFERRED",
+            "mysql://u@h/d?tls=false",
+        ] {
+            assert!(parse_connection_url(ok).is_ok(), "{ok}");
+        }
 
         for (raw, want) in [
             ("mssql://u@h/d", "unsupported url scheme"),
             ("postgres://h/d", "no username"),
             ("not a url", "parse connection url"),
+            ("postgres://u@h/d?sslmode=require", "does not support TLS"),
+            (
+                "postgres://u@h/d?sslmode=verify-full",
+                "does not support TLS",
+            ),
+            ("mysql://u@h/d?ssl-mode=REQUIRED", "does not support TLS"),
+            ("mysql://u@h/d?useSSL=true", "does not support TLS"),
+            ("mysql://u@h/d?tls=true", "does not support TLS"),
+            ("postgres://u@h/d?ssl=require", "does not support TLS"),
+            ("postgres://u@h/d?ssl=on", "does not support TLS"),
+            ("postgres://u@h/d?sslaccept=strict", "does not support TLS"),
         ] {
             let err = parse_connection_url(raw).unwrap_err().to_string();
             assert!(err.contains(want), "{raw}: got {err}");

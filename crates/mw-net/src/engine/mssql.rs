@@ -1,6 +1,8 @@
 //! MS SQL (TDS) engine: stub. The protocol surface (prelogin + auth + TDS
 //! token streams) is not implemented; the daemon refuses MsSql envs at bind.
 
+use std::time::Duration;
+
 use tokio::net::TcpStream;
 
 use mw_core::config::{ClientAuth, EngineKind, Policy};
@@ -55,6 +57,7 @@ impl Engine for MsSqlEngine {
         _session: &Session,
         _backend: &dyn Backend,
         _policy: &Policy,
+        _idle_timeout: Duration,
     ) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }

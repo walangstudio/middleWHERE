@@ -14,8 +14,6 @@ use mysql_async::{Column, Row, Value};
 
 use crate::framing::write_lenenc_int;
 
-const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
-
 pub fn column_count_packet(n: u64) -> Vec<u8> {
     let mut p = Vec::with_capacity(9);
     write_lenenc_int(&mut p, n);
@@ -84,12 +82,12 @@ pub fn row_text_packet(row: &Row) -> Vec<u8> {
 /// OK packet that terminates a result set under CLIENT_DEPRECATE_EOF.
 /// The 0xFE marker distinguishes it from the auth-time OK (0x00) for clients
 /// that need to know it's the EOF position.
-pub fn ok_eof_packet(affected_rows: u64, warnings: u16) -> Vec<u8> {
+pub fn ok_eof_packet(affected_rows: u64, warnings: u16, status: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(11);
     p.push(0xFE); // EOF-style marker
     write_lenenc_int(&mut p, affected_rows);
     write_lenenc_int(&mut p, 0); // last_insert_id
-    p.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    p.extend_from_slice(&status.to_le_bytes());
     p.extend_from_slice(&warnings.to_le_bytes());
     p
 }
@@ -142,7 +140,7 @@ mod tests {
 
     #[test]
     fn ok_eof_marker_is_fe() {
-        let p = ok_eof_packet(0, 0);
+        let p = ok_eof_packet(0, 0, 0x0002);
         assert_eq!(p[0], 0xFE);
     }
 

@@ -60,6 +60,53 @@ impl BackendManager {
 pub enum BackendError {
     #[error("mysql backend: {0}")]
     Mysql(#[from] mysql_async::Error),
+    #[error("mysql backend session setup: {0}")]
+    Setup(String),
+}
+
+/// sql_mode flags that change how MySQL lexes SQL away from what the firewall
+/// (sqlparser's MySQL dialect) parses: backslash escapes in strings, and
+/// double quotes as identifiers. `ANSI` is the combination mode that implies
+/// `ANSI_QUOTES`.
+const LEXER_MODES: &[&str] = &["NO_BACKSLASH_ESCAPES", "ANSI_QUOTES", "ANSI"];
+
+/// Make the backend lex like the firewall: utf8mb4 client charset, and none of
+/// [`LEXER_MODES`], whatever the server or `init_connect` configured.
+/// Re-reads the result and refuses the connection if it didn't take. Clients
+/// can't change these back: `sql_mode` and the charset variables are off the
+/// SET allowlist.
+async fn pin_session(conn: &mut Conn) -> Result<(), BackendError> {
+    // autocommit too: the proxy reports the session's transaction state from
+    // a known start, whatever init_connect or the server default says.
+    conn.query_drop("SET NAMES utf8mb4, autocommit = 1").await?;
+    let mode: String = conn
+        .query_first("SELECT @@SESSION.sql_mode")
+        .await?
+        .unwrap_or_default();
+    let kept: Vec<&str> = mode
+        .split(',')
+        .filter(|m| !m.is_empty() && !LEXER_MODES.contains(&m.to_ascii_uppercase().as_str()))
+        .collect();
+    // Mode names are [A-Z_]; anything else would not be safe to inline.
+    if kept
+        .iter()
+        .any(|m| !m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    {
+        return Err(BackendError::Setup(format!("unexpected sql_mode {mode:?}")));
+    }
+    conn.query_drop(format!("SET SESSION sql_mode = '{}'", kept.join(",")))
+        .await?;
+    let (mode, charset): (String, String) = conn
+        .query_first("SELECT @@SESSION.sql_mode, @@SESSION.character_set_client")
+        .await?
+        .unwrap_or_default();
+    let upper = mode.to_ascii_uppercase();
+    if upper.split(',').any(|m| LEXER_MODES.contains(&m)) || charset != "utf8mb4" {
+        return Err(BackendError::Setup(format!(
+            "backend kept sql_mode {mode:?} / charset {charset:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl Manager for BackendManager {
@@ -67,7 +114,9 @@ impl Manager for BackendManager {
     type Error = BackendError;
 
     async fn create(&self) -> Result<Conn, BackendError> {
-        Ok(Conn::new(self.opts.to_opts()).await?)
+        let mut conn = Conn::new(self.opts.to_opts()).await?;
+        pin_session(&mut conn).await?;
+        Ok(conn)
     }
 
     async fn recycle(&self, conn: &mut Conn, _: &Metrics) -> RecycleResult<BackendError> {

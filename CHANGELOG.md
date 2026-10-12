@@ -5,6 +5,91 @@ ISO-8601. Semantic versioning; the single workspace version applies to all
 three binaries. Pre-1.0: minor versions may carry breaking changes, patch
 versions are fixes only.
 
+## [0.4.1] - 2026-10-12
+
+### Security
+
+- **Read-only firewall bypasses closed.**
+  - A write wrapped in a CTE (`WITH x AS (UPDATE ... RETURNING *) SELECT ...`,
+    `WITH a AS (SELECT 1) UPDATE ...`) passed as a read. Every statement node
+    at any depth now goes through the statement-kind allowlist.
+  - MySQL runs text that the SQL parser treats as a comment: `/*! ... */`
+    executable comments, `--x` with no space after the dashes, and nested
+    `/* /* */ ... */`. Statements containing any of these are now denied.
+  - `SET a=1, b=2` only checked `a`. Every assignment is now checked against
+    the session-variable allowlist.
+  - The MySQL `/*+ SET_VAR(...) */` optimizer hint, which sets session
+    variables for one statement, is denied.
+  - Read-only clients can no longer take locks that outlive a statement:
+    `SELECT ... FOR UPDATE/SHARE`, `GET_LOCK`, and the Postgres advisory
+    locks need a policy that allows DML. So do `nextval`/`setval`,
+    `pg_notify` and the large-object writers. On MySQL, so does switching to
+    `SERIALIZABLE`, which makes InnoDB lock every row a plain SELECT reads.
+  - Postgres functions that write, run a query given as a string, touch
+    files, or change settings are now denied: `set_config`, `lo_*`,
+    `dblink_*`, `pg_ls_*dir`, `query_to_xml`, `ts_stat`, `ts_rewrite`,
+    `pg_logical_slot_*`, `pg_stat_reset*`, `pg_terminate_backend`,
+    `pg_reload_conf` and others. That includes calls in a `FROM` clause
+    (`SELECT * FROM pg_ls_dir('.')`).
+  - Client charsets that lex differently from UTF-8 (GBK, SJIS, Big5) are
+    denied in `SET NAMES`, `client_encoding` and `collation_connection`, and
+    so is MySQL latin1, which the proxy would mangle by forwarding query text
+    as UTF-8. Postgres sessions stay UTF-8: any other `client_encoding` made a row
+    decode panic, which aborted the whole daemon.
+    `SET NAMES DEFAULT` is denied, and MySQL's
+    `character_set_client`/`_connection` are off the allowlist. Under such a
+    charset the server could read different string boundaries than the
+    firewall checked.
+  - Backend connections pin the settings that change how the server lexes
+    SQL, whatever the server config says. MySQL sessions run in utf8mb4 with
+    `NO_BACKSLASH_ESCAPES`, `ANSI_QUOTES` and `ANSI` removed from `sql_mode`;
+    a connection where that doesn't take is refused. Postgres runs with
+    `standard_conforming_strings=on`. Clients can't change them back.
+- **Session state no longer leaks between clients.** Each client session now
+  holds one backend connection for its whole life. When the session ends, that
+  connection is closed instead of returning to the pool. Before, every
+  statement could land on a different pooled connection. One client's
+  `USE`/`SET`/`BEGIN` then reached the next client, and `BEGIN; UPDATE;
+  ROLLBACK` could commit the UPDATE. `max_pool` now caps concurrent client
+  sessions per env. A session idle for `idle_timeout_secs` (default 300s) is
+  closed, so idle clients can't hold every slot; inside an open transaction
+  the window counts from the last statement, so pings can't hold locks.
+- **The Windows CLI verifies the control pipe before sending secrets.** It
+  refuses a pipe whose owner isn't SYSTEM, Administrators,
+  `NT SERVICE\<svc>`, or the caller. Before, any local user who created the
+  pipe name while the service was down could receive passwords and keys from
+  `cred add`/`bastion add`. The `middlewhere-admins` group can also no longer
+  add pipe instances of its own while the service runs.
+- **The Postgres cleartext-auth guard covers live adds.** `env add` and
+  `import` over the admin channel now refuse a Postgres env on a non-loopback
+  listen host before anything is saved. Before, such an env went live, and
+  the next service restart then refused to start.
+
+### Fixed
+
+- `env add --url` rejects a URL that requires TLS (`sslmode=require`,
+  `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, `sslaccept`, ...)
+  and says why. Before, the setting
+  was dropped and the connection went unencrypted. Backend TLS is not
+  supported yet; reach such hosts through a bastion.
+- Postgres simple-query statements with no result set (`SET`, `BEGIN`) no
+  longer send an extended-protocol `NoData` message, which made clients such
+  as tokio-postgres fail with "unexpected message". A zero-row `SELECT` still
+  describes its columns.
+- The transaction status reported to clients is now real: Postgres
+  `ReadyForQuery` says `T`/`E` inside an open or failed transaction, and MySQL
+  OK packets carry `IN_TRANS` and the actual autocommit flag. A `COMMIT` of a
+  failed Postgres transaction reports `ROLLBACK`, as Postgres does.
+- A MySQL server error in the middle of a result set no longer ends the client
+  session; connection-level errors still do.
+- MySQL writes report their real affected-row count and generated insert id.
+  Both were always 0, which broke ORM optimistic locking and auto-increment
+  keys under a writable policy.
+- `SET autocommit` must use a plain value (`0`/`1`/`ON`/`OFF`); the proxy
+  reports the autocommit state to the client from it. MySQL backend sessions
+  start with autocommit on. A batch of several statements may not contain
+  BEGIN/COMMIT/ROLLBACK/DDL/`SET autocommit`; send those on their own.
+
 ## [0.4.0] - 2026-07-18
 
 ### Changed

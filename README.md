@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-300%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-336%20passing-brightgreen)
 
 middleWHERE sits between whoever runs queries and your real database. The
 caller connects to a local port with a name and a token, and runs SQL. They
@@ -64,7 +64,7 @@ the SHA-256, and extract the three binaries anywhere you like.
 Linux / macOS:
 
 ```sh
-ver=v0.4.0; target=x86_64-unknown-linux-gnu      # or aarch64-…, x86_64-apple-darwin, aarch64-apple-darwin
+ver=v0.4.1; target=x86_64-unknown-linux-gnu      # or aarch64-…, x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/middlewhere-${ver}-${target}.tar.gz"
 curl -fsSLO "https://github.com/walangstudio/middleWHERE/releases/download/${ver}/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS         # macOS: shasum -a 256 -c SHA256SUMS
@@ -74,7 +74,7 @@ tar -xzf "middlewhere-${ver}-${target}.tar.gz" -C /opt/middlewhere   # or any di
 Windows (PowerShell):
 
 ```powershell
-$ver = 'v0.4.0'; $target = 'x86_64-pc-windows-msvc'
+$ver = 'v0.4.1'; $target = 'x86_64-pc-windows-msvc'
 $asset = "middlewhere-$ver-$target.zip"
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/$asset" -OutFile $asset
 irm "https://github.com/walangstudio/middleWHERE/releases/download/$ver/SHA256SUMS" -OutFile SHA256SUMS
@@ -581,6 +581,15 @@ fixes only. See [CHANGELOG.md](CHANGELOG.md).
   prepared statements (the Connector/J default) work.
 - The local port has no TLS because it is loopback-only. Turn SSL off client
   side.
+- There is no TLS to the backend yet. Put a bastion in front of a remote
+  database, and the SSH tunnel encrypts the hop. `env add --url` refuses a URL
+  that requires TLS (`sslmode=require` and friends) rather than silently
+  connecting in the clear.
+- Each client connection gets its own backend connection for its whole
+  session, so `USE`, `SET`, transactions and temp tables behave as they would
+  on a direct connection, and nothing carries over to another client. The
+  backend connection is closed when the client disconnects. `max_pool`
+  (default 16) caps concurrent client sessions per environment.
 - Read-only is the default and is enforced for every client, whatever the
   backend account can do.
 - Config changes from `mwsqlctl` or the standalone wizard apply live over the
@@ -592,9 +601,13 @@ fixes only. See [CHANGELOG.md](CHANGELOG.md).
   pin. Sessions already running finish on the old tunnel. If an environment
   cannot reconnect under the new pin it is stopped rather than left on the old
   one, and the command tells you which went offline.
-- Idle backend connections are dropped after 5 minutes of no activity (per-env
-  `idle_timeout_secs`, default 300s; `mwsqld run --idle-timeout-secs <N>`
-  overrides every env, `0` disables). An in-flight query is never interrupted.
+- A client session that sends nothing for 5 minutes is closed, which frees its
+  backend connection (per-env `idle_timeout_secs`, default 300s;
+  `mwsqld run --idle-timeout-secs <N>` overrides every env, `0` disables). An
+  in-flight query is never interrupted. Clients that stay connected for long
+  idle stretches (DBeaver, IDEs) should enable keep-alive or reconnect. A
+  session sitting in an open transaction gets the same window counted from its
+  last statement, so pings can't keep its locks held.
 - SSH bastions use password auth today. Key auth and auto-reconnect are not
   wired yet.
 

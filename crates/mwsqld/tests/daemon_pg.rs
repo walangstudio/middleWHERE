@@ -96,6 +96,18 @@ fn build_pg_state(
     ks
 }
 
+async fn show_timeout(c: &tokio_postgres::Client) -> String {
+    c.simple_query("SHOW statement_timeout")
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap()
+}
+
 #[tokio::test]
 async fn pg_bind_shutdown_no_backend() {
     let tmp = TempDir::new().unwrap();
@@ -162,9 +174,50 @@ async fn pg_end_to_end_through_real_backend() {
     let err = client.simple_query("DROP TABLE IF EXISTS x").await;
     assert!(err.is_err(), "DROP must be denied by the firewall");
 
+    // A write hidden in a CTE is still a write.
+    assert!(
+        client
+            .simple_query("WITH x AS (UPDATE pg_class SET relname = relname WHERE false RETURNING 1) SELECT * FROM x")
+            .await
+            .is_err(),
+        "DML inside a CTE must be denied under ReadOnly"
+    );
+
+    // Session state sticks within a session and never reaches another one.
+    client
+        .simple_query("SET statement_timeout = '4321ms'")
+        .await
+        .unwrap();
+    assert_eq!(show_timeout(&client).await, "4321ms");
+    drop(client);
+    let (other, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("second session");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    assert_ne!(
+        show_timeout(&other).await,
+        "4321ms",
+        "first session's SET leaked into the second"
+    );
+
+    // A zero-row SELECT still describes its columns.
+    let msgs = other
+        .simple_query("SELECT 1 AS a, 2 AS b WHERE false")
+        .await
+        .expect("empty select");
+    let cols = msgs.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::RowDescription(c) => {
+            Some(c.iter().map(|c| c.name().to_string()).collect::<Vec<_>>())
+        }
+        _ => None,
+    });
+    assert_eq!(cols, Some(vec!["a".to_string(), "b".to_string()]));
+
     // Extended query protocol (Parse/Bind/Describe/Execute) with a bound
     // scalar parameter — the path DBeaver/pgjdbc use.
-    let row = client
+    let row = other
         .query_one("SELECT ($1::int + 1) AS v", &[&41i32])
         .await
         .expect("extended scalar param");
@@ -174,7 +227,7 @@ async fn pg_end_to_end_through_real_backend() {
     // Binary array bind parameter via `= ANY($1)` (catalog-introspection
     // pattern). Exercises decode_bin_array end-to-end against real PG.
     let arr: Vec<i32> = vec![1, 3];
-    let rows = client
+    let rows = other
         .query(
             "SELECT x FROM (VALUES (1),(2),(3)) t(x) WHERE x = ANY($1) ORDER BY x",
             &[&arr],
@@ -186,7 +239,7 @@ async fn pg_end_to_end_through_real_backend() {
 
     // Firewall still applies on the extended path.
     assert!(
-        client
+        other
             .execute("CREATE TABLE evil(x int)", &[])
             .await
             .is_err(),
