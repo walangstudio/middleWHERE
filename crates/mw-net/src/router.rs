@@ -144,10 +144,16 @@ where
     let started = Instant::now();
     let (decision, effects) = policy::check(sql, pol, &policy::MYSQL_PROFILE);
     if let Some(reason) = decision.reason() {
+        // Back off to a char boundary: slicing inside a multibyte char
+        // panics, and a panic aborts the daemon.
+        let mut cut = sql.len().min(64);
+        while !sql.is_char_boundary(cut) {
+            cut -= 1;
+        }
         info!(
             env = env_name,
             reason = reason,
-            sql_first = &sql[..sql.len().min(64)],
+            sql_first = &sql[..cut],
             "policy DENY"
         );
         AuditEvent::new(
@@ -301,6 +307,7 @@ where
             for c in &cols {
                 write_packet(stream, seq, &wire::column_def_packet(c)).await?;
             }
+            write_packet(stream, seq, &wire::eof_packet(status)).await?;
             let mut n: u64 = 0;
             loop {
                 match qr.next().await {
@@ -312,7 +319,7 @@ where
                     Err(e) => return Ok(Err(e)),
                 }
             }
-            write_packet(stream, seq, &wire::ok_eof_packet(0, 0, status)).await?;
+            write_packet(stream, seq, &wire::eof_packet(status)).await?;
             Ok(Ok(n))
         }
         _ => {

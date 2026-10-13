@@ -107,6 +107,15 @@ async fn proxy_select_one_through_real_backend() {
         denied.is_err(),
         "policy must deny DELETE even on a no-op WHERE"
     );
+
+    // A denied query with a multibyte char across the 64-byte log cut used to
+    // panic, aborting the daemon. The session must survive it.
+    let prefix = "DELETE FROM t WHERE x='";
+    let sql = format!("{prefix}{}é'", "a".repeat(63 - prefix.len()));
+    assert!(!sql.is_char_boundary(64));
+    assert!(conn.query_drop(sql).await.is_err());
+    let v: i64 = conn.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(v, 1, "session survives a denied multibyte query");
 }
 
 /// Proxy in front of MYSQL_TEST_URL with a backend pool of `max_pool`.

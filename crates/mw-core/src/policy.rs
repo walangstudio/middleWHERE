@@ -513,7 +513,7 @@ fn txn_effect(stmt: &Statement) -> TxnEffect {
 fn base_txn_effect(stmt: &Statement) -> TxnEffect {
     use Statement::*;
     match stmt {
-        // EXPLAIN ANALYZE runs the statement. Plain EXPLAIN, DESCRIBE and
+        // EXPLAIN ANALYZE runs the statement. Plain EXPLAIN, DESCRIBE, SHOW INDEX and
         // SHOW COLUMNS still hold a metadata lock until the transaction ends
         // under autocommit=0.
         Explain {
@@ -522,6 +522,17 @@ fn base_txn_effect(stmt: &Statement) -> TxnEffect {
             ..
         } => txn_effect(statement),
         Explain { .. } | ExplainTable { .. } | ShowColumns { .. } => TxnEffect::Work,
+        // sqlparser has no SHOW INDEX: it lands here as an identifier list.
+        ShowVariable { variable }
+            if variable.first().is_some_and(|i| {
+                matches!(
+                    i.value.to_ascii_uppercase().as_str(),
+                    "INDEX" | "INDEXES" | "KEYS"
+                )
+            }) =>
+        {
+            TxnEffect::Work
+        }
         StartTransaction { .. } => TxnEffect::Begin,
         Commit { chain }
         | Rollback {
@@ -1479,7 +1490,12 @@ mod tests {
         m.after("SET autocommit = 0", true, my);
         m.after("EXPLAIN SELECT * FROM t", true, my);
         assert!(m.in_txn);
-        for sql in ["DESCRIBE t", "SHOW COLUMNS FROM t"] {
+        for sql in [
+            "DESCRIBE t",
+            "SHOW COLUMNS FROM t",
+            "SHOW INDEX FROM t",
+            "SHOW KEYS FROM t",
+        ] {
             let mut m = TxnState::default();
             m.after("SET autocommit = 0", true, my);
             m.after(sql, true, my);
