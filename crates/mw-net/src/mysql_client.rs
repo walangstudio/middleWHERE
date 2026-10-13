@@ -116,9 +116,10 @@ async fn pin_session(conn: &mut Conn) -> Result<(), BackendError> {
 }
 
 /// Server errors sent right before the server closes the connection:
-/// shutdown, killed connection (MariaDB) or session, idle timeout.
+/// shutdown, killed connection (MariaDB) or session, offline mode, idle
+/// timeout.
 pub fn hangs_up(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(se) if matches!(se.code, 1053 | 1927 | 3169 | 4031))
+    matches!(e, mysql_async::Error::Server(se) if matches!(se.code, 1053 | 1927 | 3032 | 3169 | 4031))
 }
 
 impl Manager for BackendManager {
@@ -181,7 +182,7 @@ mod tests {
                 state: "HY000".into(),
             })
         };
-        for code in [1053, 1927, 3169, 4031] {
+        for code in [1053, 1927, 3032, 3169, 4031] {
             assert!(hangs_up(&server(code)), "{code}");
         }
         // Deadlock, duplicate key: the connection is still good.

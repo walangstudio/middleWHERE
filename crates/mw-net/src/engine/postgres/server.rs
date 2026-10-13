@@ -644,10 +644,6 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Ask the backend to Parse+Describe the statement so we can report accurate
-/// ParameterDescription / RowDescription to the client (pgjdbc caches these
-/// for server-side prepared-statement reuse and then sends no further
-/// Describe). Returns (param type OIDs, [(col name, col type OID)]).
 /// The server's SQLSTATE, if the error came from the server, and an audit
 /// reason. Display on a server error says only "db error".
 fn backend_error(e: &tokio_postgres::Error) -> (Option<&str>, String) {
@@ -660,6 +656,17 @@ fn backend_error(e: &tokio_postgres::Error) -> (Option<&str>, String) {
     }
 }
 
+/// SQLSTATEs the server sends right before it closes the connection:
+/// shutdown, crash, idle-session and idle-in-transaction timeouts. The
+/// client may not have seen the close yet.
+fn hangs_up(state: Option<&str>) -> bool {
+    matches!(state, Some("57P01" | "57P02" | "57P05" | "25P03"))
+}
+
+/// Ask the backend to Parse+Describe the statement so we can report accurate
+/// ParameterDescription / RowDescription to the client (pgjdbc caches these
+/// for server-side prepared-statement reuse and then sends no further
+/// Describe). Returns (param type OIDs, [(col name, col type OID)]).
 /// On failure: the server's SQLSTATE, if it gave one, and an audit reason.
 async fn backend_describe(
     conn: &mut PinnedConn<'_>,
@@ -780,24 +787,28 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend query error");
+            let (state, reason) = backend_error(&e);
             AuditEvent::new(
                 env_name,
                 client_user,
                 sql,
                 AuditDecision::Error,
-                Some(backend_error(&e).1),
+                Some(reason),
                 None,
                 started.elapsed(),
             )
             .emit();
             // The server's SQLSTATE, so serialization and deadlock retries
             // still work; the message stays hidden.
-            let state = backend_error(&e).0.unwrap_or(SQLSTATE_INTERNAL);
-            proto::write_raw(stream, &proto::error_response(state, "query failed")).await?;
+            proto::write_raw(
+                stream,
+                &proto::error_response(state.unwrap_or(SQLSTATE_INTERNAL), "query failed"),
+            )
+            .await?;
             // A closed client means the pinned connection (and any open
             // transaction) is gone; end the session rather than continue on
             // a fresh one.
-            if client.is_closed() {
+            if client.is_closed() || hangs_up(state) {
                 return Err(EngineError::Backend("backend connection lost".into()));
             }
             return Ok(false);
@@ -968,7 +979,9 @@ pub async fn serve(
                         .await?;
                         // Same rule as exec(): a dead pinned connection ends
                         // the session.
-                        if backend.conn.current().is_some_and(|c| c.is_closed()) {
+                        if hangs_up(state.as_deref())
+                            || backend.conn.current().is_some_and(|c| c.is_closed())
+                        {
                             return Err(EngineError::Backend("backend connection lost".into()));
                         }
                         skip_until_sync = true;
