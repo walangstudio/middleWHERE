@@ -690,21 +690,12 @@ struct BackendFailure {
     lost: Option<&'static str>,
 }
 
-/// Whether the session's backend connection is lost, as the SQLSTATE to
-/// report. Closed: 08006. Any other error without a server code (an
-/// unexpected or unparsable message) leaves the protocol out of step and the
-/// statement possibly run: 08007, which drivers don't blindly retry.
-fn connection_lost(
-    e: &tokio_postgres::Error,
-    client: &tokio_postgres::Client,
-) -> Option<&'static str> {
-    if e.is_closed() || client.is_closed() {
-        Some(SQLSTATE_CONNECTION_FAILURE)
-    } else if e.as_db_error().is_none() {
-        Some(SQLSTATE_RESOLUTION_UNKNOWN)
-    } else {
-        None
-    }
+/// Whether the session's backend connection is lost: closed, or any other
+/// error without a server code (an unexpected or unparsable message), which
+/// leaves the protocol out of step. The caller picks the SQLSTATE: whether
+/// the statement may have run depends on what was sent, not on how it died.
+fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
+    e.as_db_error().is_none() || client.is_closed()
 }
 
 /// Ask the backend to Parse+Describe the statement so we can report accurate
@@ -726,7 +717,8 @@ async fn backend_describe(
         BackendFailure {
             state: state.map(str::to_string),
             reason,
-            lost: connection_lost(&e, client),
+            // Prepare runs nothing: safe to reconnect and retry.
+            lost: connection_lost(&e, client).then_some(SQLSTATE_CONNECTION_FAILURE),
         }
     })?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
@@ -850,7 +842,10 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 started.elapsed(),
             )
             .emit();
-            let (frame, lost) = failure_frame(state, connection_lost(&e, client), "query failed");
+            // The statement was sent and may have run: 08007, which drivers
+            // don't blindly retry.
+            let lost = connection_lost(&e, client).then_some(SQLSTATE_RESOLUTION_UNKNOWN);
+            let (frame, lost) = failure_frame(state, lost, "query failed");
             proto::write_raw(stream, &frame).await?;
             // The pinned connection (and any open transaction) is gone; end
             // the session rather than continue on a fresh one.
