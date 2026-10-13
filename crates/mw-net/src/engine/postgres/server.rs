@@ -310,9 +310,11 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             }
             .into()),
             OID_INT2 if b.len() == 2 => Ok(i16::from_be_bytes([b[0], b[1]]).to_string()),
-            OID_INT4 | OID_OID if b.len() == 4 => {
+            OID_INT4 if b.len() == 4 => {
                 Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
             }
+            // Unsigned: an OID above 2^31 must not render negative.
+            OID_OID if b.len() == 4 => Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()),
             OID_INT8 if b.len() == 8 => {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(&b[..8]);
@@ -330,7 +332,7 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             // (regclass, regnamespace, regproc, regtype, xid, cid, ...).
             // DBeaver's catalog queries bind these heavily.
             2202 | 2203 | 2204 | 2205 | 2206 | 4089 | 24 | 28 | 29 | 2200 if b.len() == 4 => {
-                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+                Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
             }
             // Unknown binary type. If it contains a NUL it cannot be text
             // (which would corrupt the query string) — treat fixed 2/4/8-byte
@@ -476,9 +478,9 @@ fn typed_literal(oid: i32, lit: String) -> String {
     {
         return parenthesize_negative(lit);
     }
-    // Text-like params: a quoted literal already resolves as text would,
-    // and some positions take only a string literal (`LIKE .. ESCAPE $1`).
-    if matches!(oid, 25 | 1043 | 1042 | 19) && lit.starts_with('\'') {
+    // text/varchar: a quoted literal already resolves as text would. Not
+    // bpchar or name: the cast is what gives them padding and truncation.
+    if matches!(oid, 25 | 1043) && lit.starts_with('\'') {
         return lit;
     }
     match Type::from_oid(oid as u32) {
@@ -1441,6 +1443,14 @@ mod tests {
         assert!(policy::check(&esc, &Policy::ReadOnly, &policy::PG_PROFILE)
             .0
             .is_allow());
+        assert_eq!(
+            typed_literal(1042, "'abc  '".into()),
+            r#"CAST('abc  ' AS pg_catalog."bpchar")"#
+        );
+        assert_eq!(
+            render_scalar(OID_OID, 1, Some(&u32::MAX.to_be_bytes())).unwrap(),
+            "4294967295"
+        );
         assert_eq!(render_scalar(701, 0, Some(b"NaN")).unwrap(), "'NaN'");
         assert_eq!(
             render_scalar(701, 0, Some(b"-Infinity")).unwrap(),
