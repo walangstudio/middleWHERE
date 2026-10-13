@@ -26,6 +26,7 @@ type PinnedConn<'a> = SessionConn<'a, PgManager>;
 const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_INTERNAL: &str = "58000";
+const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 
@@ -78,7 +79,7 @@ pub async fn handshake(
     if tag != b'p' {
         let _ = proto::write_raw(
             stream,
-            &proto::error_response(SQLSTATE_INVALID_PASSWORD, "expected password message"),
+            &proto::fatal_response(SQLSTATE_INVALID_PASSWORD, "expected password message"),
         )
         .await;
         return Err(EngineError::Auth);
@@ -100,7 +101,7 @@ pub async fn handshake(
         warn!(env = expected_env_name, user = %user, "pg auth denied");
         let _ = proto::write_raw(
             stream,
-            &proto::error_response(SQLSTATE_INVALID_PASSWORD, "password authentication failed"),
+            &proto::fatal_response(SQLSTATE_INVALID_PASSWORD, "password authentication failed"),
         )
         .await;
         return Err(EngineError::Auth);
@@ -667,11 +668,17 @@ fn hangs_up(state: Option<&str>) -> bool {
 /// over. The server's SQLSTATE, so retries still work; the message stays
 /// hidden. FATAL when the connection is gone, as Postgres reports it.
 fn failure_frame(state: Option<&str>, closed: bool, message: &str) -> (Vec<u8>, bool) {
-    let code = state.unwrap_or(SQLSTATE_INTERNAL);
-    if closed || hangs_up(state) {
-        (proto::fatal_response(code, message), true)
-    } else {
-        (proto::error_response(code, message), false)
+    match state {
+        Some(s) if hangs_up(state) => (proto::fatal_response(s, message), true),
+        // A server error on a live connection: the session goes on.
+        Some(s) if !closed => (proto::error_response(s, message), false),
+        // No server code (I/O, closed) or the connection died under the
+        // error: report the loss, not a code that invites a retry. Not
+        // is_closed() alone: the connection task may not have noticed yet.
+        _ => (
+            proto::fatal_response(SQLSTATE_CONNECTION_FAILURE, message),
+            true,
+        ),
     }
 }
 
@@ -886,6 +893,14 @@ pub async fn serve(
         let wait = next_wait(idle_timeout, backend.txn.in_txn, backend.last_statement);
         let Some(msg) = within_idle(wait, proto::read_message(stream)).await else {
             info!(env = env_name, "closing idle session");
+            // As Postgres's own idle timeouts say it. Best effort: the
+            // client may be gone already.
+            let state = if backend.txn.in_txn { "25P03" } else { "57P05" };
+            let _ = proto::write_raw(
+                stream,
+                &proto::fatal_response(state, "terminating idle session"),
+            )
+            .await;
             return Ok(());
         };
         let (tag, body) = match msg {
@@ -1153,7 +1168,11 @@ mod tests {
             assert!(!lost, "{state}");
             assert_eq!(frame, proto::error_response(state, "x"));
         }
-        assert!(failure_frame(None, true, "x").1, "a closed client ends it");
+        for (state, closed) in [(None, false), (None, true), (Some("40001"), true)] {
+            let (frame, lost) = failure_frame(state, closed, "x");
+            assert!(lost, "{state:?} {closed}");
+            assert_eq!(frame, proto::fatal_response("08006", "x"));
+        }
     }
 
     /// Build a 1-D PG binary array payload.
