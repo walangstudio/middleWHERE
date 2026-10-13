@@ -267,7 +267,8 @@ fn elem_type_name(oid: i32) -> &'static str {
         1042 => "bpchar",
         1043 => "varchar",
         19 => "name",
-        18 => "char",
+        // Quoted: bare `char` is character(1), which truncates.
+        18 => "\"char\"",
         _ => "text",
     }
 }
@@ -359,7 +360,14 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             let t = matches!(s.as_ref(), "t" | "true" | "TRUE" | "1" | "y" | "yes");
             Ok(if t { "TRUE" } else { "FALSE" }.into())
         } else if is_numeric_oid(oid) && is_safe_numeric(&s) {
-            Ok(s.into_owned())
+            // NaN/Infinity are valid input but not bare SQL tokens: quoted.
+            if s.bytes()
+                .any(|b| b.is_ascii_alphabetic() && !b.eq_ignore_ascii_case(&b'e'))
+            {
+                Ok(quote_lit(&s))
+            } else {
+                Ok(s.into_owned())
+            }
         } else {
             // Not a numeric type, or a numeric-typed value that is not a
             // valid numeric literal: quote it. A quoted value in a numeric
@@ -458,6 +466,16 @@ fn render_param(oid: i32, fmt: i16, bytes: &Option<Vec<u8>>) -> Result<String, &
 /// from the client.
 fn typed_literal(oid: i32, lit: String) -> String {
     use tokio_postgres::types::Type;
+    // A bare integer already means what an integer Bind means, and some
+    // positions take only a literal (`FETCH FIRST $1 ROWS`, which the
+    // firewall's parser rejects as a CAST).
+    let integer = lit.strip_prefix('-').unwrap_or(&lit);
+    if matches!(oid, OID_INT2 | OID_INT4 | OID_INT8 | OID_OID)
+        && !integer.is_empty()
+        && integer.bytes().all(|b| b.is_ascii_digit())
+    {
+        return lit;
+    }
     match Type::from_oid(oid as u32) {
         Some(t) if t != Type::UNKNOWN => format!("CAST({lit} AS pg_catalog.\"{}\")", t.name()),
         _ => lit,
@@ -1385,6 +1403,22 @@ mod tests {
             .0
             .is_allow());
         assert_eq!(typed_literal(0, "'x'".into()), "'x'");
+        // Integers stay bare: FETCH FIRST takes only a literal.
+        let fetch = inline_params(
+            "SELECT * FROM t OFFSET $1 ROWS FETCH FIRST $2 ROWS ONLY",
+            &[typed_literal(20, "0".into()), typed_literal(20, "5".into())],
+        );
+        assert!(
+            policy::check(&fetch, &Policy::ReadOnly, &policy::PG_PROFILE)
+                .0
+                .is_allow()
+        );
+        assert_eq!(render_scalar(701, 0, Some(b"NaN")).unwrap(), "'NaN'");
+        assert_eq!(
+            render_scalar(701, 0, Some(b"-Infinity")).unwrap(),
+            "'-Infinity'"
+        );
+        assert_eq!(render_scalar(701, 0, Some(b"1e5")).unwrap(), "1e5");
         let arr = typed_literal(1007, "ARRAY[1,2]".into());
         assert_eq!(arr, r#"CAST(ARRAY[1,2] AS pg_catalog."_int4")"#);
         assert!(policy::check(
