@@ -103,6 +103,12 @@ versions are fixes only.
   deadlocks and serialization failures work. The message stays hidden. A
   backend error that precedes a disconnect (shutdown, killed session, offline
   mode, idle timeouts) ends the session.
+- A lost Postgres backend connection ends the client session with a FATAL
+  error: `08007` (transaction resolution unknown) when a statement was in
+  flight, `08006` during Parse, or the server's own code when it sent one.
+  The proxy's idle timeout sends `25P03`/`57P05` and a failed login `28P01`
+  as FATAL, as Postgres does. Writes to a client that stops reading time
+  out instead of holding the session and its locks.
 - MySQL requests may carry only one statement, whatever the policy. The proxy
   relays one result set, so a later statement's error was lost and a failed
   write in a batch was reported as success.

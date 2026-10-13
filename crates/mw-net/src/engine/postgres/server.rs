@@ -670,15 +670,14 @@ fn hangs_up(state: Option<&str>) -> bool {
 /// over. The server's SQLSTATE, so retries still work; the message stays
 /// hidden. FATAL when the connection is gone, as Postgres reports it.
 /// `lost` is the SQLSTATE that reports a lost connection, if it is lost.
+/// A server code wins over it: the server said what became of the
+/// statement, as a direct client would have seen.
 fn failure_frame(state: Option<&str>, lost: Option<&str>, message: &str) -> (Vec<u8>, bool) {
     match (state, lost) {
-        (Some(s), _) if hangs_up(state) => (proto::fatal_response(s, message), true),
-        // Report the loss, not a server code that invites a retry.
-        (_, Some(code)) => (proto::fatal_response(code, message), true),
-        _ => (
-            proto::error_response(state.unwrap_or(SQLSTATE_INTERNAL), message),
-            false,
-        ),
+        (Some(s), None) if !hangs_up(state) => (proto::error_response(s, message), false),
+        (Some(s), _) => (proto::fatal_response(s, message), true),
+        (None, Some(code)) => (proto::fatal_response(code, message), true),
+        (None, None) => (proto::error_response(SQLSTATE_INTERNAL, message), false),
     }
 }
 
@@ -695,7 +694,7 @@ struct BackendFailure {
 /// leaves the protocol out of step. The caller picks the SQLSTATE: whether
 /// the statement may have run depends on what was sent, not on how it died.
 fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
-    e.as_db_error().is_none() || client.is_closed()
+    e.is_closed() || e.as_db_error().is_none() || client.is_closed()
 }
 
 /// Ask the backend to Parse+Describe the statement so we can report accurate
@@ -1202,11 +1201,15 @@ mod tests {
             assert!(!lost, "{state}");
             assert_eq!(frame, proto::error_response(state, "x"));
         }
-        for (state, code) in [(None, "08006"), (Some("40001"), "08006"), (None, "08007")] {
-            let (frame, lost) = failure_frame(state, Some(code), "x");
-            assert!(lost, "{state:?}");
+        for code in ["08006", "08007"] {
+            let (frame, lost) = failure_frame(None, Some(code), "x");
+            assert!(lost, "{code}");
             assert_eq!(frame, proto::fatal_response(code, "x"));
         }
+        // The server's code says what became of the statement: it wins.
+        let (frame, lost) = failure_frame(Some("23505"), Some("08007"), "x");
+        assert!(lost);
+        assert_eq!(frame, proto::fatal_response("23505", "x"));
         // No server code and no lost connection (pool acquire): recoverable.
         let (frame, lost) = failure_frame(None, None, "x");
         assert!(!lost);
