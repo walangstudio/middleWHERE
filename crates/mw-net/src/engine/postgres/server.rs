@@ -27,6 +27,7 @@ const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_INTERNAL: &str = "58000";
 const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
+const SQLSTATE_RESOLUTION_UNKNOWN: &str = "08007";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
@@ -668,14 +669,12 @@ fn hangs_up(state: Option<&str>) -> bool {
 /// The client's frame for a backend failure, and whether the session is
 /// over. The server's SQLSTATE, so retries still work; the message stays
 /// hidden. FATAL when the connection is gone, as Postgres reports it.
-fn failure_frame(state: Option<&str>, lost: bool, message: &str) -> (Vec<u8>, bool) {
-    match state {
-        Some(s) if hangs_up(state) => (proto::fatal_response(s, message), true),
+/// `lost` is the SQLSTATE that reports a lost connection, if it is lost.
+fn failure_frame(state: Option<&str>, lost: Option<&str>, message: &str) -> (Vec<u8>, bool) {
+    match (state, lost) {
+        (Some(s), _) if hangs_up(state) => (proto::fatal_response(s, message), true),
         // Report the loss, not a server code that invites a retry.
-        _ if lost => (
-            proto::fatal_response(SQLSTATE_CONNECTION_FAILURE, message),
-            true,
-        ),
+        (_, Some(code)) => (proto::fatal_response(code, message), true),
         _ => (
             proto::error_response(state.unwrap_or(SQLSTATE_INTERNAL), message),
             false,
@@ -684,18 +683,28 @@ fn failure_frame(state: Option<&str>, lost: bool, message: &str) -> (Vec<u8>, bo
 }
 
 /// A backend call failed: the server's SQLSTATE, if it gave one, an audit
-/// reason, and whether the connection is gone.
+/// reason, and the SQLSTATE for the loss if the connection is gone.
 struct BackendFailure {
     state: Option<String>,
     reason: String,
-    lost: bool,
+    lost: Option<&'static str>,
 }
 
-/// Any error without a server code (closed, I/O, an unexpected or
-/// unparsable message) leaves the backend in an unknown state: the statement
-/// may have run, and the protocol may be out of step.
-fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
-    e.as_db_error().is_none() || client.is_closed()
+/// Whether the session's backend connection is lost, as the SQLSTATE to
+/// report. Closed: 08006. Any other error without a server code (an
+/// unexpected or unparsable message) leaves the protocol out of step and the
+/// statement possibly run: 08007, which drivers don't blindly retry.
+fn connection_lost(
+    e: &tokio_postgres::Error,
+    client: &tokio_postgres::Client,
+) -> Option<&'static str> {
+    if e.is_closed() || client.is_closed() {
+        Some(SQLSTATE_CONNECTION_FAILURE)
+    } else if e.as_db_error().is_none() {
+        Some(SQLSTATE_RESOLUTION_UNKNOWN)
+    } else {
+        None
+    }
 }
 
 /// Ask the backend to Parse+Describe the statement so we can report accurate
@@ -710,7 +719,7 @@ async fn backend_describe(
     let client = conn.get().await.map_err(|e| BackendFailure {
         state: None,
         reason: format!("pool: {e}"),
-        lost: false,
+        lost: None,
     })?;
     let stmt = client.prepare(sql).await.map_err(|e| {
         let (state, reason) = backend_error(&e);
@@ -1188,23 +1197,23 @@ mod tests {
     #[test]
     fn hang_up_states_end_the_session_as_fatal() {
         for state in ["57P01", "57P02", "57P05", "25P03"] {
-            let (frame, lost) = failure_frame(Some(state), false, "x");
+            let (frame, lost) = failure_frame(Some(state), None, "x");
             assert!(lost, "{state}");
             assert_eq!(frame, proto::fatal_response(state, "x"));
         }
         // Serialization failure, deadlock: retryable, the session goes on.
         for state in ["40001", "40P01"] {
-            let (frame, lost) = failure_frame(Some(state), false, "x");
+            let (frame, lost) = failure_frame(Some(state), None, "x");
             assert!(!lost, "{state}");
             assert_eq!(frame, proto::error_response(state, "x"));
         }
-        for state in [None, Some("40001")] {
-            let (frame, lost) = failure_frame(state, true, "x");
+        for (state, code) in [(None, "08006"), (Some("40001"), "08006"), (None, "08007")] {
+            let (frame, lost) = failure_frame(state, Some(code), "x");
             assert!(lost, "{state:?}");
-            assert_eq!(frame, proto::fatal_response("08006", "x"));
+            assert_eq!(frame, proto::fatal_response(code, "x"));
         }
-        // No server code on a live connection (pool, protocol): recoverable.
-        let (frame, lost) = failure_frame(None, false, "x");
+        // No server code and no lost connection (pool acquire): recoverable.
+        let (frame, lost) = failure_frame(None, None, "x");
         assert!(!lost);
         assert_eq!(frame, proto::error_response(SQLSTATE_INTERNAL, "x"));
     }
