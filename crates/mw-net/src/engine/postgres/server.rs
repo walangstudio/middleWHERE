@@ -474,11 +474,25 @@ fn typed_literal(oid: i32, lit: String) -> String {
         && !integer.is_empty()
         && integer.bytes().all(|b| b.is_ascii_digit())
     {
+        return parenthesize_negative(lit);
+    }
+    // Text-like params: a quoted literal already resolves as text would,
+    // and some positions take only a string literal (`LIKE .. ESCAPE $1`).
+    if matches!(oid, 25 | 1043 | 1042 | 19) && lit.starts_with('\'') {
         return lit;
     }
     match Type::from_oid(oid as u32) {
         Some(t) if t != Type::UNKNOWN => format!("CAST({lit} AS pg_catalog.\"{}\")", t.name()),
-        _ => lit,
+        _ => parenthesize_negative(lit),
+    }
+}
+
+/// `10-$1` with -5 must not become `10--5`, which starts a comment.
+fn parenthesize_negative(lit: String) -> String {
+    if lit.starts_with('-') {
+        format!("({lit})")
+    } else {
+        lit
     }
 }
 
@@ -1413,6 +1427,20 @@ mod tests {
                 .0
                 .is_allow()
         );
+        assert_eq!(
+            inline_params("SELECT 10-$1", &[typed_literal(23, "-5".into())]),
+            "SELECT 10-(-5)"
+        );
+        let esc = inline_params(
+            "SELECT 'a_b' LIKE $1 ESCAPE $2",
+            &[
+                typed_literal(25, "'a\\_b'".into()),
+                typed_literal(25, "'\\'".into()),
+            ],
+        );
+        assert!(policy::check(&esc, &Policy::ReadOnly, &policy::PG_PROFILE)
+            .0
+            .is_allow());
         assert_eq!(render_scalar(701, 0, Some(b"NaN")).unwrap(), "'NaN'");
         assert_eq!(
             render_scalar(701, 0, Some(b"-Infinity")).unwrap(),
