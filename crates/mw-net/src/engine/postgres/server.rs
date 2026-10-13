@@ -27,6 +27,7 @@ const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_INTERNAL: &str = "58000";
 const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
+const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 
@@ -79,7 +80,7 @@ pub async fn handshake(
     if tag != b'p' {
         let _ = proto::write_raw(
             stream,
-            &proto::fatal_response(SQLSTATE_INVALID_PASSWORD, "expected password message"),
+            &proto::fatal_response(SQLSTATE_PROTOCOL_VIOLATION, "expected password message"),
         )
         .await;
         return Err(EngineError::Auth);
@@ -667,34 +668,55 @@ fn hangs_up(state: Option<&str>) -> bool {
 /// The client's frame for a backend failure, and whether the session is
 /// over. The server's SQLSTATE, so retries still work; the message stays
 /// hidden. FATAL when the connection is gone, as Postgres reports it.
-fn failure_frame(state: Option<&str>, closed: bool, message: &str) -> (Vec<u8>, bool) {
+fn failure_frame(state: Option<&str>, lost: bool, message: &str) -> (Vec<u8>, bool) {
     match state {
         Some(s) if hangs_up(state) => (proto::fatal_response(s, message), true),
-        // A server error on a live connection: the session goes on.
-        Some(s) if !closed => (proto::error_response(s, message), false),
-        // No server code (I/O, closed) or the connection died under the
-        // error: report the loss, not a code that invites a retry. Not
-        // is_closed() alone: the connection task may not have noticed yet.
-        _ => (
+        // Report the loss, not a server code that invites a retry.
+        _ if lost => (
             proto::fatal_response(SQLSTATE_CONNECTION_FAILURE, message),
             true,
         ),
+        _ => (
+            proto::error_response(state.unwrap_or(SQLSTATE_INTERNAL), message),
+            false,
+        ),
     }
+}
+
+/// A backend call failed: the server's SQLSTATE, if it gave one, an audit
+/// reason, and whether the connection is gone.
+struct BackendFailure {
+    state: Option<String>,
+    reason: String,
+    lost: bool,
+}
+
+/// The request's own error says so even before the client notices the close.
+fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
+    e.is_closed() || client.is_closed()
 }
 
 /// Ask the backend to Parse+Describe the statement so we can report accurate
 /// ParameterDescription / RowDescription to the client (pgjdbc caches these
 /// for server-side prepared-statement reuse and then sends no further
 /// Describe). Returns (param type OIDs, [(col name, col type OID)]).
-/// On failure: the server's SQLSTATE, if it gave one, and an audit reason.
 async fn backend_describe(
     conn: &mut PinnedConn<'_>,
     sql: &str,
-) -> Result<(Vec<i32>, Vec<(String, i32)>), (Option<String>, String)> {
-    let client = conn.get().await.map_err(|e| (None, format!("pool: {e}")))?;
+) -> Result<(Vec<i32>, Vec<(String, i32)>), BackendFailure> {
+    // No connection to lose yet: recoverable, as in exec.
+    let client = conn.get().await.map_err(|e| BackendFailure {
+        state: None,
+        reason: format!("pool: {e}"),
+        lost: false,
+    })?;
     let stmt = client.prepare(sql).await.map_err(|e| {
         let (state, reason) = backend_error(&e);
-        (state.map(str::to_string), reason)
+        BackendFailure {
+            state: state.map(str::to_string),
+            reason,
+            lost: connection_lost(&e, client),
+        }
     })?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
     let cols = stmt
@@ -817,7 +839,7 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 started.elapsed(),
             )
             .emit();
-            let (frame, lost) = failure_frame(state, client.is_closed(), "query failed");
+            let (frame, lost) = failure_frame(state, connection_lost(&e, client), "query failed");
             proto::write_raw(stream, &frame).await?;
             // The pinned connection (and any open transaction) is gone; end
             // the session rather than continue on a fresh one.
@@ -895,10 +917,15 @@ pub async fn serve(
             info!(env = env_name, "closing idle session");
             // As Postgres's own idle timeouts say it. Best effort: the
             // client may be gone already.
+            // Bounded: a client that stopped reading must not hold the
+            // session (and its locks) open.
             let state = if backend.txn.in_txn { "25P03" } else { "57P05" };
-            let _ = proto::write_raw(
-                stream,
-                &proto::fatal_response(state, "terminating idle session"),
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                proto::write_raw(
+                    stream,
+                    &proto::fatal_response(state, "terminating idle session"),
+                ),
             )
             .await;
             return Ok(());
@@ -974,7 +1001,11 @@ pub async fn serve(
                         );
                         proto::write_raw(stream, &proto::parse_complete()).await?;
                     }
-                    Err((state, reason)) => {
+                    Err(BackendFailure {
+                        state,
+                        reason,
+                        lost,
+                    }) => {
                         // A failed prepare aborts an open transaction too.
                         backend
                             .txn
@@ -990,11 +1021,8 @@ pub async fn serve(
                             std::time::Duration::ZERO,
                         )
                         .emit();
-                        let (frame, lost) = failure_frame(
-                            state.as_deref(),
-                            backend.conn.current().is_some_and(|c| c.is_closed()),
-                            "statement parse failed",
-                        );
+                        let (frame, lost) =
+                            failure_frame(state.as_deref(), lost, "statement parse failed");
                         proto::write_raw(stream, &frame).await?;
                         if lost {
                             return Err(EngineError::Backend("backend connection lost".into()));
@@ -1168,11 +1196,15 @@ mod tests {
             assert!(!lost, "{state}");
             assert_eq!(frame, proto::error_response(state, "x"));
         }
-        for (state, closed) in [(None, false), (None, true), (Some("40001"), true)] {
-            let (frame, lost) = failure_frame(state, closed, "x");
-            assert!(lost, "{state:?} {closed}");
+        for state in [None, Some("40001")] {
+            let (frame, lost) = failure_frame(state, true, "x");
+            assert!(lost, "{state:?}");
             assert_eq!(frame, proto::fatal_response("08006", "x"));
         }
+        // No server code on a live connection (pool, protocol): recoverable.
+        let (frame, lost) = failure_frame(None, false, "x");
+        assert!(!lost);
+        assert_eq!(frame, proto::error_response(SQLSTATE_INTERNAL, "x"));
     }
 
     /// Build a 1-D PG binary array payload.
