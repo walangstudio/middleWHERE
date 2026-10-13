@@ -663,6 +663,18 @@ fn hangs_up(state: Option<&str>) -> bool {
     matches!(state, Some("57P01" | "57P02" | "57P05" | "25P03"))
 }
 
+/// The client's frame for a backend failure, and whether the session is
+/// over. The server's SQLSTATE, so retries still work; the message stays
+/// hidden. FATAL when the connection is gone, as Postgres reports it.
+fn failure_frame(state: Option<&str>, closed: bool, message: &str) -> (Vec<u8>, bool) {
+    let code = state.unwrap_or(SQLSTATE_INTERNAL);
+    if closed || hangs_up(state) {
+        (proto::fatal_response(code, message), true)
+    } else {
+        (proto::error_response(code, message), false)
+    }
+}
+
 /// Ask the backend to Parse+Describe the statement so we can report accurate
 /// ParameterDescription / RowDescription to the client (pgjdbc caches these
 /// for server-side prepared-statement reuse and then sends no further
@@ -798,17 +810,11 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 started.elapsed(),
             )
             .emit();
-            // The server's SQLSTATE, so serialization and deadlock retries
-            // still work; the message stays hidden.
-            proto::write_raw(
-                stream,
-                &proto::error_response(state.unwrap_or(SQLSTATE_INTERNAL), "query failed"),
-            )
-            .await?;
-            // A closed client means the pinned connection (and any open
-            // transaction) is gone; end the session rather than continue on
-            // a fresh one.
-            if client.is_closed() || hangs_up(state) {
+            let (frame, lost) = failure_frame(state, client.is_closed(), "query failed");
+            proto::write_raw(stream, &frame).await?;
+            // The pinned connection (and any open transaction) is gone; end
+            // the session rather than continue on a fresh one.
+            if lost {
                 return Err(EngineError::Backend("backend connection lost".into()));
             }
             return Ok(false);
@@ -969,19 +975,13 @@ pub async fn serve(
                             std::time::Duration::ZERO,
                         )
                         .emit();
-                        proto::write_raw(
-                            stream,
-                            &proto::error_response(
-                                state.as_deref().unwrap_or(SQLSTATE_INTERNAL),
-                                "statement parse failed",
-                            ),
-                        )
-                        .await?;
-                        // Same rule as exec(): a dead pinned connection ends
-                        // the session.
-                        if hangs_up(state.as_deref())
-                            || backend.conn.current().is_some_and(|c| c.is_closed())
-                        {
+                        let (frame, lost) = failure_frame(
+                            state.as_deref(),
+                            backend.conn.current().is_some_and(|c| c.is_closed()),
+                            "statement parse failed",
+                        );
+                        proto::write_raw(stream, &frame).await?;
+                        if lost {
                             return Err(EngineError::Backend("backend connection lost".into()));
                         }
                         skip_until_sync = true;
@@ -1139,6 +1139,22 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hang_up_states_end_the_session_as_fatal() {
+        for state in ["57P01", "57P02", "57P05", "25P03"] {
+            let (frame, lost) = failure_frame(Some(state), false, "x");
+            assert!(lost, "{state}");
+            assert_eq!(frame, proto::fatal_response(state, "x"));
+        }
+        // Serialization failure, deadlock: retryable, the session goes on.
+        for state in ["40001", "40P01"] {
+            let (frame, lost) = failure_frame(Some(state), false, "x");
+            assert!(!lost, "{state}");
+            assert_eq!(frame, proto::error_response(state, "x"));
+        }
+        assert!(failure_frame(None, true, "x").1, "a closed client ends it");
+    }
 
     /// Build a 1-D PG binary array payload.
     fn bin_array(elem_oid: i32, elems: &[Option<&[u8]>]) -> Vec<u8> {

@@ -143,11 +143,21 @@ pub fn ready_for_query(status: u8) -> Vec<u8> {
 
 /// `ErrorResponse` ('E') with Severity/Code/Message fields.
 pub fn error_response(sqlstate: &str, message: &str) -> Vec<u8> {
+    severity_response(b"ERROR", sqlstate, message)
+}
+
+/// `ErrorResponse` with severity FATAL: the session ends, no ReadyForQuery
+/// follows.
+pub fn fatal_response(sqlstate: &str, message: &str) -> Vec<u8> {
+    severity_response(b"FATAL", sqlstate, message)
+}
+
+fn severity_response(severity: &[u8], sqlstate: &str, message: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(b'S');
-    put_cstr(&mut p, b"ERROR");
+    put_cstr(&mut p, severity);
     p.push(b'V');
-    put_cstr(&mut p, b"ERROR");
+    put_cstr(&mut p, severity);
     p.push(b'C');
     put_cstr(&mut p, sqlstate.as_bytes());
     p.push(b'M');
