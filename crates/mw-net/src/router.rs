@@ -268,7 +268,10 @@ where
             // Anything else means it (and any transaction on it) is gone, or
             // left unread packets behind; end the session rather than
             // continue on a desynced or fresh connection.
-            if matches!(e, mysql_async::Error::Server(_)) {
+            // Except the ones the server sends right before it hangs up:
+            // shutdown, killed connection, idle timeout.
+            if matches!(&e, mysql_async::Error::Server(se) if !matches!(se.code, 1053 | 1927 | 4031))
+            {
                 Ok(())
             } else {
                 Err(e.into())

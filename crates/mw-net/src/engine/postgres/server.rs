@@ -648,12 +648,22 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
 /// ParameterDescription / RowDescription to the client (pgjdbc caches these
 /// for server-side prepared-statement reuse and then sends no further
 /// Describe). Returns (param type OIDs, [(col name, col type OID)]).
+/// On failure: the server's SQLSTATE, if it gave one, and an audit reason.
 async fn backend_describe(
     conn: &mut PinnedConn<'_>,
     sql: &str,
-) -> Result<(Vec<i32>, Vec<(String, i32)>), String> {
-    let client = conn.get().await.map_err(|e| e.to_string())?;
-    let stmt = client.prepare(sql).await.map_err(|e| e.to_string())?;
+) -> Result<(Vec<i32>, Vec<(String, i32)>), (Option<String>, String)> {
+    let client = conn.get().await.map_err(|e| (None, format!("pool: {e}")))?;
+    let stmt = client
+        .prepare(sql)
+        .await
+        .map_err(|e| match e.as_db_error() {
+            Some(db) => (
+                Some(db.code().code().to_string()),
+                format!("backend: {} {}", db.code().code(), db.message()),
+            ),
+            None => (None, format!("backend: {e}")),
+        })?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
     let cols = stmt
         .columns()
@@ -932,25 +942,28 @@ pub async fn serve(
                         );
                         proto::write_raw(stream, &proto::parse_complete()).await?;
                     }
-                    Err(e) => {
+                    Err((state, reason)) => {
                         // A failed prepare aborts an open transaction too.
                         backend
                             .txn
                             .apply(&[TxnEffect::Other], false, &policy::PG_PROFILE);
-                        warn!(env = env_name, err = %e, "pg backend parse failed");
+                        warn!(env = env_name, err = %reason, "pg backend parse failed");
                         AuditEvent::new(
                             env_name,
                             client_user,
                             &m.query,
                             AuditDecision::Error,
-                            Some(format!("parse: {e}")),
+                            Some(reason),
                             None,
                             std::time::Duration::ZERO,
                         )
                         .emit();
                         proto::write_raw(
                             stream,
-                            &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed"),
+                            &proto::error_response(
+                                state.as_deref().unwrap_or(SQLSTATE_INTERNAL),
+                                "statement parse failed",
+                            ),
                         )
                         .await?;
                         // Same rule as exec(): a dead pinned connection ends

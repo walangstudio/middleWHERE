@@ -497,25 +497,15 @@ pub enum TxnEffect {
 }
 
 fn txn_effect(stmt: &Statement) -> TxnEffect {
-    use Statement::*;
+    let reads = match stmt {
+        // Only the AS SELECT part: a column DEFAULT reads nothing.
+        Statement::CreateTable(ct) => ct.query.as_deref().is_some_and(may_read_table),
+        _ => may_read_table(stmt),
+    };
     match base_txn_effect(stmt) {
-        // SET or SHOW ... WHERE with a subquery or function call opens a
-        // transaction too. Not CREATE TEMPORARY TABLE's DEFAULT CURRENT_TIMESTAMP.
-        TxnEffect::Other
-            if matches!(
-                stmt,
-                SetVariable { .. }
-                    | ShowVariables { .. }
-                    | ShowStatus { .. }
-                    | ShowTables { .. }
-                    | ShowFunctions { .. }
-                    | ShowDatabases { .. }
-                    | ShowSchemas { .. }
-                    | ShowCollation { .. }
-            ) && may_read_table(stmt) =>
-        {
-            TxnEffect::Work
-        }
+        // SET, SHOW ... WHERE or CREATE TEMPORARY TABLE ... AS SELECT with a
+        // subquery or function call opens a transaction too.
+        TxnEffect::Other if reads => TxnEffect::Work,
         e => e,
     }
 }
@@ -1470,6 +1460,15 @@ mod tests {
             &MYSQL_PROFILE,
         );
         assert!(!m.in_txn, "a column default is not a table read");
+        m.after(
+            "CREATE TEMPORARY TABLE t2 AS SELECT * FROM orders",
+            true,
+            &MYSQL_PROFILE,
+        );
+        assert!(
+            m.in_txn,
+            "CREATE TEMPORARY TABLE ... AS SELECT reads a table"
+        );
 
         let my = &MYSQL_PROFILE;
         let mut m = TxnState::default();

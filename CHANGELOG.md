@@ -99,7 +99,8 @@ versions are fixes only.
   audited as `deny`, or not at all.
 - A backend error reaches the client with the server's SQLSTATE (and MySQL
   error code) instead of a generic internal error, so driver retries on
-  deadlocks and serialization failures work. The message stays hidden.
+  deadlocks and serialization failures work. The message stays hidden. A
+  MySQL shutdown, killed-connection or idle-timeout error ends the session.
 - MySQL requests may carry only one statement, whatever the policy. The proxy
   relays one result set, so a later statement's error was lost and a failed
   write in a batch was reported as success.

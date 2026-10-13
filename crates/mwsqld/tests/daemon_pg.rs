@@ -215,6 +215,20 @@ async fn pg_end_to_end_through_real_backend() {
     });
     assert_eq!(cols, Some(vec!["a".to_string(), "b".to_string()]));
 
+    // The server's SQLSTATE reaches the client, its message doesn't: simple
+    // query and Parse both.
+    for (err, want) in [
+        (other.simple_query("SELECT 1/0").await.unwrap_err(), "22012"),
+        (
+            other.prepare("SELECT * FROM mw_missing").await.unwrap_err(),
+            "42P01",
+        ),
+    ] {
+        let db = err.as_db_error().expect("a server error");
+        assert_eq!(db.code().code(), want);
+        assert!(!db.message().contains("mw_missing") && !db.message().contains("division"));
+    }
+
     // Extended query protocol (Parse/Bind/Describe/Execute) with a bound
     // scalar parameter — the path DBeaver/pgjdbc use.
     let row = other
