@@ -63,6 +63,7 @@ impl Engine for MySqlEngine {
                 env_name: s.env_name,
                 client_username_seen: s.client_username_seen,
                 database: s.database,
+                settings: Vec::new(),
             }),
             // handshake already wrote the ERR packet; mirror the old daemon's
             // swallow-and-close behavior.

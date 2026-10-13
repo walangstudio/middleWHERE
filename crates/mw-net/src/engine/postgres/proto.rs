@@ -170,16 +170,21 @@ fn severity_response(severity: &[u8], sqlstate: &str, message: &str) -> Vec<u8> 
 /// prepare) so the client decodes text values correctly. All values are
 /// sent in text format.
 pub fn row_description(cols: &[(String, i32)]) -> Vec<u8> {
+    row_description_formats(cols, &[])
+}
+
+/// `RowDescription` with each column's result format (missing = text).
+pub fn row_description_formats(cols: &[(String, i32)], formats: &[i16]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&(cols.len() as i16).to_be_bytes());
-    for (name, oid) in cols {
+    for (i, (name, oid)) in cols.iter().enumerate() {
         put_cstr(&mut p, name.as_bytes());
         p.extend_from_slice(&0i32.to_be_bytes()); // table OID
         p.extend_from_slice(&0i16.to_be_bytes()); // column attr no.
         p.extend_from_slice(&oid.to_be_bytes()); // type OID
         p.extend_from_slice(&(-1i16).to_be_bytes()); // type size (var)
         p.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        p.extend_from_slice(&0i16.to_be_bytes()); // format = text
+        p.extend_from_slice(&formats.get(i).copied().unwrap_or(0).to_be_bytes());
     }
     msg(b'T', &p)
 }
@@ -265,16 +270,27 @@ fn read_i32(buf: &[u8], pos: &mut usize) -> Option<i32> {
 pub struct ParseMsg {
     pub stmt: String,
     pub query: String,
+    /// Client-declared parameter type OIDs (0 = let the server infer). The
+    /// backend prepare must use them: a driver rejects a description that
+    /// contradicts what it declared.
+    pub param_oids: Vec<u32>,
 }
 
 pub fn parse_parse(body: &[u8]) -> Option<ParseMsg> {
-    // We only need the statement name and query text; the client-declared
-    // param type OIDs are ignored — authoritative types come from the
-    // backend Parse+Describe in `backend_describe`.
     let mut p = 0;
     let stmt = read_cstr(body, &mut p);
     let query = read_cstr(body, &mut p);
-    Some(ParseMsg { stmt, query })
+    // Absent count: no declared types.
+    let n = read_i16(body, &mut p).unwrap_or(0).max(0) as usize;
+    let mut param_oids = Vec::with_capacity(n);
+    for _ in 0..n {
+        param_oids.push(read_i32(body, &mut p)? as u32);
+    }
+    Some(ParseMsg {
+        stmt,
+        query,
+        param_oids,
+    })
 }
 
 pub struct BindMsg {
@@ -285,6 +301,9 @@ pub struct BindMsg {
     pub param_formats: Vec<i16>,
     /// `None` = SQL NULL.
     pub params: Vec<Option<Vec<u8>>>,
+    /// Result-column format codes as sent: none (all text), one for all, or
+    /// one per column.
+    pub result_formats: Vec<i16>,
 }
 
 pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
@@ -306,6 +325,11 @@ pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
             params.push(Some(take(body, &mut p, len as usize)?.to_vec()));
         }
     }
+    let nres = read_i16(body, &mut p)?.max(0) as usize;
+    let mut result_formats = Vec::with_capacity(nres);
+    for _ in 0..nres {
+        result_formats.push(read_i16(body, &mut p)?);
+    }
     // Normalize formats to one-per-param.
     let param_formats = (0..nparams)
         .map(|i| match nfmt {
@@ -319,6 +343,7 @@ pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
         stmt,
         param_formats,
         params,
+        result_formats,
     })
 }
 
@@ -353,7 +378,7 @@ mod tests {
         // One param claiming 1000 bytes, with 2 present.
         let body = b"\0\0\x00\x00\x00\x01\x00\x00\x03\xe8ab";
         assert!(parse_bind(body).is_none());
-        let ok = b"\0\0\x00\x00\x00\x01\x00\x00\x00\x02ab";
+        let ok = b"\0\0\x00\x00\x00\x01\x00\x00\x00\x02ab\x00\x00";
         assert_eq!(parse_bind(ok).unwrap().params, vec![Some(b"ab".to_vec())]);
     }
 

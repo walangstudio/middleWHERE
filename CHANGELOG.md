@@ -64,8 +64,30 @@ versions are fixes only.
   `import` over the admin channel now refuse a Postgres env on a non-loopback
   listen host before anything is saved. Before, such an env went live, and
   the next service restart then refused to start.
+- **Two messages that crashed the whole daemon are fixed.** Any
+  authenticated client, read-only included, could abort `mwsqld` for every
+  env: a Postgres `Bind` message shorter than it claimed, or a denied MySQL
+  query with a multibyte character across the 64-byte log cut.
 
 ### Fixed
+
+- Postgres clients that ask for binary results work. pgjdbc (DBeaver,
+  Spring, Hibernate) switches to binary once a prepared statement runs five
+  times, and tokio-postgres and Npgsql ask for it on every column; all of
+  them failed with decode errors. Results are now sent in binary for the
+  common types (integers, floats, numeric, bool, text types, json/jsonb,
+  bytea, uuid, date/time types, point/box, arrays). Other types get a clear
+  error before the statement runs.
+- Postgres startup settings (`TimeZone`, `DateStyle`, `application_name`,
+  ...) are applied to the session, through the same allowlist as a `SET`,
+  and the session's `TimeZone` is reported. Before, they were ignored and
+  timestamps came back in the server's zone.
+- Postgres `Parse` passes the client's declared parameter types to the
+  backend. pgjdbc failed with "can't change resolved type" when the backend
+  inferred a different type.
+- MySQL clients that don't support `CLIENT_DEPRECATE_EOF` (PyMySQL and other
+  pure-Python drivers) can read result sets. The proxy now uses the classic
+  EOF framing every client supports.
 
 - `env add --url` rejects a URL that requires TLS (`sslmode=require`,
   `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, or any other
@@ -92,9 +114,9 @@ versions are fixes only.
   to a value that may read a table (a subquery or function call). A Postgres
   batch of several statements may not contain BEGIN/COMMIT/ROLLBACK/`SET
   autocommit`; send those on their own. Under MySQL `autocommit=0`, plain
-  `EXPLAIN`, `DESCRIBE`, `SHOW COLUMNS`, `CREATE TEMPORARY TABLE ... AS
-  SELECT`, and any `SET`/`SHOW` with a subquery or function call count as
-  opening a transaction, as they do on the server.
+  `EXPLAIN`, `DESCRIBE`, `SHOW COLUMNS`, `SHOW INDEX`, `CREATE TEMPORARY TABLE
+  ... AS SELECT`, and any `SET`/`SHOW` with a subquery or function call count
+  as opening a transaction, as they do on the server.
 - Postgres backend failures and an unreachable backend are audited as
   `error` with the server's SQLSTATE and message, as on MySQL. They were
   audited as `deny`, or not at all.

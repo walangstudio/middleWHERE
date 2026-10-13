@@ -25,6 +25,9 @@ pub struct Session {
     pub env_name: String,
     pub client_username_seen: String,
     pub database: Option<String>,
+    /// Session settings the client asked for at startup (Postgres
+    /// `TimeZone`, `DateStyle`, ...), applied through the SET firewall.
+    pub settings: Vec<(String, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
