@@ -261,6 +261,13 @@ fn elem_type_name(oid: i32) -> &'static str {
         OID_INT4 => "int4",
         OID_INT8 => "int8",
         OID_OID => "oid",
+        24 => "regproc",
+        28 => "xid",
+        29 => "cid",
+        2205 => "regclass",
+        2206 => "regtype",
+        4089 => "regnamespace",
+        4096 => "regrole",
         OID_FLOAT4 => "float4",
         OID_FLOAT8 => "float8",
         OID_NUMERIC => "numeric",
@@ -290,6 +297,13 @@ fn array_elem_oid(oid: i32) -> Option<i32> {
         1021 => OID_FLOAT4,
         1022 => OID_FLOAT8,
         1028 => OID_OID,
+        1008 => 24,
+        1011 => 28,
+        1012 => 29,
+        2210 => 2205,
+        2211 => 2206,
+        4090 => 4089,
+        4097 => 4096,
         1231 => OID_NUMERIC,
         _ => return None,
     })
@@ -339,6 +353,12 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             28 | 29 if b.len() == 4 => Ok(quote_lit(
                 &u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
             )),
+            // xid8: the same, 8 bytes.
+            5069 if b.len() == 8 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[..8]);
+                Ok(quote_lit(&u64::from_be_bytes(a).to_string()))
+            }
             // Unknown binary type. If it contains a NUL it cannot be text
             // (which would corrupt the query string) — treat fixed 2/4/8-byte
             // payloads as big-endian integers (the realistic case: an
@@ -1601,11 +1621,25 @@ mod tests {
             render_scalar(OID_INT8, 1, Some(&9i64.to_be_bytes())).unwrap(),
             "9"
         );
-        // regclass (2205) family decoded as i32
+        // regclass (2205) family decoded as unsigned
         assert_eq!(
             render_scalar(2205, 1, Some(&2200i32.to_be_bytes())).unwrap(),
             "2200"
         );
+        assert_eq!(
+            render_scalar(4096, 1, Some(&u32::MAX.to_be_bytes())).unwrap(),
+            "4294967295"
+        );
+        assert_eq!(
+            render_scalar(5069, 1, Some(&u64::MAX.to_be_bytes())).unwrap(),
+            "'18446744073709551615'"
+        );
+        // binary regclass[]: elements decoded through the same arm
+        let mut arr = Vec::new();
+        for v in [1i32, 0, 2205, 1, 1, 4, 2259] {
+            arr.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(render_param(2210, 1, &Some(arr)).unwrap(), "ARRAY[2259]");
         // unknown binary with NUL, 4 bytes -> int
         assert_eq!(
             render_scalar(99999, 1, Some(&2200i32.to_be_bytes())).unwrap(),
