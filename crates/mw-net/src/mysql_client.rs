@@ -132,10 +132,11 @@ impl Manager for BackendManager {
                 v == "1" || v.eq_ignore_ascii_case("on"),
                 std::sync::atomic::Ordering::Relaxed,
             ),
-            Err(e @ mysql_async::Error::Io(_)) => return Err(e.into()),
             // A server, or a proxy in front of one, that refuses the probe
             // keeps what an earlier connection saw. Only tunes rollback tracking.
-            Ok(_) | Err(_) => {}
+            Ok(_) | Err(mysql_async::Error::Server(_)) => {}
+            // Anything else may have left the connection broken.
+            Err(e) => return Err(e.into()),
         }
         Ok(conn)
     }

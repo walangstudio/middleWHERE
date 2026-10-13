@@ -252,7 +252,16 @@ where
             write_packet(
                 stream,
                 seq,
-                &err_packet(ER_INTERNAL, b"HY000", "query execution failed"),
+                // The server's code and SQLSTATE, so deadlock and lock-wait
+                // retries still work; the message stays hidden.
+                &match &e {
+                    mysql_async::Error::Server(se) => err_packet(
+                        se.code,
+                        se.state.as_bytes().try_into().unwrap_or(b"HY000"),
+                        "query execution failed",
+                    ),
+                    _ => err_packet(ER_INTERNAL, b"HY000", "query execution failed"),
+                },
             )
             .await?;
             // A server-side SQL error leaves the pinned connection usable.

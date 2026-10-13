@@ -778,11 +778,12 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 started.elapsed(),
             )
             .emit();
-            proto::write_raw(
-                stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
-            )
-            .await?;
+            // The server's SQLSTATE, so serialization and deadlock retries
+            // still work; the message stays hidden.
+            let state = e
+                .as_db_error()
+                .map_or(SQLSTATE_INTERNAL, |db| db.code().code());
+            proto::write_raw(stream, &proto::error_response(state, "query failed")).await?;
             // A closed client means the pinned connection (and any open
             // transaction) is gone; end the session rather than continue on
             // a fresh one.
@@ -937,6 +938,16 @@ pub async fn serve(
                             .txn
                             .apply(&[TxnEffect::Other], false, &policy::PG_PROFILE);
                         warn!(env = env_name, err = %e, "pg backend parse failed");
+                        AuditEvent::new(
+                            env_name,
+                            client_user,
+                            &m.query,
+                            AuditDecision::Error,
+                            Some(format!("parse: {e}")),
+                            None,
+                            std::time::Duration::ZERO,
+                        )
+                        .emit();
                         proto::write_raw(
                             stream,
                             &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed"),

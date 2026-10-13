@@ -69,10 +69,10 @@ versions are fixes only.
 
 - `env add --url` rejects a URL that requires TLS (`sslmode=require`,
   `ssl-mode=REQUIRED`, `useSSL=true`, `tls=true`, `ssl=on`, or any other
-  `ssl*`/`tls*` parameter such as `ssl-ca` or `sslrootcert`) and says why. Before, the setting was dropped and the
-  connection went unencrypted. Backend TLS is not supported yet; reach such
-  hosts through a bastion. Parse errors no longer echo the URL, which may
-  hold the password.
+  `ssl*`/`tls*` parameter such as `ssl-ca` or `sslrootcert`) and says why.
+  Before, the setting was dropped and the connection went unencrypted.
+  Backend TLS is not supported yet; reach such hosts through a bastion. Parse
+  errors no longer echo the URL, which may hold the password.
 - Postgres simple-query statements with no result set (`SET`, `BEGIN`) no
   longer send an extended-protocol `NoData` message, which made clients such
   as tokio-postgres fail with "unexpected message". A zero-row `SELECT` still
@@ -97,6 +97,9 @@ versions are fixes only.
 - Postgres backend failures and an unreachable backend are audited as
   `error` with the server's SQLSTATE and message, as on MySQL. They were
   audited as `deny`, or not at all.
+- A backend error reaches the client with the server's SQLSTATE (and MySQL
+  error code) instead of a generic internal error, so driver retries on
+  deadlocks and serialization failures work. The message stays hidden.
 - MySQL requests may carry only one statement, whatever the policy. The proxy
   relays one result set, so a later statement's error was lost and a failed
   write in a batch was reported as success.

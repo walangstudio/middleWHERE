@@ -221,6 +221,23 @@ async fn session_state_is_pinned_and_never_leaks_to_the_next_client() {
         .await
         .unwrap();
     assert_eq!(b.last_insert_id(), Some(1));
+
+    // The server's error code survives, so drivers can tell a duplicate key
+    // (or a deadlock) from a proxy failure.
+    let dup = b
+        .query_drop("INSERT INTO mw_ai (id, x) VALUES (1, 8)")
+        .await
+        .unwrap_err();
+    match dup {
+        mysql_async::Error::Server(se) => {
+            assert_eq!((se.code, se.state.as_str()), (1062, "23000"));
+            assert!(
+                !se.message.contains("Duplicate"),
+                "message must stay hidden"
+            );
+        }
+        e => panic!("expected a server error, got {e}"),
+    }
 }
 
 /// A backend configured with lexer-changing sql_mode flags must still lex like

@@ -497,10 +497,25 @@ pub enum TxnEffect {
 }
 
 fn txn_effect(stmt: &Statement) -> TxnEffect {
+    use Statement::*;
     match base_txn_effect(stmt) {
         // SET or SHOW ... WHERE with a subquery or function call opens a
-        // transaction too.
-        TxnEffect::Other if may_read_table(stmt) => TxnEffect::Work,
+        // transaction too. Not CREATE TEMPORARY TABLE's DEFAULT CURRENT_TIMESTAMP.
+        TxnEffect::Other
+            if matches!(
+                stmt,
+                SetVariable { .. }
+                    | ShowVariables { .. }
+                    | ShowStatus { .. }
+                    | ShowTables { .. }
+                    | ShowFunctions { .. }
+                    | ShowDatabases { .. }
+                    | ShowSchemas { .. }
+                    | ShowCollation { .. }
+            ) && may_read_table(stmt) =>
+        {
+            TxnEffect::Work
+        }
         e => e,
     }
 }
@@ -1447,6 +1462,14 @@ mod tests {
             &MYSQL_PROFILE,
         );
         assert!(m.in_txn, "SHOW ... WHERE can read a table");
+        let mut m = TxnState::default();
+        m.after("SET autocommit = 0", true, &MYSQL_PROFILE);
+        m.after(
+            "CREATE TEMPORARY TABLE tt (ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+            true,
+            &MYSQL_PROFILE,
+        );
+        assert!(!m.in_txn, "a column default is not a table read");
 
         let my = &MYSQL_PROFILE;
         let mut m = TxnState::default();
