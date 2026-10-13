@@ -313,8 +313,6 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             OID_INT4 if b.len() == 4 => {
                 Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
             }
-            // Unsigned: an OID above 2^31 must not render negative.
-            OID_OID if b.len() == 4 => Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()),
             OID_INT8 if b.len() == 8 => {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(&b[..8]);
@@ -328,12 +326,19 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
                 a.copy_from_slice(&b[..8]);
                 Ok(fmt_float(f64::from_be_bytes(a)))
             }
-            // OID-family / register types are 4-byte big-endian integers
-            // (regclass, regnamespace, regproc, regtype, xid, cid, ...).
+            // OID-family / register types are 4-byte unsigned big-endian
+            // integers (oid, regproc, regclass, regtype, regnamespace, ...).
             // DBeaver's catalog queries bind these heavily.
-            2202 | 2203 | 2204 | 2205 | 2206 | 4089 | 24 | 28 | 29 | 2200 if b.len() == 4 => {
+            OID_OID | 24 | 2202 | 2203 | 2204 | 2205 | 2206 | 3734 | 3769 | 4089 | 4096 | 4191
+                if b.len() == 4 =>
+            {
                 Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
             }
+            // xid/cid: also 4-byte unsigned, but there's no integer-to-xid
+            // cast, so the inlined CAST needs a string literal.
+            28 | 29 if b.len() == 4 => Ok(quote_lit(
+                &u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+            )),
             // Unknown binary type. If it contains a NUL it cannot be text
             // (which would corrupt the query string) — treat fixed 2/4/8-byte
             // payloads as big-endian integers (the realistic case: an
@@ -1443,10 +1448,23 @@ mod tests {
         assert!(policy::check(&esc, &Policy::ReadOnly, &policy::PG_PROFILE)
             .0
             .is_allow());
-        assert_eq!(
-            typed_literal(1042, "'abc  '".into()),
-            r#"CAST('abc  ' AS pg_catalog."bpchar")"#
-        );
+        let bp = typed_literal(1042, "'abc  '".into());
+        assert_eq!(bp, r#"CAST('abc  ' AS pg_catalog."bpchar")"#);
+        for lit in [
+            bp,
+            typed_literal(28, render_scalar(28, 1, Some(&[0, 0, 0, 5])).unwrap()),
+        ] {
+            assert!(
+                policy::check(
+                    &format!("SELECT {lit}"),
+                    &Policy::ReadOnly,
+                    &policy::PG_PROFILE
+                )
+                .0
+                .is_allow(),
+                "{lit}"
+            );
+        }
         assert_eq!(
             render_scalar(OID_OID, 1, Some(&u32::MAX.to_be_bytes())).unwrap(),
             "4294967295"
