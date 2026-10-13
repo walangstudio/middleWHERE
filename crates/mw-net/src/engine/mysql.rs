@@ -5,6 +5,8 @@
 //! [`crate::router::serve_session`] with its concrete `mysql_async` row path.
 //! The trait only relocates the *call sites*, never the protocol logic.
 
+use std::time::Duration;
+
 use tokio::net::TcpStream;
 
 use mw_core::config::{ClientAuth, EngineKind, Policy};
@@ -61,6 +63,7 @@ impl Engine for MySqlEngine {
                 env_name: s.env_name,
                 client_username_seen: s.client_username_seen,
                 database: s.database,
+                settings: Vec::new(),
             }),
             // handshake already wrote the ERR packet; mirror the old daemon's
             // swallow-and-close behavior.
@@ -96,6 +99,7 @@ impl Engine for MySqlEngine {
         session: &Session,
         backend: &dyn Backend,
         policy: &Policy,
+        idle_timeout: Duration,
     ) -> Result<(), EngineError> {
         let be = backend
             .as_any()
@@ -107,6 +111,7 @@ impl Engine for MySqlEngine {
             &session.client_username_seen,
             &be.0,
             policy,
+            idle_timeout,
         )
         .await
         .map_err(|e| EngineError::Other(e.to_string()))

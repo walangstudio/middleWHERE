@@ -1,8 +1,11 @@
 //! PostgreSQL engine: v3 wire protocol front, tokio-postgres backend.
 
+mod binary;
 mod client;
 mod proto;
 mod server;
+
+use std::time::Duration;
 
 use tokio::net::TcpStream;
 
@@ -58,6 +61,7 @@ impl Engine for PgEngine {
             env_name: env_name.to_string(),
             client_username_seen: s.user_seen,
             database: s.database,
+            settings: s.settings,
         })
     }
 
@@ -89,6 +93,7 @@ impl Engine for PgEngine {
         session: &Session,
         backend: &dyn Backend,
         policy: &Policy,
+        idle_timeout: Duration,
     ) -> Result<(), EngineError> {
         let be = backend
             .as_any()
@@ -98,8 +103,10 @@ impl Engine for PgEngine {
             stream,
             &session.env_name,
             &session.client_username_seen,
+            &session.settings,
             &be.0,
             policy,
+            idle_timeout,
         )
         .await
     }

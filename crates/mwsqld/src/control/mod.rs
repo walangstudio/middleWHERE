@@ -222,8 +222,13 @@ async fn drain_pending_request<S: AsyncRead + Unpin>(stream: &mut S) {
 async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, resp: &Response) -> Result<()> {
     let mut buf = Vec::new();
     write_frame(&mut buf, resp)?;
-    stream.write_all(&buf).await?;
-    stream.flush().await?;
+    // Bounded like reads: a peer that stops reading must not hold its permit.
+    tokio::time::timeout(READ_TIMEOUT, async {
+        stream.write_all(&buf).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
     Ok(())
 }
 

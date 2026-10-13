@@ -20,9 +20,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-};
+use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, GetTokenInformation, LookupAccountNameW,
     LookupAccountSidW, RevertToSelf, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
@@ -58,11 +56,16 @@ pub(crate) async fn serve_loop(
         );
     }
 
+    // The service's own account (`NT SERVICE\<svc>` when installed) is neither
+    // BA nor SY, but must keep adding instances for each new client.
+    let self_sid = mw_core::winsid::process_user_sid();
+    let sddl = build_sddl(&admins_sid, self_sid.as_deref());
+
     let sem = inflight_limiter();
     // The FIRST instance failing is fatal to the channel (logged by the caller);
     // in-loop failures below are non-fatal (log + continue) so one transient
     // error can't kill the control channel for the daemon's lifetime.
-    let mut server = create_instance(&pipe_name, true, &admins_sid)?;
+    let mut server = create_instance(&pipe_name, true, &sddl)?;
     info!(pipe = %pipe_name, "control channel listening");
 
     loop {
@@ -70,7 +73,7 @@ pub(crate) async fn serve_loop(
             biased;
             _ = shutdown.recv() => break,
             res = server.connect() => match res {
-                Ok(()) => match create_instance(&pipe_name, false, &admins_sid) {
+                Ok(()) => match create_instance(&pipe_name, false, &sddl) {
                     Ok(next) => {
                         let permit = match Arc::clone(&sem).acquire_owned().await {
                             Ok(p) => p,
@@ -111,7 +114,7 @@ pub(crate) async fn serve_loop(
                 },
                 Err(e) => {
                     warn!(err = %e, "named pipe connect failed");
-                    match create_instance(&pipe_name, false, &admins_sid) {
+                    match create_instance(&pipe_name, false, &sddl) {
                         Ok(s) => server = s,
                         Err(e2) => {
                             warn!(
@@ -136,16 +139,11 @@ struct PipeHandle(HANDLE);
 // the process; we only read it, under block_in_place, on one worker thread.
 unsafe impl Send for PipeHandle {}
 
-/// Create one pipe instance with the admins-only DACL. `first` sets
+/// Create one pipe instance with the [`build_sddl`] DACL. `first` sets
 /// `first_pipe_instance` so a squatter cannot pre-create the pipe name and
 /// intercept clients.
-fn create_instance(
-    pipe_name: &str,
-    first: bool,
-    admins_sid: &Option<Vec<u8>>,
-) -> Result<NamedPipeServer> {
-    let sddl = build_sddl(admins_sid);
-    let wsddl = wide(&sddl);
+fn create_instance(pipe_name: &str, first: bool, sddl: &str) -> Result<NamedPipeServer> {
+    let wsddl = wide(sddl);
     let mut psd: *mut c_void = std::ptr::null_mut();
     let ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -180,15 +178,26 @@ fn create_instance(
     server.with_context(|| format!("create control pipe instance {pipe_name}"))
 }
 
-/// `D:` DACL granting GENERIC_ALL to the admins group (when resolvable),
-/// `BUILTIN\Administrators` (BA), and `LocalSystem` (SY). No other ACEs and no
+/// Rights the admins group gets: read/write data and attributes, READ_CONTROL
+/// (the CLI reads the pipe owner), SYNCHRONIZE. Deliberately NOT
+/// FILE_CREATE_PIPE_INSTANCE (0x4): with it a group member could add a pipe
+/// instance of their own that inherits this service-owned descriptor and so
+/// passes the CLI's owner check. Must match the CLI's `PIPE_CLIENT_ACCESS`.
+const ADMINS_PIPE_RIGHTS: &str = "0x120183";
+
+/// `D:` DACL granting [`ADMINS_PIPE_RIGHTS`] to the admins group (when
+/// resolvable) and GENERIC_ALL to the daemon's own account (`self_sid`),
+/// `BUILTIN\Administrators` (BA) and `LocalSystem` (SY). No other ACEs and no
 /// inheritance, so every other principal is denied by omission.
-fn build_sddl(admins_sid: &Option<Vec<u8>>) -> String {
+fn build_sddl(admins_sid: &Option<Vec<u8>>, self_sid: Option<&str>) -> String {
     let mut sddl = String::from("D:");
     if let Some(sid) = admins_sid {
         if let Some(s) = sid_to_string(sid.as_ptr() as *const c_void) {
-            sddl.push_str(&format!("(A;;GA;;;{s})"));
+            sddl.push_str(&format!("(A;;{ADMINS_PIPE_RIGHTS};;;{s})"));
         }
+    }
+    if let Some(s) = self_sid {
+        sddl.push_str(&format!("(A;;GA;;;{s})"));
     }
     sddl.push_str("(A;;GA;;;BA)(A;;GA;;;SY)");
     sddl
@@ -388,13 +397,8 @@ fn well_known_sid(kind: i32) -> Option<Vec<u8>> {
 }
 
 fn sid_to_string(sid: *const c_void) -> Option<String> {
-    let mut pstr: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(sid as *mut c_void, &mut pstr) } == 0 {
-        return None;
-    }
-    let s = unsafe { wide_ptr_to_string(pstr) };
-    unsafe { LocalFree(pstr as HLOCAL) };
-    Some(s)
+    // SAFETY: every caller passes a SID from a successful Win32 call.
+    unsafe { mw_core::winsid::sid_string(sid as *mut c_void) }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -405,17 +409,6 @@ fn wide(s: &str) -> Vec<u16> {
 fn wide_to_string(w: &[u16]) -> String {
     let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
     String::from_utf16_lossy(&w[..end])
-}
-
-/// # Safety
-/// `p` must be a valid, NUL-terminated wide string.
-unsafe fn wide_ptr_to_string(p: *const u16) -> String {
-    let mut len = 0isize;
-    while *p.offset(len) != 0 {
-        len += 1;
-    }
-    let slice = std::slice::from_raw_parts(p, len as usize);
-    String::from_utf16_lossy(slice)
 }
 
 #[cfg(test)]
@@ -440,13 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn wide_ptr_to_string_reads_until_nul() {
-        let w = wide("hi");
-        let s = unsafe { wide_ptr_to_string(w.as_ptr()) };
-        assert_eq!(s, "hi");
-    }
-
-    #[test]
     fn well_known_administrators_sid_formats_as_expected_string() {
         let sid = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)
             .expect("BUILTIN\\Administrators must always resolve");
@@ -462,13 +448,70 @@ mod tests {
     #[test]
     fn build_sddl_includes_group_ace_when_resolvable() {
         let admins = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID).unwrap();
-        let sddl = build_sddl(&Some(admins));
-        assert_eq!(sddl, "D:(A;;GA;;;S-1-5-32-544)(A;;GA;;;BA)(A;;GA;;;SY)");
+        let sddl = build_sddl(&Some(admins), Some("S-1-5-80-1"));
+        assert_eq!(
+            sddl,
+            "D:(A;;0x120183;;;S-1-5-32-544)(A;;GA;;;S-1-5-80-1)(A;;GA;;;BA)(A;;GA;;;SY)"
+        );
     }
 
     #[test]
     fn build_sddl_omits_group_ace_when_unresolvable() {
-        assert_eq!(build_sddl(&None), "D:(A;;GA;;;BA)(A;;GA;;;SY)");
+        assert_eq!(build_sddl(&None, None), "D:(A;;GA;;;BA)(A;;GA;;;SY)");
+    }
+
+    fn resolve_sid_string(s: &str) -> Vec<u8> {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::GetLengthSid;
+        let w = wide(s);
+        let mut psid: *mut c_void = std::ptr::null_mut();
+        assert_ne!(unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut psid) }, 0);
+        let len = unsafe { GetLengthSid(psid) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(psid as *const u8, len) }.to_vec();
+        unsafe { LocalFree(psid as HLOCAL) };
+        bytes
+    }
+
+    /// The current user stands in for a middlewhere-admins member. The CLI's
+    /// access mask must be enough to connect, and the group's rights must not
+    /// include adding a pipe instance (which would pass the CLI's owner
+    /// check). Elevated runs skip the second half: BA holds GENERIC_ALL.
+    #[tokio::test]
+    async fn admins_group_can_connect_but_cannot_add_pipe_instances() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let me = mw_core::winsid::process_user_sid().unwrap();
+        // The current user as the admins group, with no self ACE.
+        let sddl = build_sddl(&Some(resolve_sid_string(&me)), None);
+        let name = format!(r"\\.\pipe\mwsqld-acl-test-{}", std::process::id());
+        let _first = create_instance(&name, true, &sddl).expect("first instance");
+        let client = std::fs::OpenOptions::new()
+            .access_mode(0x0012_0183)
+            .open(&name);
+        assert!(client.is_ok(), "CLI access mask must connect: {client:?}");
+
+        let elevated = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)
+            .map(|sid| check_membership(std::ptr::null_mut(), sid.as_ptr() as *const c_void))
+            .unwrap_or(false);
+        if elevated {
+            eprintln!("skip: elevated process holds GENERIC_ALL via BA");
+            return;
+        }
+        assert!(
+            create_instance(&name, false, &sddl).is_err(),
+            "an admins-group member must not be able to add a pipe instance"
+        );
+    }
+
+    /// The daemon's own account, neither BA nor SY when installed as
+    /// `NT SERVICE\<svc>`, must be able to add an instance per client.
+    #[tokio::test]
+    async fn daemon_account_can_add_pipe_instances() {
+        let me = mw_core::winsid::process_user_sid().unwrap();
+        let sddl = build_sddl(&None, Some(&me));
+        let name = format!(r"\\.\pipe\mwsqld-self-test-{}", std::process::id());
+        let _first = create_instance(&name, true, &sddl).expect("first instance");
+        let second = create_instance(&name, false, &sddl);
+        assert!(second.is_ok(), "replacement instance refused: {second:?}");
     }
 
     /// FAIL-CLOSED: an invalid pipe handle can never impersonate, so

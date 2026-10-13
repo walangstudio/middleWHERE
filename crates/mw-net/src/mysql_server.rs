@@ -31,7 +31,6 @@ const CLIENT_PROTOCOL_41: u32 = 0x00000200;
 const CLIENT_SECURE_CONNECTION: u32 = 0x00008000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x00080000;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x00000008;
-const CLIENT_DEPRECATE_EOF: u32 = 0x01000000;
 
 const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 
@@ -68,11 +67,8 @@ fn build_initial_handshake(thread_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
     p.extend_from_slice(&thread_id.to_le_bytes());
     p.extend_from_slice(&scramble[..8]); // auth-plugin-data-part-1
     p.push(0); // filler
-    let caps = CLIENT_PROTOCOL_41
-        | CLIENT_SECURE_CONNECTION
-        | CLIENT_PLUGIN_AUTH
-        | CLIENT_CONNECT_WITH_DB
-        | CLIENT_DEPRECATE_EOF;
+    let caps =
+        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
     p.extend_from_slice(&(caps as u16).to_le_bytes()); // lower 2 bytes of caps
     p.push(0x21); // charset utf8mb4_general_ci
     p.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
@@ -373,11 +369,10 @@ mod golden {
             0x00, 0x44, 0x33, 0x22, 0x11, // thread id LE
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // scramble[..8]
             0x00, // filler
-            0x08,
-            0x82, // caps low (PROTOCOL_41|SECURE|PLUGIN_AUTH|CONNECT_WITH_DB|DEPRECATE_EOF) & 0xFFFF
+            0x08, 0x82, // caps low (PROTOCOL_41|SECURE|PLUGIN_AUTH|CONNECT_WITH_DB) & 0xFFFF
             0x21, // charset
             0x02, 0x00, // server status (AUTOCOMMIT)
-            0x08, 0x01, // caps high
+            0x08, 0x00, // caps high (PLUGIN_AUTH; no DEPRECATE_EOF)
             21,   // auth-plugin-data len
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // reserved[10]
             0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,

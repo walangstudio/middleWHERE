@@ -50,6 +50,17 @@ impl Manager for PgManager {
         tokio::spawn(async move {
             let _ = conn.await;
         });
+        // The firewall parses string literals the standard way; a backend with
+        // backslash escapes in plain strings would see different statement
+        // boundaries. A SET, not the `options` startup parameter, so it also
+        // works behind poolers that reject `options`. Clients can't SET it
+        // back: it's off the allowlist. (tokio-postgres already pins
+        // client_encoding to UTF8 at startup.)
+        // DateStyle too: the greeting advertises ISO, and binary results are
+        // encoded from ISO text. Clients may still SET it for their session.
+        client
+            .batch_execute("SET standard_conforming_strings = on; SET DateStyle = 'ISO, MDY'")
+            .await?;
         Ok(client)
     }
 

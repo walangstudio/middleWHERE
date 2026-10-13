@@ -92,7 +92,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8
 }
 
 pub async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<(), PgProtoError> {
-    w.write_all(bytes).await?;
+    crate::idle::bounded_write(w.write_all(bytes)).await?;
     Ok(())
 }
 
@@ -135,17 +135,29 @@ pub fn backend_key_data(pid: i32, secret: i32) -> Vec<u8> {
 }
 
 /// `ReadyForQuery` ('Z') with transaction status 'I' (idle).
-pub fn ready_for_query() -> Vec<u8> {
-    msg(b'Z', b"I")
+/// `ReadyForQuery` with the transaction status: `I` idle, `T` in a
+/// transaction, `E` in a failed transaction.
+pub fn ready_for_query(status: u8) -> Vec<u8> {
+    msg(b'Z', &[status])
 }
 
 /// `ErrorResponse` ('E') with Severity/Code/Message fields.
 pub fn error_response(sqlstate: &str, message: &str) -> Vec<u8> {
+    severity_response(b"ERROR", sqlstate, message)
+}
+
+/// `ErrorResponse` with severity FATAL: the session ends, no ReadyForQuery
+/// follows.
+pub fn fatal_response(sqlstate: &str, message: &str) -> Vec<u8> {
+    severity_response(b"FATAL", sqlstate, message)
+}
+
+fn severity_response(severity: &[u8], sqlstate: &str, message: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(b'S');
-    put_cstr(&mut p, b"ERROR");
+    put_cstr(&mut p, severity);
     p.push(b'V');
-    put_cstr(&mut p, b"ERROR");
+    put_cstr(&mut p, severity);
     p.push(b'C');
     put_cstr(&mut p, sqlstate.as_bytes());
     p.push(b'M');
@@ -158,16 +170,21 @@ pub fn error_response(sqlstate: &str, message: &str) -> Vec<u8> {
 /// prepare) so the client decodes text values correctly. All values are
 /// sent in text format.
 pub fn row_description(cols: &[(String, i32)]) -> Vec<u8> {
+    row_description_formats(cols, &[])
+}
+
+/// `RowDescription` with each column's result format (missing = text).
+pub fn row_description_formats(cols: &[(String, i32)], formats: &[i16]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&(cols.len() as i16).to_be_bytes());
-    for (name, oid) in cols {
+    for (i, (name, oid)) in cols.iter().enumerate() {
         put_cstr(&mut p, name.as_bytes());
         p.extend_from_slice(&0i32.to_be_bytes()); // table OID
         p.extend_from_slice(&0i16.to_be_bytes()); // column attr no.
         p.extend_from_slice(&oid.to_be_bytes()); // type OID
         p.extend_from_slice(&(-1i16).to_be_bytes()); // type size (var)
         p.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        p.extend_from_slice(&0i16.to_be_bytes()); // format = text
+        p.extend_from_slice(&formats.get(i).copied().unwrap_or(0).to_be_bytes());
     }
     msg(b'T', &p)
 }
@@ -234,31 +251,46 @@ fn read_cstr(buf: &[u8], pos: &mut usize) -> String {
     s
 }
 
-fn read_i16(buf: &[u8], pos: &mut usize) -> i16 {
-    let v = i16::from_be_bytes([buf[*pos], buf[*pos + 1]]);
-    *pos += 2;
-    v
+/// `n` bytes at `pos`, or None if the message is too short. Client input:
+/// an out-of-range index would panic and abort the daemon.
+fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
+    let b = buf.get(*pos..pos.checked_add(n)?)?;
+    *pos += n;
+    Some(b)
 }
 
-fn read_i32(buf: &[u8], pos: &mut usize) -> i32 {
-    let v = i32::from_be_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
-    *pos += 4;
-    v
+fn read_i16(buf: &[u8], pos: &mut usize) -> Option<i16> {
+    Some(i16::from_be_bytes(take(buf, pos, 2)?.try_into().ok()?))
+}
+
+fn read_i32(buf: &[u8], pos: &mut usize) -> Option<i32> {
+    Some(i32::from_be_bytes(take(buf, pos, 4)?.try_into().ok()?))
 }
 
 pub struct ParseMsg {
     pub stmt: String,
     pub query: String,
+    /// Client-declared parameter type OIDs (0 = let the server infer). The
+    /// backend prepare must use them: a driver rejects a description that
+    /// contradicts what it declared.
+    pub param_oids: Vec<u32>,
 }
 
 pub fn parse_parse(body: &[u8]) -> Option<ParseMsg> {
-    // We only need the statement name and query text; the client-declared
-    // param type OIDs are ignored — authoritative types come from the
-    // backend Parse+Describe in `backend_describe`.
     let mut p = 0;
     let stmt = read_cstr(body, &mut p);
     let query = read_cstr(body, &mut p);
-    Some(ParseMsg { stmt, query })
+    // Absent count: no declared types.
+    let n = read_i16(body, &mut p).unwrap_or(0).max(0) as usize;
+    let mut param_oids = Vec::with_capacity(n);
+    for _ in 0..n {
+        param_oids.push(read_i32(body, &mut p)? as u32);
+    }
+    Some(ParseMsg {
+        stmt,
+        query,
+        param_oids,
+    })
 }
 
 pub struct BindMsg {
@@ -269,28 +301,34 @@ pub struct BindMsg {
     pub param_formats: Vec<i16>,
     /// `None` = SQL NULL.
     pub params: Vec<Option<Vec<u8>>>,
+    /// Result-column format codes as sent: none (all text), one for all, or
+    /// one per column.
+    pub result_formats: Vec<i16>,
 }
 
 pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
     let mut p = 0;
     let portal = read_cstr(body, &mut p);
     let stmt = read_cstr(body, &mut p);
-    let nfmt = read_i16(body, &mut p).max(0) as usize;
+    let nfmt = read_i16(body, &mut p)?.max(0) as usize;
     let mut fmts = Vec::with_capacity(nfmt);
     for _ in 0..nfmt {
-        fmts.push(read_i16(body, &mut p));
+        fmts.push(read_i16(body, &mut p)?);
     }
-    let nparams = read_i16(body, &mut p).max(0) as usize;
+    let nparams = read_i16(body, &mut p)?.max(0) as usize;
     let mut params = Vec::with_capacity(nparams);
     for _ in 0..nparams {
-        let len = read_i32(body, &mut p);
+        let len = read_i32(body, &mut p)?;
         if len < 0 {
             params.push(None);
         } else {
-            let len = len as usize;
-            params.push(Some(body[p..p + len].to_vec()));
-            p += len;
+            params.push(Some(take(body, &mut p, len as usize)?.to_vec()));
         }
+    }
+    let nres = read_i16(body, &mut p)?.max(0) as usize;
+    let mut result_formats = Vec::with_capacity(nres);
+    for _ in 0..nres {
+        result_formats.push(read_i16(body, &mut p)?);
     }
     // Normalize formats to one-per-param.
     let param_formats = (0..nparams)
@@ -305,6 +343,7 @@ pub fn parse_bind(body: &[u8]) -> Option<BindMsg> {
         stmt,
         param_formats,
         params,
+        result_formats,
     })
 }
 
@@ -333,6 +372,17 @@ mod tests {
     }
 
     #[test]
+    fn malformed_bind_is_rejected_not_a_panic() {
+        assert!(parse_bind(b"").is_none());
+        assert!(parse_bind(b"\0\0\x00").is_none());
+        // One param claiming 1000 bytes, with 2 present.
+        let body = b"\0\0\x00\x00\x00\x01\x00\x00\x03\xe8ab";
+        assert!(parse_bind(body).is_none());
+        let ok = b"\0\0\x00\x00\x00\x01\x00\x00\x00\x02ab\x00\x00";
+        assert_eq!(parse_bind(ok).unwrap().params, vec![Some(b"ab".to_vec())]);
+    }
+
+    #[test]
     fn framing_msg_len_includes_self() {
         let m = msg(b'X', b"abc");
         assert_eq!(m[0], b'X');
@@ -347,7 +397,7 @@ mod tests {
         assert_eq!(bind_complete(), vec![b'2', 0, 0, 0, 4]);
         assert_eq!(close_complete(), vec![b'3', 0, 0, 0, 4]);
         assert_eq!(no_data(), vec![b'n', 0, 0, 0, 4]);
-        assert_eq!(ready_for_query(), vec![b'Z', 0, 0, 0, 5, b'I']);
+        assert_eq!(ready_for_query(b'I'), vec![b'Z', 0, 0, 0, 5, b'I']);
         assert_eq!(auth_ok(), vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
         assert_eq!(auth_cleartext_request(), vec![b'R', 0, 0, 0, 8, 0, 0, 0, 3]);
     }

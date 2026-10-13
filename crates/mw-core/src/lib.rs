@@ -8,3 +8,5 @@ pub mod seal;
 pub mod secret;
 pub mod state;
 pub mod token;
+#[cfg(windows)]
+pub mod winsid;

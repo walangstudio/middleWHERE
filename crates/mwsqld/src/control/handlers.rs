@@ -27,7 +27,7 @@ use mw_core::state::{load_config, with_config};
 
 use super::peercred::PeerIdentity;
 use super::{admin_event, Daemon};
-use crate::{test_envs, Probe};
+use crate::{refuse_pg_cleartext, test_envs, Probe};
 
 /// Apply one request. Returns the [`Response`] to frame back to the client;
 /// never panics on client input.
@@ -267,6 +267,9 @@ async fn rotate_cred_req(
 
 async fn add_env_req(daemon: &Arc<Daemon>, peer: &PeerIdentity, dto: EnvInputDto) -> Response {
     let target = dto.name.clone();
+    if let Err(e) = refuse_pg_cleartext(&dto.name, dto.engine, &daemon.listen_host) {
+        return fail(peer, "add_env", &target, e);
+    }
     let _guard = daemon.config_write.lock().await;
     let backend_port = dto
         .backend_port
@@ -416,6 +419,11 @@ async fn set_policy_req(
 async fn import_req(daemon: &Arc<Daemon>, peer: &PeerIdentity, fragment: Config) -> Response {
     let new_envs: Vec<String> = fragment.envs.keys().cloned().collect();
     let target = new_envs.join(",");
+    for (name, env) in &fragment.envs {
+        if let Err(e) = refuse_pg_cleartext(name, env.engine, &daemon.listen_host) {
+            return fail(peer, "import", &target, e);
+        }
+    }
     let _guard = daemon.config_write.lock().await;
     if let Err(e) = with_config(&daemon.state_dir, &daemon.ks, move |cfg| {
         merge_import(cfg, fragment)
@@ -826,6 +834,34 @@ mod tests {
         assert_eq!(daemon.env_count().await, 1);
         let cfg = load_config(&daemon.state_dir, &daemon.ks).unwrap();
         assert!(cfg.envs.contains_key("e"));
+    }
+
+    #[tokio::test]
+    async fn live_pg_add_on_non_loopback_bind_refused_before_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ks = KeystoreChoice::default_file(tmp.path());
+        init(tmp.path(), &ks).unwrap();
+        let daemon = Arc::new(
+            Daemon::bind(
+                tmp.path().to_path_buf(),
+                &Config::default(),
+                "0.0.0.0",
+                false,
+                ks,
+            )
+            .await
+            .unwrap(),
+        );
+        add_cred_and_env(&daemon, "c", "mysql_ok").await;
+        let mut dto = env_dto("pg", "c");
+        dto.engine = EngineKind::Postgres;
+        let resp = dispatch(&daemon, &peer(), Request::AddEnv(dto)).await;
+        assert!(
+            matches!(&resp, Response::Error(m) if m.contains("cleartext")),
+            "expected cleartext refusal, got {resp:?}"
+        );
+        let cfg = load_config(&daemon.state_dir, &daemon.ks).unwrap();
+        assert!(!cfg.envs.contains_key("pg"), "refused env must not persist");
     }
 
     #[tokio::test]

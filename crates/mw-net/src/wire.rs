@@ -1,11 +1,12 @@
 //! Server -> client packet serialization for COM_QUERY results.
 //!
-//! Text-protocol result set layout (CLIENT_DEPRECATE_EOF on, which our greet
-//! advertises):
+//! Text-protocol result set layout, classic EOF framing (our greeting does not
+//! offer CLIENT_DEPRECATE_EOF, which some drivers, e.g. PyMySQL, lack):
 //!   1. Column Count packet      lenenc_int(N)
 //!   2. N x Column Definition 41 packets
-//!   3. M x Row packets          lenenc_str per value, 0xFB for NULL
-//!   4. OK_with_EOF terminator   0xFE + status_flags + warnings
+//!   3. EOF packet               0xFE + warnings + status_flags
+//!   4. M x Row packets          lenenc_str per value, 0xFB for NULL
+//!   5. EOF packet
 //!
 //! For OK / ERR after a successful auth/command, see mysql_server.rs.
 
@@ -13,8 +14,6 @@ use mysql_async::consts::ColumnType;
 use mysql_async::{Column, Row, Value};
 
 use crate::framing::write_lenenc_int;
-
-const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 
 pub fn column_count_packet(n: u64) -> Vec<u8> {
     let mut p = Vec::with_capacity(9);
@@ -81,16 +80,12 @@ pub fn row_text_packet(row: &Row) -> Vec<u8> {
     p
 }
 
-/// OK packet that terminates a result set under CLIENT_DEPRECATE_EOF.
-/// The 0xFE marker distinguishes it from the auth-time OK (0x00) for clients
-/// that need to know it's the EOF position.
-pub fn ok_eof_packet(affected_rows: u64, warnings: u16) -> Vec<u8> {
-    let mut p = Vec::with_capacity(11);
-    p.push(0xFE); // EOF-style marker
-    write_lenenc_int(&mut p, affected_rows);
-    write_lenenc_int(&mut p, 0); // last_insert_id
-    p.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
-    p.extend_from_slice(&warnings.to_le_bytes());
+/// Classic EOF packet: ends the column definitions and the rows.
+pub fn eof_packet(status: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.push(0xFE);
+    p.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    p.extend_from_slice(&status.to_le_bytes());
     p
 }
 
@@ -141,9 +136,8 @@ mod tests {
     }
 
     #[test]
-    fn ok_eof_marker_is_fe() {
-        let p = ok_eof_packet(0, 0);
-        assert_eq!(p[0], 0xFE);
+    fn eof_packet_bytes() {
+        assert_eq!(eof_packet(0x0002), [0xFE, 0, 0, 0x02, 0]);
     }
 
     #[test]

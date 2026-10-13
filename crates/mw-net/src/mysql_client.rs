@@ -48,11 +48,17 @@ impl BackendOpts {
 
 pub struct BackendManager {
     opts: BackendOpts,
+    /// The server's `innodb_rollback_on_timeout` (global, read-only), seen at
+    /// connect. When on, a lock wait timeout rolls back the whole transaction.
+    pub rollback_on_timeout: std::sync::atomic::AtomicBool,
 }
 
 impl BackendManager {
     pub fn new(opts: BackendOpts) -> Self {
-        Self { opts }
+        Self {
+            opts,
+            rollback_on_timeout: Default::default(),
+        }
     }
 }
 
@@ -60,6 +66,60 @@ impl BackendManager {
 pub enum BackendError {
     #[error("mysql backend: {0}")]
     Mysql(#[from] mysql_async::Error),
+    #[error("mysql backend session setup: {0}")]
+    Setup(String),
+}
+
+/// sql_mode flags that change how MySQL lexes SQL away from what the firewall
+/// (sqlparser's MySQL dialect) parses: backslash escapes in strings, and
+/// double quotes as identifiers. `ANSI` is the combination mode that implies
+/// `ANSI_QUOTES`.
+const LEXER_MODES: &[&str] = &["NO_BACKSLASH_ESCAPES", "ANSI_QUOTES", "ANSI"];
+
+/// Make the backend lex like the firewall: utf8mb4 client charset, and none of
+/// [`LEXER_MODES`], whatever the server or `init_connect` configured.
+/// Re-reads the result and refuses the connection if it didn't take. Clients
+/// can't change these back: `sql_mode` and the charset variables are off the
+/// SET allowlist.
+async fn pin_session(conn: &mut Conn) -> Result<(), BackendError> {
+    // autocommit too: the proxy reports the session's transaction state from
+    // a known start, whatever init_connect or the server default says.
+    conn.query_drop("SET NAMES utf8mb4, autocommit = 1").await?;
+    let mode: String = conn
+        .query_first("SELECT @@SESSION.sql_mode")
+        .await?
+        .unwrap_or_default();
+    let kept: Vec<&str> = mode
+        .split(',')
+        .filter(|m| !m.is_empty() && !LEXER_MODES.contains(&m.to_ascii_uppercase().as_str()))
+        .collect();
+    // Mode names are [A-Z_]; anything else would not be safe to inline.
+    if kept
+        .iter()
+        .any(|m| !m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    {
+        return Err(BackendError::Setup(format!("unexpected sql_mode {mode:?}")));
+    }
+    conn.query_drop(format!("SET SESSION sql_mode = '{}'", kept.join(",")))
+        .await?;
+    let (mode, charset): (String, String) = conn
+        .query_first("SELECT @@SESSION.sql_mode, @@SESSION.character_set_client")
+        .await?
+        .unwrap_or_default();
+    let upper = mode.to_ascii_uppercase();
+    if upper.split(',').any(|m| LEXER_MODES.contains(&m)) || charset != "utf8mb4" {
+        return Err(BackendError::Setup(format!(
+            "backend kept sql_mode {mode:?} / charset {charset:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Server errors sent right before the server closes the connection:
+/// shutdown, killed connection (MariaDB) or session, offline mode, idle
+/// timeout.
+pub fn hangs_up(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if matches!(se.code, 1053 | 1927 | 3032 | 3169 | 4031))
 }
 
 impl Manager for BackendManager {
@@ -67,7 +127,26 @@ impl Manager for BackendManager {
     type Error = BackendError;
 
     async fn create(&self) -> Result<Conn, BackendError> {
-        Ok(Conn::new(self.opts.to_opts()).await?)
+        let mut conn = Conn::new(self.opts.to_opts()).await?;
+        pin_session(&mut conn).await?;
+        // Option<String>: query_first panics on a value it can't convert, and
+        // a proxy may answer NULL or "ON".
+        match conn
+            .query_first::<Option<String>, _>("SELECT @@GLOBAL.innodb_rollback_on_timeout")
+            .await
+        {
+            Ok(Some(Some(v))) => self.rollback_on_timeout.store(
+                v == "1" || v.eq_ignore_ascii_case("on"),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
+            // A server, or a proxy in front of one, that refuses the probe
+            // keeps what an earlier connection saw. Only tunes rollback tracking.
+            Ok(_) => {}
+            Err(e) if matches!(e, mysql_async::Error::Server(_)) && !hangs_up(&e) => {}
+            // Anything else may have left the connection broken.
+            Err(e) => return Err(e.into()),
+        }
+        Ok(conn)
     }
 
     async fn recycle(&self, conn: &mut Conn, _: &Metrics) -> RecycleResult<BackendError> {
@@ -88,4 +167,27 @@ pub fn build_pool(opts: BackendOpts, max_size: u32) -> BackendPool {
         .recycle_timeout(Some(Duration::from_secs(5)))
         .build()
         .expect("pool build only fails on bad config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hang_up_codes_end_the_session() {
+        let server = |code| {
+            mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: String::new(),
+                state: "HY000".into(),
+            })
+        };
+        for code in [1053, 1927, 3032, 3169, 4031] {
+            assert!(hangs_up(&server(code)), "{code}");
+        }
+        // Deadlock, duplicate key: the connection is still good.
+        for code in [1213, 1062] {
+            assert!(!hangs_up(&server(code)), "{code}");
+        }
+    }
 }

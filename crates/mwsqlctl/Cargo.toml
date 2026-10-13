@@ -41,6 +41,16 @@ libc = "0.2"
 # same-user pre-plant of the redirect target). Reuses the workspace pin.
 [target.'cfg(windows)'.dependencies]
 rand.workspace = true
+# Control-pipe server ownership check before sending secrets.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # tests only: create a real pipe and read this process's elevation
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

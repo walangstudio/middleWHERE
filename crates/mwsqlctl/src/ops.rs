@@ -154,7 +154,8 @@ pub struct ParsedUrl {
 /// Percent-encoded userinfo is decoded, so a password with `@` or `/` in it
 /// survives the round trip.
 pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
-    let url = url::Url::parse(raw).with_context(|| format!("parse connection url {raw:?}"))?;
+    // Not the url itself: it may hold the password.
+    let url = url::Url::parse(raw).context("parse connection url")?;
     let engine = match url.scheme() {
         "postgres" | "postgresql" => EngineKind::Postgres,
         "mysql" | "mariadb" => EngineKind::MySql,
@@ -179,6 +180,37 @@ pub fn parse_connection_url(raw: &str) -> Result<ParsedUrl> {
         "" => None,
         db => Some(percent_decode(db)),
     };
+    // Dropping a TLS requirement would silently downgrade to plaintext (or
+    // fail later with a generic connect error on hosts that enforce TLS).
+    // A CA or cert is refused even next to a TLS-off switch: which switch a
+    // client honours varies by driver, and a wrong guess drops verification.
+    for (k, v) in url.query_pairs() {
+        let key = k.to_ascii_lowercase().replace(['-', '_'], "");
+        let val = v.to_ascii_lowercase();
+        // useSSL and tls are MySQL-only: a Postgres client ignores them.
+        if matches!(engine, EngineKind::Postgres) && matches!(key.as_str(), "usessl" | "tls") {
+            continue;
+        }
+        let requires_tls = match key.as_str() {
+            "sslmode" | "ssl" | "usessl" | "requiressl" | "tls" => !matches!(
+                val.as_str(),
+                "disable" | "disabled" | "allow" | "prefer" | "preferred" | "false" | "0" | "off"
+            ),
+            // Tuning only, no TLS of their own.
+            "sslcompression" | "sslsni" => false,
+            "sslnegotiation" => val != "postgres",
+            "sslcertmode" => val == "require",
+            // Any other ssl*/tls* parameter (ssl-ca, sslcert, sslrootcert, ...).
+            k => k.starts_with("ssl") || k.starts_with("tls"),
+        };
+        if requires_tls {
+            bail!(
+                "the url asks for TLS ({k}), but middleWHERE does not support TLS to \
+                 the backend yet. Reach the database through a --bastion (the SSH tunnel \
+                 encrypts it) or over a trusted network, and drop it from the url."
+            );
+        }
+    }
     Ok(ParsedUrl {
         engine,
         host,
@@ -374,14 +406,62 @@ mod tests {
         let p = parse_connection_url("mysql://u@h").unwrap();
         assert_eq!(p.port, None);
         assert_eq!(p.database, None);
+        for ok in [
+            "postgres://u@h/d?sslmode=disable",
+            "postgres://u@h/d?sslmode=prefer",
+            "mysql://u@h/d?ssl-mode=PREFERRED",
+            "mysql://u@h/d?tls=false",
+            "postgres://u@h/d?sslmode=disable&sslcompression=0",
+            "postgres://u@h/d?sslnegotiation=postgres&sslsni=0",
+            "postgres://u@h/d?tls=false",
+            "postgres://u@h/d?sslmode=prefer&sslcertmode=disable",
+        ] {
+            assert!(parse_connection_url(ok).is_ok(), "{ok}");
+        }
 
         for (raw, want) in [
             ("mssql://u@h/d", "unsupported url scheme"),
             ("postgres://h/d", "no username"),
             ("not a url", "parse connection url"),
+            ("postgres://u@h/d?sslmode=require", "does not support TLS"),
+            (
+                "postgres://u@h/d?sslmode=verify-full",
+                "does not support TLS",
+            ),
+            ("mysql://u@h/d?ssl-mode=REQUIRED", "does not support TLS"),
+            ("mysql://u@h/d?useSSL=true", "does not support TLS"),
+            ("mysql://u@h/d?tls=true", "does not support TLS"),
+            ("postgres://u@h/d?ssl=require", "does not support TLS"),
+            ("postgres://u@h/d?ssl=on", "does not support TLS"),
+            ("postgres://u@h/d?sslaccept=strict", "does not support TLS"),
+            ("mysql://u@h/d?ssl-ca=/etc/ca.pem", "does not support TLS"),
+            ("postgres://u@h/d?sslcert=/c.pem", "does not support TLS"),
+            (
+                "postgres://u@h/d?sslmode=prefer&sslrootcert=/ca.pem",
+                "does not support TLS",
+            ),
+            (
+                "postgres://u@h/d?useSSL=false&sslrootcert=/ca.pem",
+                "does not support TLS",
+            ),
+            (
+                "postgres://u@h/d?requiressl=0&sslrootcert=/ca.pem",
+                "does not support TLS",
+            ),
+            (
+                "mysql://u@h/d?ssl-mode=PREFERRED&ssl-ca=/ca.pem&useSSL=false",
+                "does not support TLS",
+            ),
         ] {
             let err = parse_connection_url(raw).unwrap_err().to_string();
             assert!(err.contains(want), "{raw}: got {err}");
+        }
+        for raw in [
+            "postgres://u:S3cret@h:99999/d",
+            "postgres://u@h/d?sslpassword=S3cret",
+        ] {
+            let err = format!("{:#}", parse_connection_url(raw).unwrap_err());
+            assert!(!err.contains("S3cret"), "secret leaked: {err}");
         }
     }
 

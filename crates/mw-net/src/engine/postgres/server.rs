@@ -3,6 +3,7 @@
 //! is rejected without desyncing the stream.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,21 +12,33 @@ use tracing::{info, warn};
 
 use mw_core::audit::{AuditEvent, Decision as AuditDecision};
 use mw_core::config::{ClientAuth, Policy};
-use mw_core::policy::{self, Decision};
+use mw_core::policy::{self, Decision, TxnEffect, TxnState};
 use mw_core::token::verify_pg_cleartext;
 
-use super::client::PgPool;
+use super::binary;
+use super::client::{PgManager, PgPool};
 use super::proto::{self, PgProtoError, Startup};
 use crate::engine::EngineError;
+use crate::idle::{next_wait, within_idle};
+use crate::session_conn::SessionConn;
+
+type PinnedConn<'a> = SessionConn<'a, PgManager>;
 
 const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 const SQLSTATE_INTERNAL: &str = "58000";
+const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
+const SQLSTATE_RESOLUTION_UNKNOWN: &str = "08007";
+const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+const SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+const SQLSTATE_INVALID_BINARY_REPRESENTATION: &str = "22P03";
 
 pub struct PgSession {
     pub user_seen: String,
     pub database: Option<String>,
+    /// Startup parameters other than user/database/client_encoding.
+    pub settings: Vec<(String, String)>,
 }
 
 impl From<PgProtoError> for EngineError {
@@ -72,7 +85,7 @@ pub async fn handshake(
     if tag != b'p' {
         let _ = proto::write_raw(
             stream,
-            &proto::error_response(SQLSTATE_INVALID_PASSWORD, "expected password message"),
+            &proto::fatal_response(SQLSTATE_PROTOCOL_VIOLATION, "expected password message"),
         )
         .await;
         return Err(EngineError::Auth);
@@ -94,7 +107,7 @@ pub async fn handshake(
         warn!(env = expected_env_name, user = %user, "pg auth denied");
         let _ = proto::write_raw(
             stream,
-            &proto::error_response(SQLSTATE_INVALID_PASSWORD, "password authentication failed"),
+            &proto::fatal_response(SQLSTATE_INVALID_PASSWORD, "password authentication failed"),
         )
         .await;
         return Err(EngineError::Auth);
@@ -118,12 +131,17 @@ pub async fn handshake(
         std::process::id() as i32,
         rand::random::<i32>(),
     ));
-    greeting.extend_from_slice(&proto::ready_for_query());
+    greeting.extend_from_slice(&proto::ready_for_query(b'I'));
     proto::write_raw(stream, &greeting).await?;
 
+    let settings = params
+        .into_iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "user" | "database" | "client_encoding"))
+        .collect();
     Ok(PgSession {
         user_seen: user,
         database,
+        settings,
     })
 }
 
@@ -243,13 +261,21 @@ fn elem_type_name(oid: i32) -> &'static str {
         OID_INT4 => "int4",
         OID_INT8 => "int8",
         OID_OID => "oid",
+        24 => "regproc",
+        28 => "xid",
+        29 => "cid",
+        2205 => "regclass",
+        2206 => "regtype",
+        4089 => "regnamespace",
+        4096 => "regrole",
         OID_FLOAT4 => "float4",
         OID_FLOAT8 => "float8",
         OID_NUMERIC => "numeric",
         1042 => "bpchar",
         1043 => "varchar",
         19 => "name",
-        18 => "char",
+        // Quoted: bare `char` is character(1), which truncates.
+        18 => "\"char\"",
         _ => "text",
     }
 }
@@ -271,6 +297,13 @@ fn array_elem_oid(oid: i32) -> Option<i32> {
         1021 => OID_FLOAT4,
         1022 => OID_FLOAT8,
         1028 => OID_OID,
+        1008 => 24,
+        1011 => 28,
+        1012 => 29,
+        2210 => 2205,
+        2211 => 2206,
+        4090 => 4089,
+        4097 => 4096,
         1231 => OID_NUMERIC,
         _ => return None,
     })
@@ -291,7 +324,7 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             }
             .into()),
             OID_INT2 if b.len() == 2 => Ok(i16::from_be_bytes([b[0], b[1]]).to_string()),
-            OID_INT4 | OID_OID if b.len() == 4 => {
+            OID_INT4 if b.len() == 4 => {
                 Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
             }
             OID_INT8 if b.len() == 8 => {
@@ -307,11 +340,24 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
                 a.copy_from_slice(&b[..8]);
                 Ok(fmt_float(f64::from_be_bytes(a)))
             }
-            // OID-family / register types are 4-byte big-endian integers
-            // (regclass, regnamespace, regproc, regtype, xid, cid, ...).
+            // OID-family / register types are 4-byte unsigned big-endian
+            // integers (oid, regproc, regclass, regtype, regnamespace, ...).
             // DBeaver's catalog queries bind these heavily.
-            2202 | 2203 | 2204 | 2205 | 2206 | 4089 | 24 | 28 | 29 | 2200 if b.len() == 4 => {
-                Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            OID_OID | 24 | 2202 | 2203 | 2204 | 2205 | 2206 | 3734 | 3769 | 4089 | 4096 | 4191
+                if b.len() == 4 =>
+            {
+                Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+            }
+            // xid/cid: also 4-byte unsigned, but there's no integer-to-xid
+            // cast, so the inlined CAST needs a string literal.
+            28 | 29 if b.len() == 4 => Ok(quote_lit(
+                &u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+            )),
+            // xid8: the same, 8 bytes.
+            5069 if b.len() == 8 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[..8]);
+                Ok(quote_lit(&u64::from_be_bytes(a).to_string()))
             }
             // Unknown binary type. If it contains a NUL it cannot be text
             // (which would corrupt the query string) — treat fixed 2/4/8-byte
@@ -341,7 +387,14 @@ fn render_scalar(oid: i32, fmt: i16, bytes: Option<&[u8]>) -> Result<String, &'s
             let t = matches!(s.as_ref(), "t" | "true" | "TRUE" | "1" | "y" | "yes");
             Ok(if t { "TRUE" } else { "FALSE" }.into())
         } else if is_numeric_oid(oid) && is_safe_numeric(&s) {
-            Ok(s.into_owned())
+            // NaN/Infinity are valid input but not bare SQL tokens: quoted.
+            if s.bytes()
+                .any(|b| b.is_ascii_alphabetic() && !b.eq_ignore_ascii_case(&b'e'))
+            {
+                Ok(quote_lit(&s))
+            } else {
+                Ok(s.into_owned())
+            }
         } else {
             // Not a numeric type, or a numeric-typed value that is not a
             // valid numeric literal: quote it. A quoted value in a numeric
@@ -432,6 +485,42 @@ fn render_param(oid: i32, fmt: i16, bytes: &Option<Vec<u8>>) -> Result<String, &
         }
     }
     render_scalar(oid, fmt, Some(b))
+}
+
+/// Pin an inlined literal to the type the backend resolved for its
+/// parameter, as a real Bind would: `$1 / 3` with a float8 param stays float
+/// division. The type name comes from tokio-postgres's built-in table, never
+/// from the client.
+fn typed_literal(oid: i32, lit: String) -> String {
+    use tokio_postgres::types::Type;
+    // A bare integer already means what an integer Bind means, and some
+    // positions take only a literal (`FETCH FIRST $1 ROWS`, which the
+    // firewall's parser rejects as a CAST).
+    let integer = lit.strip_prefix('-').unwrap_or(&lit);
+    if matches!(oid, OID_INT2 | OID_INT4 | OID_INT8 | OID_OID)
+        && !integer.is_empty()
+        && integer.bytes().all(|b| b.is_ascii_digit())
+    {
+        return parenthesize_negative(lit);
+    }
+    // text/varchar: a quoted literal already resolves as text would. Not
+    // bpchar or name: the cast is what gives them padding and truncation.
+    if matches!(oid, 25 | 1043) && lit.starts_with('\'') {
+        return lit;
+    }
+    match Type::from_oid(oid as u32) {
+        Some(t) if t != Type::UNKNOWN => format!("CAST({lit} AS pg_catalog.\"{}\")", t.name()),
+        _ => parenthesize_negative(lit),
+    }
+}
+
+/// `10-$1` with -5 must not become `10--5`, which starts a comment.
+fn parenthesize_negative(lit: String) -> String {
+    if lit.starts_with('-') {
+        format!("({lit})")
+    } else {
+        lit
+    }
 }
 
 /// Substitute `$1..$N` placeholders with rendered literals, skipping string
@@ -555,29 +644,54 @@ fn inline_params(sql: &str, rendered: &[String]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn rfq_status(t: &TxnState) -> u8 {
+    if t.failed {
+        b'E'
+    } else if t.in_txn {
+        b'T'
+    } else {
+        b'I'
+    }
+}
+
 type ResultSet = (Vec<String>, Vec<Vec<Option<Vec<u8>>>>, String);
 
-/// Run already-firewalled SQL on the backend, collecting the full result.
+/// The statement ran, but a value in its result isn't UTF-8 (a SQL_ASCII
+/// database), which tokio-postgres can't hand over. Not a statement failure:
+/// the backend did the work.
+struct Undecodable;
+
+/// Run already-firewalled SQL on the backend, collecting the full result. The
+/// outer error is the backend's (the statement failed).
 async fn run_query(
     client: &tokio_postgres::Client,
     sql: &str,
-) -> Result<ResultSet, tokio_postgres::Error> {
+) -> Result<Result<ResultSet, Undecodable>, tokio_postgres::Error> {
     use tokio_postgres::SimpleQueryMessage;
     let msgs = client.simple_query(sql).await?;
     let mut cols: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     let mut affected: u64 = 0;
+    let mut undecodable = false;
     for m in msgs {
         match m {
+            // Sent even for zero rows, so an empty SELECT keeps its columns.
+            SimpleQueryMessage::RowDescription(desc) => {
+                cols = desc.iter().map(|c| c.name().to_string()).collect();
+            }
             SimpleQueryMessage::Row(r) => {
                 if cols.is_empty() {
                     cols = r.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                rows.push(
-                    (0..r.columns().len())
-                        .map(|i| r.get(i).map(|s| s.as_bytes().to_vec()))
-                        .collect(),
-                );
+                // try_get, not get: get panics on a value that isn't UTF-8,
+                // and a release build aborts the whole daemon.
+                let row: Result<Vec<_>, _> = (0..r.columns().len())
+                    .map(|i| r.try_get(i).map(|v| v.map(|s| s.as_bytes().to_vec())))
+                    .collect();
+                match row {
+                    Ok(row) => rows.push(row),
+                    Err(_) => undecodable = true,
+                }
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
             _ => {}
@@ -588,7 +702,10 @@ async fn run_query(
     } else {
         command_tag(sql, rows.len())
     };
-    Ok((cols, rows, tag))
+    if undecodable {
+        return Ok(Err(Undecodable));
+    }
+    Ok(Ok((cols, rows, tag)))
 }
 
 async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
@@ -596,9 +713,9 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
     rs: &ResultSet,
 ) -> Result<(), EngineError> {
     let (cols, rows, tag) = rs;
-    if cols.is_empty() {
-        proto::write_raw(stream, &proto::no_data()).await?;
-    } else {
+    // NoData belongs to the extended protocol; a simple-query statement with no
+    // result set (SET, BEGIN, ...) gets only CommandComplete.
+    if !cols.is_empty() {
         // Simple-query path has no type info; advertise text (OID 25).
         let typed: Vec<(String, i32)> = cols.iter().map(|n| (n.clone(), 25)).collect();
         proto::write_raw(stream, &proto::row_description(&typed)).await?;
@@ -610,16 +727,95 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// The server's SQLSTATE, if the error came from the server, and an audit
+/// reason. Display on a server error says only "db error".
+fn backend_error(e: &tokio_postgres::Error) -> (Option<&str>, String) {
+    match e.as_db_error() {
+        Some(db) => (
+            Some(db.code().code()),
+            format!("backend: {} {}", db.code().code(), db.message()),
+        ),
+        None => (None, format!("backend: {e}")),
+    }
+}
+
+/// SQLSTATEs the server sends right before it closes the connection:
+/// shutdown, crash, idle-session and idle-in-transaction timeouts. The
+/// client may not have seen the close yet.
+fn hangs_up(state: Option<&str>) -> bool {
+    matches!(state, Some("57P01" | "57P02" | "57P05" | "25P03"))
+}
+
+/// The client's frame for a backend failure, and whether the session is
+/// over. The server's SQLSTATE, so retries still work; the message stays
+/// hidden. FATAL when the connection is gone, as Postgres reports it.
+/// `lost` is the SQLSTATE that reports a lost connection, if it is lost.
+/// A server code wins over it: the server said what became of the
+/// statement, as a direct client would have seen.
+fn failure_frame(state: Option<&str>, lost: Option<&str>, message: &str) -> (Vec<u8>, bool) {
+    match (state, lost) {
+        (Some(s), None) if !hangs_up(state) => (proto::error_response(s, message), false),
+        (Some(s), _) => (proto::fatal_response(s, message), true),
+        (None, Some(code)) => (proto::fatal_response(code, message), true),
+        (None, None) => (proto::error_response(SQLSTATE_INTERNAL, message), false),
+    }
+}
+
+/// A backend call failed: the server's SQLSTATE, if it gave one, an audit
+/// reason, and the SQLSTATE for the loss if the connection is gone.
+struct BackendFailure {
+    state: Option<String>,
+    reason: String,
+    lost: Option<&'static str>,
+}
+
+/// Whether the session's backend connection is lost: closed, or any other
+/// error without a server code (an unexpected or unparsable message), which
+/// leaves the protocol out of step. The caller picks the SQLSTATE: whether
+/// the statement may have run depends on what was sent, not on how it died.
+fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
+    e.is_closed() || e.as_db_error().is_none() || client.is_closed()
+}
+
 /// Ask the backend to Parse+Describe the statement so we can report accurate
 /// ParameterDescription / RowDescription to the client (pgjdbc caches these
 /// for server-side prepared-statement reuse and then sends no further
 /// Describe). Returns (param type OIDs, [(col name, col type OID)]).
 async fn backend_describe(
-    pool: &PgPool,
+    conn: &mut PinnedConn<'_>,
     sql: &str,
-) -> Result<(Vec<i32>, Vec<(String, i32)>), String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
-    let stmt = client.prepare(sql).await.map_err(|e| e.to_string())?;
+    param_oids: &[u32],
+) -> Result<(Vec<i32>, Vec<(String, i32)>), BackendFailure> {
+    // The client's declared types, as the backend should see them; 0 and
+    // non-builtin OIDs go through as-is.
+    let types: Vec<tokio_postgres::types::Type> = param_oids
+        .iter()
+        .map(|&oid| {
+            tokio_postgres::types::Type::from_oid(oid).unwrap_or_else(|| {
+                tokio_postgres::types::Type::new(
+                    format!("oid{oid}"),
+                    oid,
+                    tokio_postgres::types::Kind::Simple,
+                    "pg_catalog".into(),
+                )
+            })
+        })
+        .collect();
+    // No connection to lose yet: recoverable, as in exec.
+    let client = conn.get().await.map_err(|e| BackendFailure {
+        state: None,
+        reason: format!("pool: {e}"),
+        lost: None,
+    })?;
+    let stmt = client.prepare_typed(sql, &types).await.map_err(|e| {
+        let (state, reason) = backend_error(&e);
+        BackendFailure {
+            state: state.map(str::to_string),
+            reason,
+            // Prepare runs nothing: safe to reconnect and retry.
+            lost: connection_lost(&e, client).then_some(SQLSTATE_CONNECTION_FAILURE),
+        }
+    })?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
     let cols = stmt
         .columns()
@@ -629,19 +825,25 @@ async fn backend_describe(
     Ok((params, cols))
 }
 
-/// Execute already-firewalled SQL and stream ONLY DataRows + CommandComplete
-/// (no RowDescription — Execute must never send it; the client got the field
-/// structure from Describe). On failure writes an ErrorResponse.
-async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
+/// Firewall + execute, writing the protocol result frames (no ReadyForQuery,
+/// no ParseComplete/BindComplete: the caller owns those). `execute` is set
+/// for an extended-protocol Execute, with each column's type and format: it
+/// sends only DataRows + CommandComplete (the client got the field structure
+/// from Describe). None is a simple query, which describes its own rows.
+/// Returns whether it succeeded; on deny/backend failure it has already
+/// written an ErrorResponse.
+async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     env_name: &str,
     client_user: &str,
     sql: &str,
-    pool: &PgPool,
+    backend: &mut Pinned<'_>,
     pol: &Policy,
+    execute: Option<&[(i32, i16)]>,
 ) -> Result<bool, EngineError> {
     let started = std::time::Instant::now();
-    if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
+    let (decision, effects) = policy::check(sql, pol, &policy::PG_PROFILE);
+    if let Decision::Deny(reason) = decision {
         info!(env = env_name, reason, "pg policy DENY");
         AuditEvent::new(
             env_name,
@@ -660,10 +862,20 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         return Ok(false);
     }
-    let client = match pool.get().await {
+    let client = match backend.conn.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(env = env_name, err = %e, "pg backend unavailable");
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Error,
+                Some(format!("pool: {e}")),
+                None,
+                started.elapsed(),
+            )
+            .emit();
             proto::write_raw(
                 stream,
                 &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
@@ -672,32 +884,108 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(false);
         }
     };
-    let rs = match run_query(&client, sql).await {
-        Ok(rs) => rs,
-        Err(e) => {
-            warn!(env = env_name, err = %e, "pg backend query error");
+    let ran = run_query(client, sql).await;
+    backend.last_statement = std::time::Instant::now();
+    // COMMIT of a failed transaction is a rollback; say so, as Postgres does.
+    // The tag otherwise comes from the SQL text, which would claim "COMMIT".
+    let committed_failed =
+        backend.txn.failed && matches!(effects.as_slice(), [TxnEffect::End { .. }]);
+    backend
+        .txn
+        .apply(&effects, ran.is_ok(), &policy::PG_PROFILE);
+    let rs = match ran {
+        Ok(Ok((cols, rows, tag))) => {
+            let tag = if committed_failed {
+                "ROLLBACK".to_string()
+            } else {
+                tag
+            };
+            (cols, rows, tag)
+        }
+        Ok(Err(Undecodable)) => {
             AuditEvent::new(
                 env_name,
                 client_user,
                 sql,
-                AuditDecision::Deny,
-                Some("backend error".into()),
+                AuditDecision::Allow,
+                Some("result not valid UTF-8".into()),
                 None,
                 started.elapsed(),
             )
             .emit();
+            // Say it ran: "query failed" would invite a retry that repeats
+            // a write.
             proto::write_raw(
                 stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
+                &proto::error_response(
+                    SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE,
+                    "the statement ran, but its result is not valid UTF-8",
+                ),
             )
             .await?;
             return Ok(false);
         }
+        Err(e) => {
+            warn!(env = env_name, err = %e, "pg backend query error");
+            let (state, reason) = backend_error(&e);
+            AuditEvent::new(
+                env_name,
+                client_user,
+                sql,
+                AuditDecision::Error,
+                Some(reason),
+                None,
+                started.elapsed(),
+            )
+            .emit();
+            // The statement was sent and may have run: 08007, which drivers
+            // don't blindly retry.
+            let lost = connection_lost(&e, client).then_some(SQLSTATE_RESOLUTION_UNKNOWN);
+            let (frame, lost) = failure_frame(state, lost, "query failed");
+            proto::write_raw(stream, &frame).await?;
+            // The pinned connection (and any open transaction) is gone; end
+            // the session rather than continue on a fresh one.
+            if lost {
+                return Err(EngineError::Backend("backend connection lost".into()));
+            }
+            return Ok(false);
+        }
     };
-    for row in &rs.1 {
-        proto::write_raw(stream, &proto::data_row(row)).await?;
+    match execute {
+        None => write_result_set(stream, &rs).await?,
+        Some(cols) => {
+            let rows = match encode_rows(&rs.1, cols) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // Checked per type at Bind; this is a value the text
+                    // parser can't read (say, a non-ISO DateStyle).
+                    AuditEvent::new(
+                        env_name,
+                        client_user,
+                        sql,
+                        AuditDecision::Error,
+                        Some(e.to_string()),
+                        None,
+                        started.elapsed(),
+                    )
+                    .emit();
+                    proto::write_raw(
+                        stream,
+                        &proto::error_response(
+                            SQLSTATE_INVALID_BINARY_REPRESENTATION,
+                            "the statement ran, but a result value could not be sent in binary",
+                        ),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+            };
+            for row in &rows {
+                proto::write_raw(stream, &proto::data_row(row)).await?;
+            }
+            proto::write_raw(stream, &proto::command_complete(&rs.2)).await?;
+        }
     }
-    proto::write_raw(stream, &proto::command_complete(&rs.2)).await?;
     AuditEvent::new(
         env_name,
         client_user,
@@ -711,84 +999,12 @@ async fn exec_rows_only<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(true)
 }
 
-/// Firewall + execute, writing the protocol result frames (no ReadyForQuery,
-/// no ParseComplete/BindComplete — caller owns those). Returns the rendered
-/// outcome; on deny/backend failure it has already written an ErrorResponse.
-async fn firewalled_exec<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    env_name: &str,
-    client_user: &str,
-    sql: &str,
-    pool: &PgPool,
-    pol: &Policy,
-) -> Result<bool, EngineError> {
-    let started = std::time::Instant::now();
-    if let Decision::Deny(reason) = policy::evaluate(sql, pol, &policy::PG_PROFILE) {
-        info!(env = env_name, reason, "pg policy DENY");
-        AuditEvent::new(
-            env_name,
-            client_user,
-            sql,
-            AuditDecision::Deny,
-            Some(reason.to_string()),
-            None,
-            started.elapsed(),
-        )
-        .emit();
-        proto::write_raw(
-            stream,
-            &proto::error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, reason),
-        )
-        .await?;
-        return Ok(false);
-    }
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(env = env_name, err = %e, "pg backend unavailable");
-            proto::write_raw(
-                stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "backend unavailable"),
-            )
-            .await?;
-            return Ok(false);
-        }
-    };
-    let rs = match run_query(&client, sql).await {
-        Ok(rs) => rs,
-        Err(e) => {
-            warn!(env = env_name, err = %e, "pg backend query error");
-            AuditEvent::new(
-                env_name,
-                client_user,
-                sql,
-                AuditDecision::Deny,
-                Some("backend error".into()),
-                None,
-                started.elapsed(),
-            )
-            .emit();
-            proto::write_raw(
-                stream,
-                &proto::error_response(SQLSTATE_INTERNAL, "query failed"),
-            )
-            .await?;
-            return Ok(false);
-        }
-    };
-    let n = rs.1.len() as u64;
-    write_result_set(stream, &rs).await?;
-    AuditEvent::new(
-        env_name,
-        client_user,
-        sql,
-        AuditDecision::Allow,
-        None,
-        Some(n),
-        started.elapsed(),
-    )
-    .emit();
-    Ok(true)
+/// The session's backend connection and the transaction state it is in.
+struct Pinned<'a> {
+    conn: PinnedConn<'a>,
+    txn: TxnState,
+    /// When the backend last ran a statement; bounds idle-in-transaction.
+    last_statement: std::time::Instant,
 }
 
 struct Prepared {
@@ -803,23 +1019,150 @@ struct Portal {
     stmt: String,
     /// Parameter-inlined, executable SQL.
     sql: String,
+    /// Each result column's type OID and the format the client asked for.
+    result_cols: Vec<(i32, i16)>,
+}
+
+/// Bind's result format codes, one per column: none means all text, one
+/// applies to all. Binary is checked against what [`binary`] can encode, so
+/// an unsupported request fails before the statement runs.
+fn result_cols(cols: &[(String, i32)], formats: &[i16]) -> Result<Vec<(i32, i16)>, String> {
+    if formats.len() > 1 && formats.len() != cols.len() {
+        return Err("result format count does not match the columns".to_string());
+    }
+    let fmt_of = |i: usize| match formats.len() {
+        0 => Ok(0),
+        1 => Ok(formats[0]),
+        n if n == cols.len() => Ok(formats[i]),
+        _ => Err("result format count does not match the columns".to_string()),
+    };
+    cols.iter()
+        .enumerate()
+        .map(|(i, (_, oid))| match fmt_of(i)? {
+            0 => Ok((*oid, 0)),
+            1 if binary::supported(*oid) => Ok((*oid, 1)),
+            1 => Err(format!(
+                "binary result format is not supported for type {oid}"
+            )),
+            _ => Err("unknown result format code".to_string()),
+        })
+        .collect()
+}
+
+/// Re-encode the binary columns of text rows.
+fn encode_rows(
+    rows: &[Vec<Option<Vec<u8>>>],
+    cols: &[(i32, i16)],
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, &'static str> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, cell)| match (cell, cols.get(i)) {
+                    (Some(v), Some(&(oid, 1))) => binary::encode(oid, v).map(Some),
+                    _ => Ok(cell.clone()),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 pub async fn serve(
     stream: &mut TcpStream,
     env_name: &str,
     client_user: &str,
+    settings: &[(String, String)],
     pool: &PgPool,
     pol: &Policy,
+    idle_timeout: Duration,
 ) -> Result<(), EngineError> {
+    let mut backend = Pinned {
+        conn: PinnedConn::new(pool),
+        txn: TxnState::default(),
+        last_statement: std::time::Instant::now(),
+    };
     let mut prepared: HashMap<String, Prepared> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     // Set once an error occurs in an extended-protocol series; suppresses
     // further work until the next Sync (matches PG skip-until-Sync rule).
     let mut skip_until_sync = false;
 
+    // Apply the client's startup settings, as Postgres would, then report
+    // the TimeZone: the greeting can't know it, and drivers need it to
+    // decode binary timestamptz/timetz (pgjdbc refuses without it). Best
+    // effort: a backend that's down fails the first statement instead.
+    // Postgres refuses the connection when it can't apply the startup
+    // settings; so does the proxy, rather than run without them.
+    let client = match backend.conn.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(env = env_name, err = %e, "pg backend unavailable at session start");
+            let _ = proto::write_raw(
+                stream,
+                &proto::fatal_response(SQLSTATE_CONNECTION_FAILURE, "backend unavailable"),
+            )
+            .await;
+            return Err(EngineError::Backend("backend unavailable".into()));
+        }
+    };
+    for (name, value) in settings {
+        // Same gate and audit as a client's own SET.
+        let started = std::time::Instant::now();
+        let sql = format!("SET {name} = {}", quote_lit(value));
+        let named = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        let decision = if named {
+            policy::check(&sql, pol, &policy::PG_PROFILE).0
+        } else {
+            Decision::Deny("startup parameter name not allowed")
+        };
+        let (audit, reason) = match decision {
+            Decision::Deny(r) => (AuditDecision::Deny, Some(r.to_string())),
+            _ => match client.batch_execute(&sql).await {
+                Ok(()) => (AuditDecision::Allow, None),
+                Err(e) => (AuditDecision::Error, Some(backend_error(&e).1)),
+            },
+        };
+        AuditEvent::new(
+            env_name,
+            client_user,
+            &sql,
+            audit,
+            reason,
+            None,
+            started.elapsed(),
+        )
+        .emit();
+    }
+    if let Ok(rows) = client.simple_query("SHOW TimeZone").await {
+        let tz = rows.iter().find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.try_get(0).ok().flatten(),
+            _ => None,
+        });
+        if let Some(tz) = tz {
+            proto::write_raw(stream, &proto::parameter_status("TimeZone", tz)).await?;
+        }
+    }
+
     loop {
-        let (tag, body) = match proto::read_message(stream).await {
+        let wait = next_wait(idle_timeout, backend.txn.in_txn, backend.last_statement);
+        let Some(msg) = within_idle(wait, proto::read_message(stream)).await else {
+            info!(env = env_name, "closing idle session");
+            // As Postgres's own idle timeouts say it. Best effort: the
+            // client may be gone already.
+            // Bounded: a client that stopped reading must not hold the
+            // session (and its locks) open.
+            let state = if backend.txn.in_txn { "25P03" } else { "57P05" };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                proto::write_raw(
+                    stream,
+                    &proto::fatal_response(state, "terminating idle session"),
+                ),
+            )
+            .await;
+            return Ok(());
+        };
+        let (tag, body) = match msg {
             Ok(m) => m,
             Err(PgProtoError::Closed) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -835,9 +1178,10 @@ pub async fn serve(
                 if sql.trim().is_empty() {
                     proto::write_raw(stream, &proto::empty_query_response()).await?;
                 } else {
-                    let _ = firewalled_exec(stream, env_name, client_user, &sql, pool, pol).await?;
+                    let _ =
+                        exec(stream, env_name, client_user, &sql, &mut backend, pol, None).await?;
                 }
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
 
             // --- Extended query ---
@@ -877,7 +1221,7 @@ pub async fn serve(
                 }
                 // Parse+Describe on the backend for accurate param/result
                 // metadata (pgjdbc relies on this for prepared reuse).
-                match backend_describe(pool, &m.query).await {
+                match backend_describe(&mut backend.conn, &m.query, &m.param_oids).await {
                     Ok((param_oids, col_meta)) => {
                         prepared.insert(
                             m.stmt.clone(),
@@ -889,13 +1233,32 @@ pub async fn serve(
                         );
                         proto::write_raw(stream, &proto::parse_complete()).await?;
                     }
-                    Err(e) => {
-                        warn!(env = env_name, err = %e, "pg backend parse failed");
-                        proto::write_raw(
-                            stream,
-                            &proto::error_response(SQLSTATE_INTERNAL, "statement parse failed"),
+                    Err(BackendFailure {
+                        state,
+                        reason,
+                        lost,
+                    }) => {
+                        // A failed prepare aborts an open transaction too.
+                        backend
+                            .txn
+                            .apply(&[TxnEffect::Other], false, &policy::PG_PROFILE);
+                        warn!(env = env_name, err = %reason, "pg backend parse failed");
+                        AuditEvent::new(
+                            env_name,
+                            client_user,
+                            &m.query,
+                            AuditDecision::Error,
+                            Some(reason),
+                            None,
+                            std::time::Duration::ZERO,
                         )
-                        .await?;
+                        .emit();
+                        let (frame, lost) =
+                            failure_frame(state.as_deref(), lost, "statement parse failed");
+                        proto::write_raw(stream, &frame).await?;
+                        if lost {
+                            return Err(EngineError::Backend("backend connection lost".into()));
+                        }
                         skip_until_sync = true;
                     }
                 }
@@ -928,7 +1291,7 @@ pub async fn serve(
                     let oid = prep.param_oids.get(i).copied().unwrap_or(0);
                     let fmt = m.param_formats.get(i).copied().unwrap_or(0);
                     match render_param(oid, fmt, val) {
-                        Ok(r) => rendered.push(r),
+                        Ok(r) => rendered.push(typed_literal(oid, r)),
                         Err(e) => {
                             bad = Some(e);
                             break;
@@ -944,12 +1307,25 @@ pub async fn serve(
                     skip_until_sync = true;
                     continue;
                 }
+                let cols = match result_cols(&prep.col_meta, &m.result_formats) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        proto::write_raw(
+                            stream,
+                            &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, &e),
+                        )
+                        .await?;
+                        skip_until_sync = true;
+                        continue;
+                    }
+                };
                 let inlined = inline_params(&prep.sql, &rendered);
                 portals.insert(
                     m.portal.clone(),
                     Portal {
                         stmt: m.stmt.clone(),
                         sql: inlined,
+                        result_cols: cols,
                     },
                 );
                 proto::write_raw(stream, &proto::bind_complete()).await?;
@@ -962,25 +1338,33 @@ pub async fn serve(
                     proto::write_raw(stream, &proto::no_data()).await?;
                     continue;
                 };
+                // A statement's formats aren't known until Bind (text); a
+                // portal's are the ones its Bind asked for.
                 let meta = if kind == b'S' {
                     prepared
                         .get(&name)
-                        .map(|p| (Some(p.param_oids.clone()), p.col_meta.clone()))
+                        .map(|p| (Some(p.param_oids.clone()), p.col_meta.clone(), Vec::new()))
                 } else {
-                    portals
-                        .get(&name)
-                        .and_then(|po| prepared.get(&po.stmt))
-                        .map(|p| (None, p.col_meta.clone()))
+                    portals.get(&name).and_then(|po| {
+                        let formats = po.result_cols.iter().map(|c| c.1).collect();
+                        prepared
+                            .get(&po.stmt)
+                            .map(|p| (None, p.col_meta.clone(), formats))
+                    })
                 };
                 match meta {
-                    Some((param_oids, col_meta)) => {
+                    Some((param_oids, col_meta, formats)) => {
                         if let Some(oids) = param_oids {
                             proto::write_raw(stream, &proto::parameter_description(&oids)).await?;
                         }
                         if col_meta.is_empty() {
                             proto::write_raw(stream, &proto::no_data()).await?;
                         } else {
-                            proto::write_raw(stream, &proto::row_description(&col_meta)).await?;
+                            proto::write_raw(
+                                stream,
+                                &proto::row_description_formats(&col_meta, &formats),
+                            )
+                            .await?;
                         }
                     }
                     None => proto::write_raw(stream, &proto::no_data()).await?,
@@ -991,8 +1375,8 @@ pub async fn serve(
                     continue;
                 }
                 let portal_name = proto::parse_execute(&body).unwrap_or_default();
-                let sql = match portals.get(&portal_name) {
-                    Some(p) => p.sql.clone(),
+                let (sql, cols) = match portals.get(&portal_name) {
+                    Some(p) => (p.sql.clone(), p.result_cols.clone()),
                     None => {
                         proto::write_raw(
                             stream,
@@ -1005,7 +1389,17 @@ pub async fn serve(
                 };
                 // Execute streams ONLY DataRows + CommandComplete; the client
                 // already has the field structure from Describe.
-                if !exec_rows_only(stream, env_name, client_user, &sql, pool, pol).await? {
+                if !exec(
+                    stream,
+                    env_name,
+                    client_user,
+                    &sql,
+                    &mut backend,
+                    pol,
+                    Some(&cols),
+                )
+                .await?
+                {
                     skip_until_sync = true;
                 }
             }
@@ -1022,7 +1416,7 @@ pub async fn serve(
             b'H' => { /* Flush: we write eagerly, nothing buffered */ }
             b'S' => {
                 skip_until_sync = false;
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
             b'X' => return Ok(()),
             other => {
@@ -1032,7 +1426,7 @@ pub async fn serve(
                     &proto::error_response(SQLSTATE_FEATURE_NOT_SUPPORTED, "unsupported message"),
                 )
                 .await?;
-                proto::write_raw(stream, &proto::ready_for_query()).await?;
+                proto::write_raw(stream, &proto::ready_for_query(rfq_status(&backend.txn))).await?;
             }
         }
     }
@@ -1041,6 +1435,104 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inlined_params_keep_their_type() {
+        let sql = inline_params("SELECT $1 / 3", &[typed_literal(701, "1".into())]);
+        assert_eq!(sql, r#"SELECT CAST(1 AS pg_catalog."float8") / 3"#);
+        assert!(policy::check(&sql, &Policy::ReadOnly, &policy::PG_PROFILE)
+            .0
+            .is_allow());
+        assert_eq!(typed_literal(0, "'x'".into()), "'x'");
+        // Integers stay bare: FETCH FIRST takes only a literal.
+        let fetch = inline_params(
+            "SELECT * FROM t OFFSET $1 ROWS FETCH FIRST $2 ROWS ONLY",
+            &[typed_literal(20, "0".into()), typed_literal(20, "5".into())],
+        );
+        assert!(
+            policy::check(&fetch, &Policy::ReadOnly, &policy::PG_PROFILE)
+                .0
+                .is_allow()
+        );
+        assert_eq!(
+            inline_params("SELECT 10-$1", &[typed_literal(23, "-5".into())]),
+            "SELECT 10-(-5)"
+        );
+        let esc = inline_params(
+            "SELECT 'a_b' LIKE $1 ESCAPE $2",
+            &[
+                typed_literal(25, "'a\\_b'".into()),
+                typed_literal(25, "'\\'".into()),
+            ],
+        );
+        assert!(policy::check(&esc, &Policy::ReadOnly, &policy::PG_PROFILE)
+            .0
+            .is_allow());
+        let bp = typed_literal(1042, "'abc  '".into());
+        assert_eq!(bp, r#"CAST('abc  ' AS pg_catalog."bpchar")"#);
+        for lit in [
+            bp,
+            typed_literal(28, render_scalar(28, 1, Some(&[0, 0, 0, 5])).unwrap()),
+        ] {
+            assert!(
+                policy::check(
+                    &format!("SELECT {lit}"),
+                    &Policy::ReadOnly,
+                    &policy::PG_PROFILE
+                )
+                .0
+                .is_allow(),
+                "{lit}"
+            );
+        }
+        assert_eq!(
+            render_scalar(OID_OID, 1, Some(&u32::MAX.to_be_bytes())).unwrap(),
+            "4294967295"
+        );
+        assert_eq!(render_scalar(701, 0, Some(b"NaN")).unwrap(), "'NaN'");
+        assert_eq!(
+            render_scalar(701, 0, Some(b"-Infinity")).unwrap(),
+            "'-Infinity'"
+        );
+        assert_eq!(render_scalar(701, 0, Some(b"1e5")).unwrap(), "1e5");
+        let arr = typed_literal(1007, "ARRAY[1,2]".into());
+        assert_eq!(arr, r#"CAST(ARRAY[1,2] AS pg_catalog."_int4")"#);
+        assert!(policy::check(
+            &format!("SELECT {arr}"),
+            &Policy::ReadOnly,
+            &policy::PG_PROFILE
+        )
+        .0
+        .is_allow());
+    }
+
+    #[test]
+    fn hang_up_states_end_the_session_as_fatal() {
+        for state in ["57P01", "57P02", "57P05", "25P03"] {
+            let (frame, lost) = failure_frame(Some(state), None, "x");
+            assert!(lost, "{state}");
+            assert_eq!(frame, proto::fatal_response(state, "x"));
+        }
+        // Serialization failure, deadlock: retryable, the session goes on.
+        for state in ["40001", "40P01"] {
+            let (frame, lost) = failure_frame(Some(state), None, "x");
+            assert!(!lost, "{state}");
+            assert_eq!(frame, proto::error_response(state, "x"));
+        }
+        for code in ["08006", "08007"] {
+            let (frame, lost) = failure_frame(None, Some(code), "x");
+            assert!(lost, "{code}");
+            assert_eq!(frame, proto::fatal_response(code, "x"));
+        }
+        // The server's code says what became of the statement: it wins.
+        let (frame, lost) = failure_frame(Some("23505"), Some("08007"), "x");
+        assert!(lost);
+        assert_eq!(frame, proto::fatal_response("23505", "x"));
+        // No server code and no lost connection (pool acquire): recoverable.
+        let (frame, lost) = failure_frame(None, None, "x");
+        assert!(!lost);
+        assert_eq!(frame, proto::error_response(SQLSTATE_INTERNAL, "x"));
+    }
 
     /// Build a 1-D PG binary array payload.
     fn bin_array(elem_oid: i32, elems: &[Option<&[u8]>]) -> Vec<u8> {
@@ -1129,11 +1621,25 @@ mod tests {
             render_scalar(OID_INT8, 1, Some(&9i64.to_be_bytes())).unwrap(),
             "9"
         );
-        // regclass (2205) family decoded as i32
+        // regclass (2205) family decoded as unsigned
         assert_eq!(
             render_scalar(2205, 1, Some(&2200i32.to_be_bytes())).unwrap(),
             "2200"
         );
+        assert_eq!(
+            render_scalar(4096, 1, Some(&u32::MAX.to_be_bytes())).unwrap(),
+            "4294967295"
+        );
+        assert_eq!(
+            render_scalar(5069, 1, Some(&u64::MAX.to_be_bytes())).unwrap(),
+            "'18446744073709551615'"
+        );
+        // binary regclass[]: elements decoded through the same arm
+        let mut arr = Vec::new();
+        for v in [1i32, 0, 2205, 1, 1, 4, 2259] {
+            arr.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(render_param(2210, 1, &Some(arr)).unwrap(), "ARRAY[2259]");
         // unknown binary with NUL, 4 bytes -> int
         assert_eq!(
             render_scalar(99999, 1, Some(&2200i32.to_be_bytes())).unwrap(),
