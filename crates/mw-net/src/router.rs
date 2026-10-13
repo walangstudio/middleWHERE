@@ -15,7 +15,7 @@ use mw_core::policy::{self, TxnState};
 
 use crate::framing::{read_packet, write_lenenc_int, write_packet, FramingError, SequenceCounter};
 use crate::idle::{next_wait, within_idle};
-use crate::mysql_client::{BackendManager, BackendPool};
+use crate::mysql_client::{hangs_up, BackendManager, BackendPool};
 use crate::session_conn::SessionConn;
 use crate::wire;
 
@@ -268,10 +268,8 @@ where
             // Anything else means it (and any transaction on it) is gone, or
             // left unread packets behind; end the session rather than
             // continue on a desynced or fresh connection.
-            // Except the ones the server sends right before it hangs up:
-            // shutdown, killed connection, idle timeout.
-            if matches!(&e, mysql_async::Error::Server(se) if !matches!(se.code, 1053 | 1927 | 4031))
-            {
+            // Except the ones the server sends right before it hangs up.
+            if matches!(e, mysql_async::Error::Server(_)) && !hangs_up(&e) {
                 Ok(())
             } else {
                 Err(e.into())

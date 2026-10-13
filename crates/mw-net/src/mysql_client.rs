@@ -115,6 +115,12 @@ async fn pin_session(conn: &mut Conn) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Server errors sent right before the server closes the connection:
+/// shutdown, killed connection (MariaDB) or session, idle timeout.
+pub fn hangs_up(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if matches!(se.code, 1053 | 1927 | 3169 | 4031))
+}
+
 impl Manager for BackendManager {
     type Type = Conn;
     type Error = BackendError;
@@ -134,7 +140,8 @@ impl Manager for BackendManager {
             ),
             // A server, or a proxy in front of one, that refuses the probe
             // keeps what an earlier connection saw. Only tunes rollback tracking.
-            Ok(_) | Err(mysql_async::Error::Server(_)) => {}
+            Ok(_) => {}
+            Err(e) if matches!(e, mysql_async::Error::Server(_)) && !hangs_up(&e) => {}
             // Anything else may have left the connection broken.
             Err(e) => return Err(e.into()),
         }
@@ -159,4 +166,27 @@ pub fn build_pool(opts: BackendOpts, max_size: u32) -> BackendPool {
         .recycle_timeout(Some(Duration::from_secs(5)))
         .build()
         .expect("pool build only fails on bad config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hang_up_codes_end_the_session() {
+        let server = |code| {
+            mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: String::new(),
+                state: "HY000".into(),
+            })
+        };
+        for code in [1053, 1927, 3169, 4031] {
+            assert!(hangs_up(&server(code)), "{code}");
+        }
+        // Deadlock, duplicate key: the connection is still good.
+        for code in [1213, 1062] {
+            assert!(!hangs_up(&server(code)), "{code}");
+        }
+    }
 }

@@ -92,15 +92,17 @@ versions are fixes only.
   to a value that may read a table (a subquery or function call). A Postgres
   batch of several statements may not contain BEGIN/COMMIT/ROLLBACK/`SET
   autocommit`; send those on their own. Under MySQL `autocommit=0`, plain
-  `EXPLAIN`, `DESCRIBE`, `SHOW COLUMNS`, and any `SET`/`SHOW` with a subquery
-  or function call count as opening a transaction, as they do on the server.
+  `EXPLAIN`, `DESCRIBE`, `SHOW COLUMNS`, `CREATE TEMPORARY TABLE ... AS
+  SELECT`, and any `SET`/`SHOW` with a subquery or function call count as
+  opening a transaction, as they do on the server.
 - Postgres backend failures and an unreachable backend are audited as
   `error` with the server's SQLSTATE and message, as on MySQL. They were
   audited as `deny`, or not at all.
 - A backend error reaches the client with the server's SQLSTATE (and MySQL
   error code) instead of a generic internal error, so driver retries on
   deadlocks and serialization failures work. The message stays hidden. A
-  MySQL shutdown, killed-connection or idle-timeout error ends the session.
+  MySQL shutdown, killed-connection, killed-session or idle-timeout error ends
+  the session.
 - MySQL requests may carry only one statement, whatever the policy. The proxy
   relays one result set, so a later statement's error was lost and a failed
   write in a batch was reported as success.

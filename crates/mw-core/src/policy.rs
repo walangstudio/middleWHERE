@@ -497,7 +497,7 @@ pub enum TxnEffect {
 }
 
 fn txn_effect(stmt: &Statement) -> TxnEffect {
-    let reads = match stmt {
+    let reads = || match stmt {
         // Only the AS SELECT part: a column DEFAULT reads nothing.
         Statement::CreateTable(ct) => ct.query.as_deref().is_some_and(may_read_table),
         _ => may_read_table(stmt),
@@ -505,7 +505,7 @@ fn txn_effect(stmt: &Statement) -> TxnEffect {
     match base_txn_effect(stmt) {
         // SET, SHOW ... WHERE or CREATE TEMPORARY TABLE ... AS SELECT with a
         // subquery or function call opens a transaction too.
-        TxnEffect::Other if reads => TxnEffect::Work,
+        TxnEffect::Other if reads() => TxnEffect::Work,
         e => e,
     }
 }

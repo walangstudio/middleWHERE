@@ -648,22 +648,28 @@ async fn write_result_set<S: AsyncRead + AsyncWrite + Unpin>(
 /// ParameterDescription / RowDescription to the client (pgjdbc caches these
 /// for server-side prepared-statement reuse and then sends no further
 /// Describe). Returns (param type OIDs, [(col name, col type OID)]).
+/// The server's SQLSTATE, if the error came from the server, and an audit
+/// reason. Display on a server error says only "db error".
+fn backend_error(e: &tokio_postgres::Error) -> (Option<&str>, String) {
+    match e.as_db_error() {
+        Some(db) => (
+            Some(db.code().code()),
+            format!("backend: {} {}", db.code().code(), db.message()),
+        ),
+        None => (None, format!("backend: {e}")),
+    }
+}
+
 /// On failure: the server's SQLSTATE, if it gave one, and an audit reason.
 async fn backend_describe(
     conn: &mut PinnedConn<'_>,
     sql: &str,
 ) -> Result<(Vec<i32>, Vec<(String, i32)>), (Option<String>, String)> {
     let client = conn.get().await.map_err(|e| (None, format!("pool: {e}")))?;
-    let stmt = client
-        .prepare(sql)
-        .await
-        .map_err(|e| match e.as_db_error() {
-            Some(db) => (
-                Some(db.code().code().to_string()),
-                format!("backend: {} {}", db.code().code(), db.message()),
-            ),
-            None => (None, format!("backend: {e}")),
-        })?;
+    let stmt = client.prepare(sql).await.map_err(|e| {
+        let (state, reason) = backend_error(&e);
+        (state.map(str::to_string), reason)
+    })?;
     let params = stmt.params().iter().map(|t| t.oid() as i32).collect();
     let cols = stmt
         .columns()
@@ -779,20 +785,14 @@ async fn exec<S: AsyncRead + AsyncWrite + Unpin>(
                 client_user,
                 sql,
                 AuditDecision::Error,
-                // Display on a server error says only "db error".
-                Some(match e.as_db_error() {
-                    Some(db) => format!("backend: {} {}", db.code().code(), db.message()),
-                    None => format!("backend: {e}"),
-                }),
+                Some(backend_error(&e).1),
                 None,
                 started.elapsed(),
             )
             .emit();
             // The server's SQLSTATE, so serialization and deadlock retries
             // still work; the message stays hidden.
-            let state = e
-                .as_db_error()
-                .map_or(SQLSTATE_INTERNAL, |db| db.code().code());
+            let state = backend_error(&e).0.unwrap_or(SQLSTATE_INTERNAL);
             proto::write_raw(stream, &proto::error_response(state, "query failed")).await?;
             // A closed client means the pinned connection (and any open
             // transaction) is gone; end the session rather than continue on
