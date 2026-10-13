@@ -100,9 +100,12 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
         ((len >> 16) & 0xFF) as u8,
         seq.next(),
     ];
-    w.write_all(&hdr).await?;
-    w.write_all(payload).await?;
-    w.flush().await?;
+    crate::idle::bounded_write(async {
+        w.write_all(&hdr).await?;
+        w.write_all(payload).await?;
+        w.flush().await
+    })
+    .await?;
     Ok(())
 }
 

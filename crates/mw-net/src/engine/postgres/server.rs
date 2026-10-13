@@ -691,9 +691,11 @@ struct BackendFailure {
     lost: bool,
 }
 
-/// The request's own error says so even before the client notices the close.
+/// Any error without a server code (closed, I/O, an unexpected or
+/// unparsable message) leaves the backend in an unknown state: the statement
+/// may have run, and the protocol may be out of step.
 fn connection_lost(e: &tokio_postgres::Error, client: &tokio_postgres::Client) -> bool {
-    e.is_closed() || client.is_closed()
+    e.as_db_error().is_none() || client.is_closed()
 }
 
 /// Ask the backend to Parse+Describe the statement so we can report accurate

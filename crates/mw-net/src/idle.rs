@@ -10,7 +10,23 @@
 //! `Pool::retain` only inspects connections sitting in the pool, so active
 //! proxying is never interrupted.
 
+use std::future::Future;
 use std::time::Duration;
+
+/// How long one write to a client may take. A client that stops reading
+/// would otherwise block the session, its pinned connection and any locks
+/// forever; the idle timeout only covers reads.
+// ponytail: fixed bound per frame, make it configurable if slow links need more.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Run a client write under [`WRITE_TIMEOUT`].
+pub async fn bounded_write<F: Future<Output = std::io::Result<()>>>(
+    write: F,
+) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write)
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+}
 
 /// Whether a pooled connection whose last use was `last_used` ago should be
 /// kept. A zero `idle_timeout` disables reaping (keep everything). This is the
@@ -55,6 +71,15 @@ pub fn next_wait(idle: Duration, in_txn: bool, last_statement: std::time::Instan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that never drains its socket can't hold the session forever.
+    #[tokio::test(start_paused = true)]
+    async fn write_to_a_stalled_client_times_out() {
+        use tokio::io::AsyncWriteExt;
+        let (mut ours, _theirs) = tokio::io::duplex(16);
+        let err = bounded_write(ours.write_all(&[0; 64])).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn idle_in_transaction_window_runs_from_the_last_statement() {

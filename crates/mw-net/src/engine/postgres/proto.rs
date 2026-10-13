@@ -92,7 +92,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8
 }
 
 pub async fn write_raw<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<(), PgProtoError> {
-    w.write_all(bytes).await?;
+    crate::idle::bounded_write(w.write_all(bytes)).await?;
     Ok(())
 }
 
