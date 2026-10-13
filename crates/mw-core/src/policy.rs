@@ -523,6 +523,7 @@ fn base_txn_effect(stmt: &Statement) -> TxnEffect {
         } => txn_effect(statement),
         Explain { .. } | ExplainTable { .. } | ShowColumns { .. } => TxnEffect::Work,
         // sqlparser has no SHOW INDEX: it lands here as an identifier list.
+        // (SHOW EXTENDED INDEX doesn't parse, so the firewall denies it.)
         ShowVariable { variable }
             if variable.first().is_some_and(|i| {
                 matches!(

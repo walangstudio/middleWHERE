@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/github/v/release/walangstudio/middleWHERE?sort=semver)](https://github.com/walangstudio/middleWHERE/releases/latest)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-345%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-346%20passing-brightgreen)
 
 middleWHERE sits between whoever runs queries and your real database. The
 caller connects to a local port with a name and a token, and runs SQL. They

@@ -452,6 +452,18 @@ fn render_param(oid: i32, fmt: i16, bytes: &Option<Vec<u8>>) -> Result<String, &
     render_scalar(oid, fmt, Some(b))
 }
 
+/// Pin an inlined literal to the type the backend resolved for its
+/// parameter, as a real Bind would: `$1 / 3` with a float8 param stays float
+/// division. The type name comes from tokio-postgres's built-in table, never
+/// from the client.
+fn typed_literal(oid: i32, lit: String) -> String {
+    use tokio_postgres::types::Type;
+    match Type::from_oid(oid as u32) {
+        Some(t) if t != Type::UNKNOWN => format!("CAST({lit} AS pg_catalog.\"{}\")", t.name()),
+        _ => lit,
+    }
+}
+
 /// Substitute `$1..$N` placeholders with rendered literals, skipping string
 /// literals, quoted identifiers and comments so we never rewrite a `$n`
 /// that is actually data.
@@ -956,6 +968,9 @@ struct Portal {
 /// applies to all. Binary is checked against what [`binary`] can encode, so
 /// an unsupported request fails before the statement runs.
 fn result_cols(cols: &[(String, i32)], formats: &[i16]) -> Result<Vec<(i32, i16)>, String> {
+    if formats.len() > 1 && formats.len() != cols.len() {
+        return Err("result format count does not match the columns".to_string());
+    }
     let fmt_of = |i: usize| match formats.len() {
         0 => Ok(0),
         1 => Ok(formats[0]),
@@ -1017,27 +1032,55 @@ pub async fn serve(
     // the TimeZone: the greeting can't know it, and drivers need it to
     // decode binary timestamptz/timetz (pgjdbc refuses without it). Best
     // effort: a backend that's down fails the first statement instead.
-    if let Ok(client) = backend.conn.get().await {
-        for (name, value) in settings {
-            // Same gate as a client's own SET: the firewall's allowlist.
-            let sql = format!("SET {name} = {}", quote_lit(value));
-            let named = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-            if !named || !policy::check(&sql, pol, &policy::PG_PROFILE).0.is_allow() {
-                info!(env = env_name, setting = %name, "startup setting not applied");
-                continue;
-            }
-            if let Err(e) = client.batch_execute(&sql).await {
-                info!(env = env_name, setting = %name, err = %e, "startup setting rejected");
-            }
+    // Postgres refuses the connection when it can't apply the startup
+    // settings; so does the proxy, rather than run without them.
+    let client = match backend.conn.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(env = env_name, err = %e, "pg backend unavailable at session start");
+            let _ = proto::write_raw(
+                stream,
+                &proto::fatal_response(SQLSTATE_CONNECTION_FAILURE, "backend unavailable"),
+            )
+            .await;
+            return Err(EngineError::Backend("backend unavailable".into()));
         }
-        if let Ok(rows) = client.simple_query("SHOW TimeZone").await {
-            let tz = rows.iter().find_map(|m| match m {
-                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
-                _ => None,
-            });
-            if let Some(tz) = tz {
-                proto::write_raw(stream, &proto::parameter_status("TimeZone", &tz)).await?;
-            }
+    };
+    for (name, value) in settings {
+        // Same gate and audit as a client's own SET.
+        let started = std::time::Instant::now();
+        let sql = format!("SET {name} = {}", quote_lit(value));
+        let named = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        let decision = if named {
+            policy::check(&sql, pol, &policy::PG_PROFILE).0
+        } else {
+            Decision::Deny("startup parameter name not allowed")
+        };
+        let (audit, reason) = match decision {
+            Decision::Deny(r) => (AuditDecision::Deny, Some(r.to_string())),
+            _ => match client.batch_execute(&sql).await {
+                Ok(()) => (AuditDecision::Allow, None),
+                Err(e) => (AuditDecision::Error, Some(backend_error(&e).1)),
+            },
+        };
+        AuditEvent::new(
+            env_name,
+            client_user,
+            &sql,
+            audit,
+            reason,
+            None,
+            started.elapsed(),
+        )
+        .emit();
+    }
+    if let Ok(rows) = client.simple_query("SHOW TimeZone").await {
+        let tz = rows.iter().find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.try_get(0).ok().flatten(),
+            _ => None,
+        });
+        if let Some(tz) = tz {
+            proto::write_raw(stream, &proto::parameter_status("TimeZone", tz)).await?;
         }
     }
 
@@ -1189,7 +1232,7 @@ pub async fn serve(
                     let oid = prep.param_oids.get(i).copied().unwrap_or(0);
                     let fmt = m.param_formats.get(i).copied().unwrap_or(0);
                     match render_param(oid, fmt, val) {
-                        Ok(r) => rendered.push(r),
+                        Ok(r) => rendered.push(typed_literal(oid, r)),
                         Err(e) => {
                             bad = Some(e);
                             break;
@@ -1333,6 +1376,25 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inlined_params_keep_their_type() {
+        let sql = inline_params("SELECT $1 / 3", &[typed_literal(701, "1".into())]);
+        assert_eq!(sql, r#"SELECT CAST(1 AS pg_catalog."float8") / 3"#);
+        assert!(policy::check(&sql, &Policy::ReadOnly, &policy::PG_PROFILE)
+            .0
+            .is_allow());
+        assert_eq!(typed_literal(0, "'x'".into()), "'x'");
+        let arr = typed_literal(1007, "ARRAY[1,2]".into());
+        assert_eq!(arr, r#"CAST(ARRAY[1,2] AS pg_catalog."_int4")"#);
+        assert!(policy::check(
+            &format!("SELECT {arr}"),
+            &Policy::ReadOnly,
+            &policy::PG_PROFILE
+        )
+        .0
+        .is_allow());
+    }
 
     #[test]
     fn hang_up_states_end_the_session_as_fatal() {
